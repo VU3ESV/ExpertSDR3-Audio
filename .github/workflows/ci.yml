@@ -1,0 +1,32 @@
+name: CI
+
+# Builds, tests and packages every platform without signing. Nothing is published.
+
+on:
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Which to build: any of macos, windows, linux. Saves minutes when fixing one (macOS costs 10x on a private repo).'
+        required: false
+        type: string
+        default: macos windows linux
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+    with:
+      version: 0.0.${{ github.run_number }}
+      sign: false
+      platforms: ${{ inputs.platforms || 'macos windows linux' }}

@@ -1,0 +1,4 @@
+# Upstream's files stay byte-identical on every platform, including a Windows checkout.
+vendor/** -text
+packaging/icons/** binary
+*.sh text eol=lf

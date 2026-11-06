@@ -1,0 +1,306 @@
+name: Build all platforms
+
+# The one definition of how every platform is built, tested and packaged, called by both
+# ci.yml (unsigned) and release.yml (signed). Anything a pull request proves here is
+# therefore what a release will do.
+#
+# Artifacts are kept for only three days: the release is the permanent copy, and a private
+# repository's storage allowance is small enough for one run to nearly fill it.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version stamped into the binaries and file names (no leading v).'
+        required: true
+        type: string
+      sign:
+        description: 'Developer ID sign and notarize. Fails if the secrets are missing.'
+        required: false
+        type: boolean
+        default: false
+      platforms:
+        description: 'Which to build: any of macos, windows, linux. Linux includes the Raspberry Pi.'
+        required: false
+        type: string
+        default: macos windows linux
+
+env:
+  VERSION: ${{ inputs.version }}
+  # 6.10, not the 6.8 LTS: 6.8.3 links Apple's AGL framework, which current macOS SDKs have
+  # removed, and later 6.8 patches are commercial-only. Linux uses Debian's Qt instead.
+  QT_VERSION: '6.10.3'
+
+jobs:
+  macos:
+    name: macOS (Apple Silicon)
+    if: contains(inputs.platforms, 'macos')
+    runs-on: macos-15
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: clang_64
+          modules: qtwebsockets
+          cache: true
+
+      - name: Install build tools
+        run: brew install ninja
+
+      - name: Cache FFTW
+        id: fftw
+        uses: actions/cache@v6
+        with:
+          path: .deps/fftw
+          key: fftw-macos13-${{ runner.arch }}-${{ hashFiles('scripts/build-fftw.sh') }}
+
+      - name: Build static FFTW
+        if: steps.fftw.outputs.cache-hit != 'true'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '13.0'
+        run: scripts/build-fftw.sh "$PWD/.deps/fftw"
+
+      - name: Cache DeepFilterNet
+        uses: actions/cache@v6
+        with:
+          path: vendor/aethersdr/third_party/deepfilter/lib
+          key: deepfilter-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vendor/aethersdr/scripts/setup/setup-deepfilter.sh') }}
+
+      - name: Fetch DeepFilterNet
+        working-directory: vendor/aethersdr
+        run: bash scripts/setup/setup-deepfilter.sh
+
+      - name: Configure
+        run: |
+          PKG_CONFIG_PATH="$PWD/.deps/fftw/lib/pkgconfig" cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DESA_STATIC_PORTAUDIO=ON \
+            -DESA_VERSION="$VERSION" \
+            -DCMAKE_PREFIX_PATH="$PWD/.deps/fftw"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ctest --test-dir build --output-on-failure --timeout 300
+
+      - name: Package, sign and notarize
+        env:
+          REQUIRE_SIGNING: ${{ inputs.sign && '1' || '0' }}
+          # The same six secrets as LP-700-App. See docs/RELEASING.md.
+          MACOS_CERT_P12_BASE64: ${{ inputs.sign && secrets.MACOS_CERT_P12_BASE64 || '' }}
+          MACOS_CERT_PASSWORD: ${{ inputs.sign && secrets.MACOS_CERT_PASSWORD || '' }}
+          KEYCHAIN_PASSWORD: ${{ inputs.sign && secrets.KEYCHAIN_PASSWORD || '' }}
+          NOTARY_APPLE_ID: ${{ inputs.sign && secrets.NOTARY_APPLE_ID || '' }}
+          NOTARY_TEAM_ID: ${{ inputs.sign && secrets.NOTARY_TEAM_ID || '' }}
+          NOTARY_PASSWORD: ${{ inputs.sign && secrets.NOTARY_PASSWORD || '' }}
+        run: scripts/package-macos.sh build/ExpertSDR3Audio.app
+
+      - name: Smoke test from the DMG
+        env:
+          SMOKE_METHODS: nr2 nr4 mnr dfnr rn2 nnr
+        run: |
+          MOUNT="$RUNNER_TEMP/dmg"
+          mkdir -p "$MOUNT"
+          hdiutil attach dist/*.dmg -nobrowse -readonly -mountpoint "$MOUNT"
+          scripts/smoke-test.sh "$MOUNT/ExpertSDR3Audio.app/Contents/MacOS/ExpertSDR3Audio" "$VERSION" native
+          hdiutil detach "$MOUNT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-macos
+          path: dist/*.dmg
+          if-no-files-found: error
+          retention-days: 3
+
+  windows:
+    name: Windows (x64)
+    if: contains(inputs.platforms, 'windows')
+    runs-on: windows-2025
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: win64_msvc2022_64
+          modules: qtwebsockets
+          cache: true
+
+      - name: Install FFTW
+        run: vcpkg install fftw3:x64-windows
+
+      - name: Cache DeepFilterNet
+        uses: actions/cache@v6
+        with:
+          path: vendor/aethersdr/third_party/deepfilter/lib
+          key: deepfilter-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vendor/aethersdr/scripts/setup/setup-deepfilter.ps1') }}
+
+      - name: Fetch DeepFilterNet
+        working-directory: vendor/aethersdr
+        run: ./scripts/setup/setup-deepfilter.ps1
+
+      # clang-cl rather than cl.exe, because NR4's libspecbleach uses C99 VLAs.
+      - name: Configure
+        run: >
+          cmake -S . -B build -A x64 -T ClangCL
+          "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          "-DESA_VERSION=$env:VERSION"
+          "-DESA_STATIC_PORTAUDIO=ON"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ctest --test-dir build -C Release --output-on-failure --timeout 300
+
+      - name: Package
+        run: scripts/package-windows.ps1 -Version $env:VERSION -BuildDir build\Release
+
+      # Without this, --version in a GUI program shows a message box nobody can dismiss.
+      - name: Smoke test the portable build
+        shell: bash
+        env:
+          QT_COMMAND_LINE_PARSER_NO_GUI_MESSAGE_BOXES: '1'
+        run: scripts/smoke-test.sh dist/ExpertSDR3Audio/ExpertSDR3Audio.exe "$VERSION" native
+
+      - name: Smoke test the installer
+        shell: bash
+        env:
+          QT_COMMAND_LINE_PARSER_NO_GUI_MESSAGE_BOXES: '1'
+        run: |
+          TARGET="$(cygpath -w "$RUNNER_TEMP/installed")"
+          MSYS_NO_PATHCONV=1 dist/ExpertSDR3Audio-"$VERSION"-windows-x64-setup.exe \
+            /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER "/DIR=$TARGET"
+          scripts/smoke-test.sh "$RUNNER_TEMP/installed/ExpertSDR3Audio.exe" "$VERSION" native
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-windows
+          path: |
+            dist/*-setup.exe
+            dist/*-portable.zip
+          if-no-files-found: error
+          retention-days: 3
+
+  linux:
+    name: ${{ matrix.name }}
+    if: contains(inputs.platforms, 'linux')
+    runs-on: ${{ matrix.runner }}
+    # Debian 12 is the oldest system supported, and also Raspberry Pi OS Bookworm's base. What
+    # builds here runs on anything newer, which verify-linux below then proves.
+    container: debian:bookworm
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux (x86-64)
+            runner: ubuntu-24.04
+            artifact: dist-linux-x86_64
+          - name: Raspberry Pi (arm64)
+            runner: ubuntu-24.04-arm
+            artifact: dist-raspberrypi-arm64
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config git curl ca-certificates file zstd xz-utils \
+            dpkg-dev qt6-base-dev qt6-base-dev-tools libqt6websockets6-dev libfftw3-dev \
+            portaudio19-dev libgl1-mesa-dev qt6-qpa-plugins
+
+      - uses: actions/checkout@v7
+
+      - name: Cache DeepFilterNet
+        uses: actions/cache@v6
+        with:
+          path: vendor/aethersdr/third_party/deepfilter/lib
+          key: deepfilter-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vendor/aethersdr/scripts/setup/setup-deepfilter.sh') }}
+
+      - name: Fetch DeepFilterNet
+        working-directory: vendor/aethersdr
+        run: bash scripts/setup/setup-deepfilter.sh
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DESA_VERSION="$VERSION"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ctest --test-dir build --output-on-failure --timeout 300
+
+      - name: Package
+        run: scripts/package-linux.sh "$VERSION" build
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/*.deb
+            dist/*.AppImage
+          if-no-files-found: error
+          retention-days: 3
+
+  # Installs what was just built on clean systems, nothing from the build environment left over.
+  verify-linux:
+    name: ${{ matrix.target.name }} on ${{ matrix.image }}
+    needs: linux
+    runs-on: ${{ matrix.target.runner }}
+    container: ${{ matrix.image }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['debian:bookworm', 'debian:trixie', 'ubuntu:24.04']
+        target:
+          - name: Linux (x86-64)
+            runner: ubuntu-24.04
+            artifact: dist-linux-x86_64
+          - name: Raspberry Pi (arm64)
+            runner: ubuntu-24.04-arm
+            artifact: dist-raspberrypi-arm64
+    steps:
+      - name: Prepare the clean system
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates file
+
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.target.artifact }}
+          path: dist
+
+      # Before the .deb, so the AppImage cannot pass by borrowing what the .deb pulls in.
+      # These are the few system libraries an AppImage leaves to the host on purpose.
+      - name: Smoke test the AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        run: |
+          apt-get install -y --no-install-recommends libgl1 libegl1 libglib2.0-0 libfontconfig1 libfreetype6 libdbus-1-3
+          apt-get install -y --no-install-recommends libasound2t64 || apt-get install -y --no-install-recommends libasound2
+          chmod +x dist/*.AppImage
+          scripts/smoke-test.sh "$(ls "$PWD"/dist/*.AppImage)" "$VERSION" offscreen
+
+      - name: Smoke test the .deb
+        run: |
+          apt-get install -y --no-install-recommends "$(ls "$PWD"/dist/*.deb)"
+          scripts/smoke-test.sh ExpertSDR3Audio "$VERSION" offscreen

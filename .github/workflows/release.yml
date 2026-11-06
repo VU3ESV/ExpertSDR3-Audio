@@ -1,0 +1,260 @@
+name: Release
+
+# Triggered the same three ways as LP-700-App, and all produce a public GitHub Release:
+#   1. Push to `main` (i.e. after a PR merge): auto-bumps the latest clean `vX.Y.Z` tag by
+#      $BUMP and cuts a Release at the merge commit. Skipped if only docs changed.
+#   2. Push a `vX.Y.Z` tag: uses the tag as-is.
+#   3. Manual `workflow_dispatch` with a version: creates the matching tag at the run's commit.
+#
+# It publishes only if every platform built, passed its tests and smoke tests, and macOS was
+# signed and notarized. A partial release, or an unsigned Mac build, never goes out.
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (e.g. 0.1.0). A matching git tag `vX.Y.Z` is created at the current commit.'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark as a pre-release, so it does not become "latest".'
+        required: false
+        type: boolean
+        default: false
+
+# One release at a time on a given ref. Two PRs merging back-to-back queue rather than race
+# for the same next-version tag.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Auto-bump strategy for push-to-main runs: patch | minor | major.
+  BUMP: patch
+
+jobs:
+  gate:
+    name: Decide whether to release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      skip: ${{ steps.decide.outputs.skip }}
+    steps:
+      - id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HAVE_SECRETS: ${{ secrets.MACOS_CERT_P12_BASE64 != '' && secrets.MACOS_CERT_PASSWORD != '' && secrets.NOTARY_APPLE_ID != '' && secrets.NOTARY_TEAM_ID != '' && secrets.NOTARY_PASSWORD != '' }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REPO: ${{ github.repository }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          explicit=false
+          case "$EVENT:$REF" in
+            workflow_dispatch:*|push:refs/tags/*) explicit=true ;;
+          esac
+
+          if [ "$HAVE_SECRETS" != true ]; then
+            if [ "$explicit" = true ]; then
+              echo "::error::The signing secrets are not set, so this release could not be signed. See docs/RELEASING.md."
+              exit 1
+            fi
+            # Merging before signing is set up should not turn the branch red on every push.
+            echo "::notice::The signing secrets are not set. Skipping the automatic release. See docs/RELEASING.md."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$explicit" = true ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Docs-only when EVERY changed file is markdown, under docs/, or LICENSE.
+          files="$(gh api --paginate "repos/$REPO/compare/$BEFORE...$AFTER" -q '.files[].filename' || true)"
+          echo "Changed files:"; printf '  %s\n' "$files"
+          skip=true
+          [ -z "$files" ] && skip=false   # unknown or empty diff: release rather than skip
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              *.md|docs/*|LICENSE) : ;;
+              *) skip=false; break ;;
+            esac
+          done <<< "$files"
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+          if [ "$skip" = true ]; then echo "::notice::Docs-only change. Skipping the release."; fi
+
+  version:
+    name: Resolve version
+    needs: gate
+    if: needs.gate.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    outputs:
+      skip: ${{ steps.ver.outputs.skip }}
+      value: ${{ steps.ver.outputs.value }}
+      tag: ${{ steps.ver.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - id: ver
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          next() {
+            IFS=. read -r MAJOR MINOR PATCH <<< "$1"
+            case "$BUMP" in
+              major) echo "$((MAJOR + 1)).0.0" ;;
+              minor) echo "$MAJOR.$((MINOR + 1)).0" ;;
+              *) echo "$MAJOR.$MINOR.$((PATCH + 1))" ;;
+            esac
+          }
+
+          if [ "$EVENT" = workflow_dispatch ]; then
+            V="${INPUT_VERSION#v}"   # tolerate "v0.2.0", which has produced `vv` tags elsewhere
+            if git rev-parse -q --verify "refs/tags/v$V" >/dev/null; then
+              echo "::error::Tag v$V already exists."
+              exit 1
+            fi
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            V="${GITHUB_REF_NAME#v}"
+          else
+            # Push to main. If HEAD is already tagged, that tag's own run handles the release.
+            if git tag --points-at HEAD | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "HEAD already has a release tag. Skipping the automatic release."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            LATEST="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
+            if [ -z "$LATEST" ]; then V=0.1.0; else V="$(next "${LATEST#v}")"; fi
+            while git rev-parse -q --verify "refs/tags/v$V" >/dev/null; do V="$(next "$V")"; done
+          fi
+
+          # This value reaches file names, Debian's version field and Apple's bundle version.
+          if ! [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$V' is not a version of the form X.Y.Z."
+            exit 1
+          fi
+          {
+            echo "value=$V"
+            echo "tag=v$V"
+            echo "skip=false"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::Building release v$V"
+
+  build:
+    name: Build
+    needs: [gate, version]
+    if: needs.gate.outputs.skip != 'true' && needs.version.outputs.skip != 'true'
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ needs.version.outputs.value }}
+      sign: true
+    secrets: inherit
+
+  publish:
+    name: Publish
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write     # create the release and its tag
+      id-token: write     # sign the provenance with GitHub's identity
+      attestations: write
+    env:
+      V: ${{ needs.version.outputs.value }}
+      REPO: ${{ github.repository }}
+      PRIVATE: ${{ github.event.repository.private }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Check every platform is here
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          ls -la
+          for file in \
+            "ExpertSDR3Audio-$V-macos-arm64.dmg" \
+            "ExpertSDR3Audio-$V-windows-x64-setup.exe" \
+            "ExpertSDR3Audio-$V-windows-x64-portable.zip" \
+            "ExpertSDR3Audio-$V-linux-x86_64.deb" \
+            "ExpertSDR3Audio-$V-linux-x86_64.AppImage" \
+            "ExpertSDR3Audio-$V-raspberrypi-arm64.deb" \
+            "ExpertSDR3Audio-$V-raspberrypi-arm64.AppImage"; do
+            [ -s "$file" ] || { echo "::error::$file is missing"; exit 1; }
+          done
+
+      - name: Compute checksums
+        working-directory: dist
+        run: sha256sum ExpertSDR3Audio-* > SHA256SUMS
+
+      # A Sigstore signature tying each file to this repository and workflow run. On Linux, the
+      # Raspberry Pi and Windows, this is the signature. Private repositories cannot use it
+      # without GitHub Enterprise, so it starts working when the repository goes public. See
+      # docs/RELEASING.md.
+      - name: Sign build provenance
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/ExpertSDR3Audio-*
+
+      - name: Compose release notes
+        run: |
+          set -euo pipefail
+          BASE="ExpertSDR3Audio-$V"
+          {
+            echo "## ExpertSDR3 Audio $V"
+            echo
+            echo "ExpertSDR3 receive audio through the AetherRX noise-reduction chain."
+            echo
+            echo "| Platform | Download | Notes |"
+            echo "|---|---|---|"
+            echo "| macOS 13+ (Apple Silicon) | \`$BASE-macos-arm64.dmg\` | Signed with Developer ID and Apple-notarized. |"
+            echo "| Windows 10+ (x64) | \`$BASE-windows-x64-setup.exe\`, or \`$BASE-windows-x64-portable.zip\` | Not code-signed yet, so SmartScreen warns on first run: choose **More info**, then **Run anyway**. |"
+            echo "| Raspberry Pi (64-bit OS) | \`$BASE-raspberrypi-arm64.deb\` | \`sudo apt install ./$BASE-raspberrypi-arm64.deb\`. Start with NR2. An AppImage is also attached. |"
+            echo "| Linux x86-64, Debian or Ubuntu | \`$BASE-linux-x86_64.deb\` | \`sudo apt install ./$BASE-linux-x86_64.deb\` |"
+            echo "| Linux x86-64, other distributions | \`$BASE-linux-x86_64.AppImage\` | \`chmod +x\`, then run. Needs glibc 2.36 or newer. |"
+            echo
+            echo "### Verifying a download"
+            echo
+            if [ "$PRIVATE" != true ]; then
+              echo "Every file carries a signed record of the exact workflow run that built it:"
+              echo
+              echo "\`\`\`sh"
+              echo "gh attestation verify <file> --repo $REPO"
+              echo "\`\`\`"
+              echo
+            fi
+            echo "\`SHA256SUMS\` lists the checksums."
+          } > RELEASE_NOTES.md
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: ${{ needs.version.outputs.value }}
+          tag_name: ${{ needs.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          draft: false
+          prerelease: ${{ inputs.prerelease == true }}
+          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
+          fail_on_unmatched_files: true
+          files: dist/*

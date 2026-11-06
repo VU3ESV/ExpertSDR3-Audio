@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=ExpertSDR3 Audio
+Comment=ExpertSDR3 receive audio through the AetherRX noise-reduction chain
+Exec=ExpertSDR3Audio
+Icon=expertsdr3-audio
+Terminal=false
+Categories=AudioVideo;Audio;HamRadio;
