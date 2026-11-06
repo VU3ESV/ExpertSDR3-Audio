@@ -15,7 +15,7 @@ on:
         required: true
         type: string
       sign:
-        description: 'Developer ID sign and notarize. Fails if the secrets are missing.'
+        description: 'Developer ID sign and notarize if the secrets are set. With none set, the Mac build is ad-hoc signed.'
         required: false
         type: boolean
         default: false
@@ -96,7 +96,9 @@ jobs:
 
       - name: Package, sign and notarize
         env:
-          REQUIRE_SIGNING: ${{ inputs.sign && '1' || '0' }}
+          # All or nothing: with some secrets set, a missing one is a mistake, and must not
+          # quietly ship a build that is signed but not notarized.
+          REQUIRE_SIGNING: ${{ inputs.sign && (secrets.MACOS_CERT_P12_BASE64 != '' || secrets.NOTARY_APPLE_ID != '' || secrets.NOTARY_PASSWORD != '') && '1' || '0' }}
           # The same six secrets as LP-700-App. See docs/RELEASING.md.
           MACOS_CERT_P12_BASE64: ${{ inputs.sign && secrets.MACOS_CERT_P12_BASE64 || '' }}
           MACOS_CERT_PASSWORD: ${{ inputs.sign && secrets.MACOS_CERT_PASSWORD || '' }}

@@ -6,8 +6,9 @@ name: Release
 #   2. Push a `vX.Y.Z` tag: uses the tag as-is.
 #   3. Manual `workflow_dispatch` with a version: creates the matching tag at the run's commit.
 #
-# It publishes only if every platform built, passed its tests and smoke tests, and macOS was
-# signed and notarized. A partial release, or an unsigned Mac build, never goes out.
+# It publishes only if every platform built, passed its tests and smoke tests, so a partial
+# release never goes out. Releases are unsigned for now: the Mac build is signed and notarized
+# automatically if its secrets are ever set, and if any are set, all of them must work.
 
 on:
   push:
@@ -51,7 +52,6 @@ jobs:
       - id: decide
         env:
           GH_TOKEN: ${{ github.token }}
-          HAVE_SECRETS: ${{ secrets.MACOS_CERT_P12_BASE64 != '' && secrets.MACOS_CERT_PASSWORD != '' && secrets.NOTARY_APPLE_ID != '' && secrets.NOTARY_TEAM_ID != '' && secrets.NOTARY_PASSWORD != '' }}
           EVENT: ${{ github.event_name }}
           REF: ${{ github.ref }}
           REPO: ${{ github.repository }}
@@ -59,26 +59,13 @@ jobs:
           AFTER: ${{ github.event.after }}
         run: |
           set -euo pipefail
-          explicit=false
+          # Explicit releases are never skipped.
           case "$EVENT:$REF" in
-            workflow_dispatch:*|push:refs/tags/*) explicit=true ;;
+            workflow_dispatch:*|push:refs/tags/*)
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
           esac
-
-          if [ "$HAVE_SECRETS" != true ]; then
-            if [ "$explicit" = true ]; then
-              echo "::error::The signing secrets are not set, so this release could not be signed. See docs/RELEASING.md."
-              exit 1
-            fi
-            # Merging before signing is set up should not turn the branch red on every push.
-            echo "::notice::The signing secrets are not set. Skipping the automatic release. See docs/RELEASING.md."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [ "$explicit" = true ]; then
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
 
           # Docs-only when EVERY changed file is markdown, under docs/, or LICENSE.
           files="$(gh api --paginate "repos/$REPO/compare/$BEFORE...$AFTER" -q '.files[].filename' || true)"
@@ -179,6 +166,8 @@ jobs:
       V: ${{ needs.version.outputs.value }}
       REPO: ${{ github.repository }}
       PRIVATE: ${{ github.event.repository.private }}
+      # 'true' only when the build was Developer ID signed and notarized, as with LP-700-App.
+      NOTARIZED: ${{ secrets.MACOS_CERT_P12_BASE64 != '' && secrets.NOTARY_PASSWORD != '' }}
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -227,7 +216,11 @@ jobs:
             echo
             echo "| Platform | Download | Notes |"
             echo "|---|---|---|"
-            echo "| macOS 13+ (Apple Silicon) | \`$BASE-macos-arm64.dmg\` | Signed with Developer ID and Apple-notarized. |"
+            if [ "$NOTARIZED" = true ]; then
+              echo "| macOS 13+ (Apple Silicon) | \`$BASE-macos-arm64.dmg\` | Signed with Developer ID and Apple-notarized. |"
+            else
+              echo "| macOS 13+ (Apple Silicon) | \`$BASE-macos-arm64.dmg\` | Not signed or notarized, so macOS refuses to open it at first. Drag it to Applications, then run \`xattr -dr com.apple.quarantine /Applications/ExpertSDR3Audio.app\` once. |"
+            fi
             echo "| Windows 10+ (x64) | \`$BASE-windows-x64-setup.exe\`, or \`$BASE-windows-x64-portable.zip\` | Not code-signed yet, so SmartScreen warns on first run: choose **More info**, then **Run anyway**. |"
             echo "| Raspberry Pi (64-bit OS) | \`$BASE-raspberrypi-arm64.deb\` | \`sudo apt install ./$BASE-raspberrypi-arm64.deb\`. Start with NR2. An AppImage is also attached, for the desktop version of the OS. |"
             echo "| Linux x86-64, Debian or Ubuntu | \`$BASE-linux-x86_64.deb\` | \`sudo apt install ./$BASE-linux-x86_64.deb\` |"

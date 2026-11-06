@@ -14,9 +14,10 @@
 #   NOTARY_TEAM_ID          team id (Y6FT52BKDA)
 #   NOTARY_PASSWORD         app-specific password for that Apple ID
 # Env, options:
-#   REQUIRE_SIGNING=1       fail rather than produce anything unsigned or unnotarized.
-#                           Unlike LP-700's fallback: the release pipeline sets this, so a
-#                           missing secret can never publish an ad-hoc build.
+#   REQUIRE_SIGNING=1       fail rather than produce anything unsigned or unnotarized. The
+#                           release pipeline sets this once any signing secret is set, so a
+#                           missing one cannot quietly ship a half-signed build. With no secrets
+#                           at all the build is ad-hoc signed, as with LP-700-App.
 #   CODESIGN_IDENTITY       sign with this keychain identity instead of a .p12 (local tests)
 set -euo pipefail
 cd "$(dirname "$0")/.."

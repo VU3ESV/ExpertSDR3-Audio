@@ -1,9 +1,12 @@
 # Releasing
 
-[`release.yml`](../.github/workflows/release.yml) builds every platform, signs what can be
-signed, and publishes a GitHub Release. It publishes only if every platform built, passed its
-tests and smoke tests, and the Mac build was signed and notarized. A partial release, or an
-unsigned Mac build, never goes out.
+[`release.yml`](../.github/workflows/release.yml) builds every platform and publishes a GitHub
+Release. It publishes only if every platform built, passed its tests and smoke tests, so a partial
+release never goes out.
+
+**Releases are currently unsigned on Windows and macOS, by choice.** Both warn or refuse on first
+run, and the release notes tell people what to do. The Mac signing path is still in place: see
+below.
 
 ## Starting a release
 
@@ -23,7 +26,7 @@ published. It can also be started by hand, for just the platforms you name.
 
 | Platform | Files | Signing |
 |---|---|---|
-| macOS 13+ (Apple Silicon) | `-macos-arm64.dmg` | Developer ID, hardened runtime, notarized and stapled, on both the app and the DMG |
+| macOS 13+ (Apple Silicon) | `-macos-arm64.dmg` | **Ad-hoc only for now**, see below. With the secrets set: Developer ID, hardened runtime, notarized and stapled, on both the app and the DMG |
 | Windows 10+ (x64) | `-windows-x64-setup.exe`, `-windows-x64-portable.zip` | **Not Authenticode signed**, see below. Sigstore provenance once public |
 | Raspberry Pi (64-bit OS) | `-raspberrypi-arm64.deb`, `.AppImage` | Sigstore provenance once public |
 | Linux x86-64 | `-linux-x86_64.deb`, `.AppImage` | Sigstore provenance once public |
@@ -58,9 +61,12 @@ gh workflow run ci.yml --ref <branch> -f platforms="linux windows"
 
 ## macOS signing secrets
 
-These are the same six secrets as LP-700-App (its `docs/SIGNING-SECRETS.md`), with the same
-meaning. Each has to be set on this repository too, since GitHub never lets a secret be read
-back:
+These are optional. With none set, the Mac build is ad-hoc signed and macOS refuses to open it
+until its quarantine flag is cleared. Setting them turns on Developer ID signing and notarization
+with no other change.
+
+They are the same six secrets as LP-700-App (its `docs/SIGNING-SECRETS.md`), with the same meaning.
+Each has to be set on this repository too, since GitHub never lets a secret be read back:
 
 | Secret | What it is |
 |---|---|
@@ -79,9 +85,9 @@ disk:
 scripts/setup-signing-secrets.sh
 ```
 
-Unlike LP-700-App, a release with missing secrets fails rather than publishing an ad-hoc build.
-The one exception is an automatic release from a merge to `main`, which skips with a notice
-instead, so that merging before signing is set up does not turn the branch red.
+It is all or nothing: if any are set, a missing or wrong one stops the release, rather than
+quietly shipping a build that is signed but not notarized. Notarization has never run yet, so the
+first signed release is also its first test.
 
 This shares LP-700's certificate. Revoking that certificate would affect this app as well.
 

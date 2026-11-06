@@ -44,14 +44,14 @@ Download the latest build from [Releases](https://github.com/VU3ESV/ExpertSDR3-A
 
 | Platform | File | Install |
 |---|---|---|
-| macOS 13+ (Apple Silicon) | `-macos-arm64.dmg` | Drag to Applications. Signed and notarized. |
+| macOS 13+ (Apple Silicon) | `-macos-arm64.dmg` | Drag to Applications. Not signed yet, so run `xattr -dr com.apple.quarantine /Applications/ExpertSDR3Audio.app` once before opening it. |
 | Windows 10+ (x64) | `-windows-x64-setup.exe` or `-portable.zip` | Not code-signed yet, so SmartScreen warns on first run: choose **More info**, then **Run anyway**. |
 | Raspberry Pi (64-bit OS) | `-raspberrypi-arm64.deb` | `sudo apt install ./<file>.deb` |
 | Debian or Ubuntu (x86-64) | `-linux-x86_64.deb` | `sudo apt install ./<file>.deb` |
 | Other Linux (x86-64) | `-linux-x86_64.AppImage` | `chmod +x`, then run. Needs a desktop Linux with glibc 2.36 or newer. |
 
 32-bit Raspberry Pi OS is not supported. [docs/RELEASING.md](docs/RELEASING.md) covers how
-releases are made, signed and verified.
+releases are made and verified.
 
 ## Build
 
