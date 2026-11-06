@@ -221,7 +221,7 @@ jobs:
           apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build pkg-config git curl ca-certificates file zstd xz-utils \
             dpkg-dev qt6-base-dev qt6-base-dev-tools libqt6websockets6-dev libfftw3-dev \
-            portaudio19-dev libgl1-mesa-dev qt6-qpa-plugins
+            libasound2-dev libgl1-mesa-dev qt6-qpa-plugins
 
       - uses: actions/checkout@v7
 
@@ -236,7 +236,7 @@ jobs:
         run: bash scripts/setup/setup-deepfilter.sh
 
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DESA_VERSION="$VERSION"
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DESA_STATIC_PORTAUDIO=ON -DESA_VERSION="$VERSION"
 
       - name: Build
         run: cmake --build build
@@ -300,7 +300,9 @@ jobs:
           chmod +x dist/*.AppImage
           scripts/smoke-test.sh "$(ls "$PWD"/dist/*.AppImage)" "$VERSION" offscreen
 
+      # Worth knowing about even when the AppImage failed.
       - name: Smoke test the .deb
+        if: ${{ !cancelled() }}
         run: |
           apt-get install -y --no-install-recommends "$(ls "$PWD"/dist/*.deb)"
           scripts/smoke-test.sh ExpertSDR3Audio "$VERSION" offscreen

@@ -51,6 +51,10 @@ else()
     message(STATUS "Building PortAudio v19.7.0 from source")
     set(PA_BUILD_SHARED OFF CACHE BOOL "" FORCE)
     set(PA_BUILD_STATIC ON CACHE BOOL "" FORCE)
+    # JACK's library is not something a package can bundle or assume: an AppImage linking it
+    # fails to start on nearly every desktop. Sound still reaches PipeWire and PulseAudio
+    # through ALSA.
+    set(PA_USE_JACK OFF CACHE BOOL "" FORCE)
     set(CMAKE_POLICY_VERSION_MINIMUM 3.5)  # its CMakeLists predates CMake 4
     FetchContent_Declare(portaudio
         GIT_REPOSITORY https://github.com/PortAudio/portaudio.git
@@ -124,6 +128,11 @@ if(ENABLE_NNR)
     # whatever links WDSP in turn. Hand it full paths so the bare name never escapes.
     set(FFTW3_LIBRARIES ${FFTW3_LINK_LIBRARIES})
     add_subdirectory(${AETHER_TP}/wdsp ${CMAKE_BINARY_DIR}/aether_wdsp EXCLUDE_FROM_ALL)
+    if(MSVC AND CMAKE_C_COMPILER_ID STREQUAL "Clang")
+        # WDSP hands `volatile int*` to Interlocked*(), which take `volatile long*`. They are
+        # the same size on Windows, so this is harmless, but recent clang-cl rejects it.
+        target_compile_options(aether_wdsp PRIVATE -Wno-incompatible-pointer-types)
+    endif()
 endif()
 
 # ── DeepFilterNet3 (DFNR) ────────────────────────────────────────────────────
