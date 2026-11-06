@@ -29,6 +29,9 @@ echo "==> Building AppImage"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 DESTDIR="$WORK/AppDir" cmake --install "$BUILD" --prefix /usr
+# appimagetool looks for the icon at the top of the AppDir, and warns that it will soon refuse
+# to build without it.
+cp "$WORK/AppDir/usr/share/icons/hicolor/256x256/apps/expertsdr3-audio.png" "$WORK/AppDir/"
 
 for tool in linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-"$TOOL_ARCH" \
             linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-"$TOOL_ARCH"; do

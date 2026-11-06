@@ -86,10 +86,13 @@ jobs:
       - name: Build
         run: cmake --build build
 
+      # The caps are not caution for its own sake: a crash inside a test once made QtTest loop on
+      # its signal handler, printing 5.5 million lines and billing 53 macOS minutes.
       - name: Test
+        timeout-minutes: 15
         env:
           QT_QPA_PLATFORM: offscreen
-        run: ctest --test-dir build --output-on-failure --timeout 300
+        run: ctest --test-dir build --output-on-failure --test-output-size-failed 100000 --stop-on-failure --timeout 240
 
       - name: Package, sign and notarize
         env:
@@ -103,9 +106,12 @@ jobs:
           NOTARY_PASSWORD: ${{ inputs.sign && secrets.NOTARY_PASSWORD || '' }}
         run: scripts/package-macos.sh build/ExpertSDR3Audio.app
 
+      # Not DFNR: the runner is a VM, where it is not offered. See dfnrCanRunHere(). So CI cannot
+      # cover DFNR on macOS, and docs/RELEASING.md's local rehearsal is what does.
       - name: Smoke test from the DMG
+        timeout-minutes: 10
         env:
-          SMOKE_METHODS: nr2 nr4 mnr dfnr rn2 nnr
+          SMOKE_METHODS: nr2 nr4 mnr rn2 nnr
         run: |
           MOUNT="$RUNNER_TEMP/dmg"
           mkdir -p "$MOUNT"
@@ -163,9 +169,13 @@ jobs:
         run: cmake --build build --config Release --parallel
 
       - name: Test
+        timeout-minutes: 15
         env:
           QT_QPA_PLATFORM: offscreen
-        run: ctest --test-dir build -C Release --output-on-failure --timeout 300
+          # Otherwise Qt sends its messages, including why it is aborting, to the Windows debug
+          # log, and a failing test shows no output at all.
+          QT_LOGGING_TO_CONSOLE: '1'
+        run: ctest --test-dir build -C Release --output-on-failure --test-output-size-failed 100000 --stop-on-failure --timeout 240
 
       - name: Package
         run: scripts/package-windows.ps1 -Version $env:VERSION -BuildDir build\Release
@@ -221,7 +231,7 @@ jobs:
           apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build pkg-config git curl ca-certificates file zstd xz-utils \
             dpkg-dev qt6-base-dev qt6-base-dev-tools libqt6websockets6-dev libfftw3-dev \
-            portaudio19-dev libgl1-mesa-dev qt6-qpa-plugins
+            libasound2-dev libgl1-mesa-dev qt6-qpa-plugins
 
       - uses: actions/checkout@v7
 
@@ -236,15 +246,16 @@ jobs:
         run: bash scripts/setup/setup-deepfilter.sh
 
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DESA_VERSION="$VERSION"
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DESA_STATIC_PORTAUDIO=ON -DESA_VERSION="$VERSION"
 
       - name: Build
         run: cmake --build build
 
       - name: Test
+        timeout-minutes: 15
         env:
           QT_QPA_PLATFORM: offscreen
-        run: ctest --test-dir build --output-on-failure --timeout 300
+        run: ctest --test-dir build --output-on-failure --test-output-size-failed 100000 --stop-on-failure --timeout 240
 
       - name: Package
         run: scripts/package-linux.sh "$VERSION" build
@@ -268,7 +279,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: ['debian:bookworm', 'debian:trixie', 'ubuntu:24.04']
+        image: ['debian:bookworm', 'debian:trixie', 'ubuntu:24.04', 'ubuntu:26.04']
         target:
           - name: Linux (x86-64)
             runner: ubuntu-24.04
@@ -290,17 +301,22 @@ jobs:
           path: dist
 
       # Before the .deb, so the AppImage cannot pass by borrowing what the .deb pulls in.
-      # These are the few system libraries an AppImage leaves to the host on purpose.
+      # Exactly the libraries linuxdeploy leaves to the host on purpose: any desktop has them,
+      # a headless Raspberry Pi OS Lite does not, which is why the .deb is its package.
       - name: Smoke test the AppImage
         env:
           APPIMAGE_EXTRACT_AND_RUN: '1'
         run: |
-          apt-get install -y --no-install-recommends libgl1 libegl1 libglib2.0-0 libfontconfig1 libfreetype6 libdbus-1-3
+          apt-get install -y --no-install-recommends \
+            libegl1 libglx0 libglvnd0 libopengl0 libx11-6 libx11-xcb1 libxcb1 libice6 libsm6 \
+            libfontconfig1 libfreetype6 libharfbuzz0b libexpat1 libuuid1 libcom-err2 libgpg-error0 zlib1g
           apt-get install -y --no-install-recommends libasound2t64 || apt-get install -y --no-install-recommends libasound2
           chmod +x dist/*.AppImage
           scripts/smoke-test.sh "$(ls "$PWD"/dist/*.AppImage)" "$VERSION" offscreen
 
+      # Worth knowing about even when the AppImage failed.
       - name: Smoke test the .deb
+        if: ${{ !cancelled() }}
         run: |
           apt-get install -y --no-install-recommends "$(ls "$PWD"/dist/*.deb)"
           scripts/smoke-test.sh ExpertSDR3Audio "$VERSION" offscreen

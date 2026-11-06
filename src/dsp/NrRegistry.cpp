@@ -18,9 +18,31 @@
 
 #include <algorithm>
 
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
+
 namespace esa {
 
 namespace {
+
+#ifdef HAVE_DFNR
+// DeepFilterNet's inference library always uses Apple's AMX coprocessor on macOS: in tract-linalg
+// 0.21, has_amx() is simply `true`, with no detection and no override. A virtual machine does not
+// expose AMX, so there DFNR would kill the whole app with an illegal instruction, leaving
+// ExpertSDR3 muted. So it is not offered at all. GitHub's Mac runners are such VMs.
+bool dfnrCanRunHere()
+{
+#ifdef __APPLE__
+    int virtualized = 0;
+    size_t size = sizeof(virtualized);
+    if (sysctlbyname("kern.hv_vmm_present", &virtualized, &size, nullptr, 0) == 0 && virtualized != 0) {
+        return false;
+    }
+#endif
+    return true;
+}
+#endif
 
 // ── RN2: RNNoise. Native 48 kHz, one state per channel ───────────────────────
 class Rn2Processor final : public NrProcessor {
@@ -240,7 +262,7 @@ QList<NrMethod> buildMethods()
 #endif
 
 #ifdef HAVE_DFNR
-    methods.append({QStringLiteral("dfnr"), QStringLiteral("DFNR (DeepFilterNet3)"),
+    if (dfnrCanRunHere()) methods.append({QStringLiteral("dfnr"), QStringLiteral("DFNR (DeepFilterNet3)"),
         QStringLiteral("Neural speech enhancement. Strongest on voice, heaviest on CPU."),
         {
             {QStringLiteral("dfnr.atten"), QStringLiteral("Attenuation limit"), 0.0, 100.0, 100.0, 0, QStringLiteral("dB")},

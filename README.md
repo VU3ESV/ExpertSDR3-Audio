@@ -32,6 +32,9 @@ differ, but are not a listening test, and real band noise behaves differently. C
 share of one Apple Silicon core, in stereo, on a live stream. Delay excludes the output
 buffer (60 ms by default).
 
+DFNR is not offered when macOS runs in a virtual machine: its library always uses an Apple
+Silicon coprocessor that VMs do not expose, so it would crash.
+
 NR is bypassed automatically on CW and digital modes, because those signals are not speech
 and a speech model treats a steady carrier as noise. You can turn this off.
 
@@ -45,7 +48,7 @@ Download the latest build from [Releases](https://github.com/VU3ESV/ExpertSDR3-A
 | Windows 10+ (x64) | `-windows-x64-setup.exe` or `-portable.zip` | Not code-signed yet, so SmartScreen warns on first run: choose **More info**, then **Run anyway**. |
 | Raspberry Pi (64-bit OS) | `-raspberrypi-arm64.deb` | `sudo apt install ./<file>.deb` |
 | Debian or Ubuntu (x86-64) | `-linux-x86_64.deb` | `sudo apt install ./<file>.deb` |
-| Other Linux (x86-64) | `-linux-x86_64.AppImage` | `chmod +x`, then run. Needs glibc 2.36 or newer. |
+| Other Linux (x86-64) | `-linux-x86_64.AppImage` | `chmod +x`, then run. Needs a desktop Linux with glibc 2.36 or newer. |
 
 32-bit Raspberry Pi OS is not supported. [docs/RELEASING.md](docs/RELEASING.md) covers how
 releases are made, signed and verified.
@@ -117,12 +120,13 @@ is really playing, and undoes it when you disconnect or quit.
 
 | Platform | Status |
 |---|---|
-| macOS (Apple Silicon) | Tested live against ExpertSDR3 2.1 on a ColibriDDC, including the Developer ID signed build from its DMG |
-| Windows | **Not yet built or run.** The pipeline is written but has not run |
-| Linux x86-64 | **Not yet built or run.** The pipeline is written but has not run |
-| Raspberry Pi (64-bit) | **Not yet built or run.** The pipeline is written but has not run. It builds on arm64 Debian, not on a real Pi |
+| macOS (Apple Silicon) | Tested live against ExpertSDR3 2.1 on a ColibriDDC, including the Developer ID signed build from its DMG. Built and tested in CI |
+| Windows | Built, tested and run from both the installer and the zip in CI. **Not yet tried on a real PC, with a radio or sound device** |
+| Linux x86-64 | Built, tested, and run from the `.deb` and AppImage on Debian 12 and 13 and Ubuntu 24.04 and 26.04 in CI. **Not yet tried with a radio or sound device** |
+| Raspberry Pi (64-bit) | The same, on arm64. **Not yet tried on a real Pi** |
 
-**Raspberry Pi.** Start with `nr2`. The neural methods need about 28% of an Apple Silicon
+**Raspberry Pi.** Install the `.deb`, which also suits a headless Pi OS Lite; the AppImage needs
+the desktop version's libraries. Start with `nr2`. The neural methods need about 28% of an Apple Silicon
 core here, and a Pi core is several times slower, so they may not keep up; the app warns if
 so. Note that `--rate 24000` adds about 150 ms of delay from resampling and does not make
 RN2 any cheaper, because RNNoise always runs at 48 kHz internally.

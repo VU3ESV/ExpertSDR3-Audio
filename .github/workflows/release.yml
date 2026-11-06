@@ -229,9 +229,9 @@ jobs:
             echo "|---|---|---|"
             echo "| macOS 13+ (Apple Silicon) | \`$BASE-macos-arm64.dmg\` | Signed with Developer ID and Apple-notarized. |"
             echo "| Windows 10+ (x64) | \`$BASE-windows-x64-setup.exe\`, or \`$BASE-windows-x64-portable.zip\` | Not code-signed yet, so SmartScreen warns on first run: choose **More info**, then **Run anyway**. |"
-            echo "| Raspberry Pi (64-bit OS) | \`$BASE-raspberrypi-arm64.deb\` | \`sudo apt install ./$BASE-raspberrypi-arm64.deb\`. Start with NR2. An AppImage is also attached. |"
+            echo "| Raspberry Pi (64-bit OS) | \`$BASE-raspberrypi-arm64.deb\` | \`sudo apt install ./$BASE-raspberrypi-arm64.deb\`. Start with NR2. An AppImage is also attached, for the desktop version of the OS. |"
             echo "| Linux x86-64, Debian or Ubuntu | \`$BASE-linux-x86_64.deb\` | \`sudo apt install ./$BASE-linux-x86_64.deb\` |"
-            echo "| Linux x86-64, other distributions | \`$BASE-linux-x86_64.AppImage\` | \`chmod +x\`, then run. Needs glibc 2.36 or newer. |"
+            echo "| Linux x86-64, other distributions | \`$BASE-linux-x86_64.AppImage\` | \`chmod +x\`, then run. Needs a desktop Linux with glibc 2.36 or newer. |"
             echo
             echo "### Verifying a download"
             echo

@@ -51,6 +51,10 @@ else()
     message(STATUS "Building PortAudio v19.7.0 from source")
     set(PA_BUILD_SHARED OFF CACHE BOOL "" FORCE)
     set(PA_BUILD_STATIC ON CACHE BOOL "" FORCE)
+    # JACK's library is not something a package can bundle or assume: an AppImage linking it
+    # fails to start on nearly every desktop. Sound still reaches PipeWire and PulseAudio
+    # through ALSA.
+    set(PA_USE_JACK OFF CACHE BOOL "" FORCE)
     set(CMAKE_POLICY_VERSION_MINIMUM 3.5)  # its CMakeLists predates CMake 4
     FetchContent_Declare(portaudio
         GIT_REPOSITORY https://github.com/PortAudio/portaudio.git
@@ -124,6 +128,11 @@ if(ENABLE_NNR)
     # whatever links WDSP in turn. Hand it full paths so the bare name never escapes.
     set(FFTW3_LIBRARIES ${FFTW3_LINK_LIBRARIES})
     add_subdirectory(${AETHER_TP}/wdsp ${CMAKE_BINARY_DIR}/aether_wdsp EXCLUDE_FROM_ALL)
+    if(MSVC AND CMAKE_C_COMPILER_ID STREQUAL "Clang")
+        # WDSP hands `volatile int*` to Interlocked*(), which take `volatile long*`. They are
+        # the same size on Windows, so this is harmless, but recent clang-cl rejects it.
+        target_compile_options(aether_wdsp PRIVATE -Wno-incompatible-pointer-types)
+    endif()
 endif()
 
 # ── DeepFilterNet3 (DFNR) ────────────────────────────────────────────────────
@@ -282,10 +291,14 @@ if(UNIX AND NOT APPLE)
     set(CPACK_DEBIAN_PACKAGE_MAINTAINER "VU3ESV <VU3ESV@users.noreply.github.com>")
     set(CPACK_DEBIAN_PACKAGE_SECTION hamradio)
     set(CPACK_DEBIAN_PACKAGE_HOMEPAGE "https://github.com/VU3ESV/ExpertSDR3-Audio")
-    # Works out Qt, PortAudio and FFTW from what the binary really links.
-    set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
-    # A plugin, so that scan cannot see it. Without it the window cannot open at all.
-    set(CPACK_DEBIAN_PACKAGE_DEPENDS qt6-qpa-plugins)
+    # Listed by hand rather than generated: Debian's Qt adds a strict qt6-websockets-abi
+    # (= 6.4.2) dependency to anything built against it, which would stop one package
+    # installing on a newer Debian, although Qt's public API stays compatible. The newer
+    # names are what the 64-bit time_t transition renamed some of these to. CI installs and
+    # runs the result on each release listed in build.yml, which is what keeps this honest.
+    # qt6-qpa-plugins is what lets the window open at all.
+    set(CPACK_DEBIAN_PACKAGE_DEPENDS
+        "libc6 (>= 2.36), libstdc++6, libasound2 | libasound2t64, libfftw3-double3, libfftw3-single3, libqt6core6 | libqt6core6t64, libqt6gui6 | libqt6gui6t64, libqt6widgets6 | libqt6widgets6t64, libqt6network6 | libqt6network6t64, libqt6websockets6 | libqt6websockets6t64, qt6-qpa-plugins")
     include(CPack)
 endif()
 
