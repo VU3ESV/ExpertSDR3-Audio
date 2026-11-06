@@ -226,10 +226,10 @@ endif()
 
 # ── Application core (everything except the GUI, shared with tests) ──────────
 add_library(esa_core STATIC
-    src/tci/TciProtocol.cpp src/tci/TciClient.cpp src/tci/MuteController.cpp
+    src/tci/TciProtocol.cpp src/tci/TciClient.cpp src/tci/TciDiscovery.cpp src/tci/MuteController.cpp
     src/dsp/RxChain.cpp src/dsp/NrRegistry.cpp
     src/audio/PlaybackBuffer.cpp src/audio/PortAudioSink.cpp
-    src/app/Engine.cpp src/app/Settings.cpp src/app/WavWriter.cpp)
+    src/app/Engine.cpp src/app/Profiles.cpp src/app/Settings.cpp src/app/WavWriter.cpp)
 target_include_directories(esa_core PUBLIC src)
 target_link_libraries(esa_core PUBLIC
     Qt6::Core Qt6::Network Qt6::WebSockets aether_dsp esa_portaudio)
@@ -240,6 +240,7 @@ set_source_files_properties(${ESA_ICON_ICNS} PROPERTIES MACOSX_PACKAGE_LOCATION 
 
 qt_add_executable(ExpertSDR3Audio MACOSX_BUNDLE WIN32
     src/main.cpp src/gui/MainWindow.cpp src/gui/ParamWidgets.cpp
+    src/gui/AboutDialog.cpp src/gui/RadioDiscoveryDialog.cpp
     $<$<BOOL:${APPLE}>:${ESA_ICON_ICNS}>
     $<$<BOOL:${WIN32}>:packaging/windows/app.rc>)
 target_link_libraries(ExpertSDR3Audio PRIVATE esa_core Qt6::Gui Qt6::Widgets)
@@ -318,8 +319,15 @@ if(BUILD_TESTS)
     esa_test(test_playback)
     esa_test(test_rx_chain)
     esa_test(test_engine_e2e tests/MockExpert.cpp)
-    esa_test(test_gui src/gui/MainWindow.cpp src/gui/ParamWidgets.cpp)
+    esa_test(test_discovery tests/MockExpert.cpp)
+    esa_test(test_profiles)
+    esa_test(test_gui src/gui/MainWindow.cpp src/gui/ParamWidgets.cpp
+        src/gui/AboutDialog.cpp src/gui/RadioDiscoveryDialog.cpp tests/MockExpert.cpp)
     target_link_libraries(test_gui PRIVATE Qt6::Gui Qt6::Widgets)
+    qt_add_resources(test_gui "app_icon_test"
+        PREFIX "/icons"
+        BASE ${CMAKE_SOURCE_DIR}/packaging/icons
+        FILES ${CMAKE_SOURCE_DIR}/packaging/icons/ExpertSDR3Audio-256.png)
     if(ENABLE_DFNR AND EXISTS ${DF_DIR}/models/DeepFilterNet3_onnx.tar.gz)
         qt_add_resources(test_rx_chain "dfnr_model_test"
             PREFIX "/models"

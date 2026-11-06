@@ -101,6 +101,42 @@ ExpertSDR3Audio --headless --host 192.168.1.20 --port 40001 --device "USB" --nr 
 ExpertSDR3Audio --list-params   # everything --set can change
 ```
 
+## Finding radios
+
+**Find Radios...** looks for computers on your network running ExpertSDR3 with TCI enabled, and
+connects to the one you pick. `ExpertSDR3Audio --discover` does the same from a terminal.
+
+TCI has no way to announce itself, so this tries the usual TCI ports (40001, 50001, 60001, plus
+whatever is in the Port box) on each address, which takes about 10 seconds. It only reads each
+server's greeting and sends no commands, so it cannot disturb a radio in use. It stays on private
+addresses, skips VPN links, and checks only the 254 addresses around this computer on each network
+adapter. For anything further away, type the host and port in the main window.
+
+On a Mac, the first scan asks for permission to use the local network. If you allow it, scan again.
+
+## Profiles
+
+A profile saves everything in the tabs: the noise reduction method and its settings, every stage,
+and the stage order. It leaves out the radio, output device, volume and buffer, so it can move to
+another computer without bringing that computer's hardware along.
+
+Pick one from the **Profile** list, or **Factory settings** to start over. **Modified** means the
+sound has changed since it was saved. **Export...** writes a `.json` file to share or back up, and
+**Export All...** in the Profiles menu writes every profile to one file. **Import...** reads either
+kind, renames anything whose name is taken rather than replacing it, and leaves the current sound
+alone until you choose one.
+
+A profile that uses a method this computer lacks, such as MNR away from a Mac, plays with NR off,
+and keeps the setting in case it travels back.
+
+From a terminal:
+```sh
+ExpertSDR3Audio --list-profiles
+ExpertSDR3Audio --import-profile shared.json
+ExpertSDR3Audio --export-profile "Weak SSB" > weak-ssb.json
+ExpertSDR3Audio --headless --device "USB" --profile "Weak SSB"
+```
+
 ## How muting works
 
 With **Mute ExpertSDR3's own audio** on (the default), the app sends `MUTE` only once audio

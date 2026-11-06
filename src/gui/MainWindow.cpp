@@ -2,34 +2,46 @@
 
 #include "dsp/NrProcessor.h"
 #include "dsp/RxChain.h"
+#include "gui/AboutDialog.h"
+#include "gui/RadioDiscoveryDialog.h"
 
 #include "ClientEq.h"
 
+#include <QAction>
 #include <QApplication>
 #include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
+#include <QDesktopServices>
+#include <QDir>
 #include <QDoubleSpinBox>
+#include <QFileDialog>
 #include <QFormLayout>
 #include <QFrame>
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QInputDialog>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
+#include <QMenu>
+#include <QMenuBar>
 #include <QMessageBox>
 #include <QPalette>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QScrollArea>
 #include <QSignalBlocker>
 #include <QSlider>
 #include <QSpinBox>
 #include <QStackedWidget>
+#include <QStandardPaths>
 #include <QTabWidget>
 #include <QScreen>
 #include <QTimer>
+#include <QUrl>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -74,8 +86,8 @@ QWidget* scrollable(QWidget* content)
 
 } // namespace
 
-MainWindow::MainWindow(Engine* engine, Settings* settings, const AppConfig& config)
-    : m_engine(engine), m_settings(settings), m_config(config)
+MainWindow::MainWindow(Engine* engine, Settings* settings, ProfileLibrary* profiles, const AppConfig& config)
+    : m_engine(engine), m_settings(settings), m_profiles(profiles), m_config(config)
 {
     setWindowTitle(QStringLiteral("ExpertSDR3 Audio"));
     applyTheme();
@@ -84,9 +96,18 @@ MainWindow::MainWindow(Engine* engine, Settings* settings, const AppConfig& conf
     auto* layout = new QVBoxLayout(central);
     layout->addWidget(buildConnectionBox());
     layout->addWidget(buildOutputBox());
+    layout->addWidget(buildProfileBar());
     layout->addWidget(buildTabs(), 1);
     layout->addWidget(buildMeters());
     setCentralWidget(central);
+    buildMenus();
+
+    // The profile may have been deleted since these settings were saved.
+    if (!m_config.profileName.isEmpty() && !m_profiles->find(m_config.profileName)) m_config.profileName.clear();
+    m_profileNote = m_profiles->loadWarning();
+    refreshProfileList();
+    updateProfileState();
+
     // Fits a small display such as a Raspberry Pi touchscreen. The tab panels scroll,
     // so the window can shrink a long way below this.
     const QScreen* screen = QApplication::primaryScreen();
@@ -163,6 +184,9 @@ QWidget* MainWindow::buildConnectionBox()
     m_connect = new QPushButton(QStringLiteral("Connect"));
     m_connect->setCheckable(true);
     m_connect->setMinimumWidth(110);
+    m_findRadios = new QPushButton(QStringLiteral("Find Radios..."));
+    m_findRadios->setToolTip(QStringLiteral("Look on your network for computers running ExpertSDR3 with TCI enabled."));
+    connect(m_findRadios, &QPushButton::clicked, this, &MainWindow::findRadios);
     m_radioLabel = new QLabel(colored(kMuted, QStringLiteral("Not connected")));
     m_radioLabel->setTextFormat(Qt::RichText);
 
@@ -172,8 +196,9 @@ QWidget* MainWindow::buildConnectionBox()
     grid->addWidget(m_port, 0, 3);
     grid->addWidget(new QLabel(QStringLiteral("Receiver")), 0, 4);
     grid->addWidget(m_receiver, 0, 5);
-    grid->addWidget(m_connect, 0, 6);
-    grid->addWidget(m_radioLabel, 1, 0, 1, 7);
+    grid->addWidget(m_findRadios, 0, 6);
+    grid->addWidget(m_connect, 0, 7);
+    grid->addWidget(m_radioLabel, 1, 0, 1, 8);
     grid->setColumnStretch(1, 1);
 
     connect(m_connect, &QPushButton::toggled, this, &MainWindow::onConnectToggled);
@@ -279,10 +304,77 @@ QTabWidget* MainWindow::buildTabs()
     return tabs;
 }
 
+QWidget* MainWindow::buildProfileBar()
+{
+    auto* bar = new QWidget;
+    auto* layout = new QHBoxLayout(bar);
+    layout->setContentsMargins(4, 0, 4, 0);
+
+    m_profileList = new QComboBox;
+    m_profileList->setToolTip(QStringLiteral("A saved set of everything in the tabs below: noise reduction, its settings, and the stages."));
+    m_profileStatus = new QLabel;
+    m_profileStatus->setTextFormat(Qt::RichText);
+    connect(m_profileList, &QComboBox::activated, this, &MainWindow::onProfileSelected);
+
+    m_saveAction = new QAction(QStringLiteral("Save"), this);
+    m_saveAsAction = new QAction(QStringLiteral("Save As..."), this);
+    m_deleteAction = new QAction(QStringLiteral("Delete"), this);
+    m_importAction = new QAction(QStringLiteral("Import..."), this);
+    m_exportAction = new QAction(QStringLiteral("Export..."), this);
+    m_exportAllAction = new QAction(QStringLiteral("Export All..."), this);
+    connect(m_saveAction, &QAction::triggered, this, &MainWindow::onSaveProfile);
+    connect(m_saveAsAction, &QAction::triggered, this, &MainWindow::onSaveProfileAs);
+    connect(m_deleteAction, &QAction::triggered, this, &MainWindow::onDeleteProfile);
+    connect(m_importAction, &QAction::triggered, this, &MainWindow::onImportProfiles);
+    connect(m_exportAction, &QAction::triggered, this, &MainWindow::onExportProfile);
+    connect(m_exportAllAction, &QAction::triggered, this, &MainWindow::onExportAllProfiles);
+
+    const auto addButton = [&](QAction* action) {
+        auto* button = new QPushButton(action->text());
+        connect(button, &QPushButton::clicked, action, &QAction::trigger);
+        connect(action, &QAction::changed, button, [button, action] { button->setEnabled(action->isEnabled()); });
+        layout->addWidget(button);
+    };
+    layout->addWidget(new QLabel(QStringLiteral("Profile")));
+    layout->addWidget(m_profileList, 1);
+    layout->addWidget(m_profileStatus);
+    addButton(m_saveAction);
+    addButton(m_saveAsAction);
+    addButton(m_importAction);
+    addButton(m_exportAction);
+    addButton(m_deleteAction);
+    return bar;
+}
+
+void MainWindow::buildMenus()
+{
+    auto* radio = menuBar()->addMenu(QStringLiteral("Radio"));
+    connect(radio->addAction(QStringLiteral("Find Radios...")), &QAction::triggered, this, &MainWindow::findRadios);
+
+    auto* profiles = menuBar()->addMenu(QStringLiteral("Profiles"));
+    profiles->addAction(m_saveAction);
+    profiles->addAction(m_saveAsAction);
+    profiles->addSeparator();
+    profiles->addAction(m_importAction);
+    profiles->addAction(m_exportAction);
+    profiles->addAction(m_exportAllAction);
+    profiles->addSeparator();
+    profiles->addAction(m_deleteAction);
+
+    auto* help = menuBar()->addMenu(QStringLiteral("Help"));
+    connect(help->addAction(QStringLiteral("Project Website")), &QAction::triggered, this, [] {
+        QDesktopServices::openUrl(QUrl(QStringLiteral("https://github.com/VU3ESV/ExpertSDR3-Audio")));
+    });
+    auto* about = help->addAction(QStringLiteral("About ExpertSDR3 Audio"));
+    about->setMenuRole(QAction::AboutRole);  // on a Mac, this belongs in the application menu
+    connect(about, &QAction::triggered, this, &MainWindow::showAbout);
+}
+
 ParamControl* MainWindow::addParam(const ParamSpec& spec, QGridLayout* grid, int row)
 {
     auto* control = new ParamControl(spec, paramValue(m_config, spec), grid, row, this);
     m_controls.insert(spec.key, control);
+    m_editors.insert(spec.key, [control](double value) { control->setValueSilently(value); });
     connect(control, &ParamControl::valueChanged, this, &MainWindow::onParamChanged);
     return control;
 }
@@ -316,28 +408,22 @@ QWidget* MainWindow::buildNrTab()
     }
     layout->addWidget(m_nrParams, 1);
 
-    auto* autoBypass = new QCheckBox(QStringLiteral("Bypass NR automatically on CW and digital modes"));
-    autoBypass->setChecked(m_config.nrAutoBypass);
-    autoBypass->setToolTip(QStringLiteral(
+    m_autoBypass = new QCheckBox(QStringLiteral("Bypass NR automatically on CW and digital modes"));
+    m_autoBypass->setChecked(m_config.nrAutoBypass);
+    m_autoBypass->setToolTip(QStringLiteral(
         "These are not speech. A speech model treats a steady carrier as noise and can remove the signal itself."));
-    connect(autoBypass, &QCheckBox::toggled, this, [this](bool on) {
+    connect(m_autoBypass, &QCheckBox::toggled, this, [this](bool on) {
         m_config.nrAutoBypass = on;
         onEngine([engine = m_engine, on] { engine->setNrAutoBypass(on); });
+        updateProfileState();
     });
-    layout->addWidget(autoBypass);
+    layout->addWidget(m_autoBypass);
 
     m_nrStatus = hintLabel();
     layout->addWidget(m_nrStatus);
 
     connect(m_nrMethod, &QComboBox::currentIndexChanged, this, &MainWindow::onNrSelected);
-    const int selected = std::max(0, m_nrMethod->findData(m_config.nrMethod));
-    {
-        const QSignalBlocker block(m_nrMethod);
-        m_nrMethod->setCurrentIndex(selected);
-    }
-    m_nrParams->setCurrentIndex(selected);
-    const NrMethod* method = findNrMethod(m_config.nrMethod);
-    m_nrDescription->setText(colored(kMuted, method ? method->description : QStringLiteral("Audio passes through unchanged.")));
+    showNrMethod(m_config.nrMethod);
     return page;
 }
 
@@ -395,6 +481,10 @@ QWidget* MainWindow::buildEqTab()
         auto* on = new QCheckBox(onSpec->label);
         on->setChecked(paramValue(m_config, *onSpec) != 0.0);
         table->addWidget(on, tableRow, 0);
+        m_editors.insert(onSpec->key, [on](double value) {
+            const QSignalBlocker block(on);
+            on->setChecked(value != 0.0);
+        });
         connect(on, &QCheckBox::toggled, this, [this, key = onSpec->key](bool checked) {
             onParamChanged(key, checked ? 1.0 : 0.0);
         });
@@ -408,6 +498,10 @@ QWidget* MainWindow::buildEqTab()
             spin->setValue(paramValue(m_config, *spec));
             if (!spec->unit.isEmpty()) spin->setSuffix(QLatin1Char(' ') + spec->unit);
             table->addWidget(spin, tableRow, column);
+            m_editors.insert(spec->key, [spin](double value) {
+                const QSignalBlocker block(spin);
+                spin->setValue(value);
+            });
             connect(spin, &QDoubleSpinBox::valueChanged, this, [this, key = spec->key](double value) {
                 onParamChanged(key, value);
             });
@@ -438,16 +532,7 @@ QWidget* MainWindow::buildOrderTab()
 
     auto* row = new QHBoxLayout;
     m_order = new QListWidget;
-    QStringList stored = m_config.stageOrder;
-    if (stored.isEmpty()) stored = RxChain::stageIds();
-    RxChain normaliser(48000);
-    normaliser.setStageOrder(stored);  // drops unknown ids, restores missing ones
-    const QStringList order = normaliser.stageOrder();
-    for (const QString& id : order) {
-        auto* item = new QListWidgetItem(RxChain::stageLabel(id));
-        item->setData(Qt::UserRole, id);
-        m_order->addItem(item);
-    }
+    setOrderList(m_config.stageOrder);
     row->addWidget(m_order, 1);
 
     auto* buttons = new QVBoxLayout;
@@ -464,13 +549,7 @@ QWidget* MainWindow::buildOrderTab()
     connect(up, &QPushButton::clicked, this, [this] { moveStage(-1); });
     connect(down, &QPushButton::clicked, this, [this] { moveStage(1); });
     connect(reset, &QPushButton::clicked, this, [this] {
-        m_order->clear();
-        const QStringList ids = RxChain::stageIds();
-        for (const QString& id : ids) {
-            auto* item = new QListWidgetItem(RxChain::stageLabel(id));
-            item->setData(Qt::UserRole, id);
-            m_order->addItem(item);
-        }
+        setOrderList(RxChain::stageIds());
         pushStageOrder();
     });
     return page;
@@ -565,20 +644,32 @@ void MainWindow::onDeviceSelected(int index)
     onEngine([engine = m_engine, key] { engine->setOutputDevice(key); });
 }
 
+void MainWindow::showNrMethod(const QString& id)
+{
+    const int index = std::max(0, m_nrMethod->findData(id));
+    {
+        const QSignalBlocker block(m_nrMethod);
+        m_nrMethod->setCurrentIndex(index);
+    }
+    m_nrParams->setCurrentIndex(index);
+    const NrMethod* method = findNrMethod(id);
+    m_nrDescription->setText(colored(kMuted, method ? method->description : QStringLiteral("Audio passes through unchanged.")));
+}
+
 void MainWindow::onNrSelected(int index)
 {
     const QString id = m_nrMethod->itemData(index).toString();
     m_config.nrMethod = id;
-    m_nrParams->setCurrentIndex(index);
-    const NrMethod* method = findNrMethod(id);
-    m_nrDescription->setText(colored(kMuted, method ? method->description : QStringLiteral("Audio passes through unchanged.")));
+    showNrMethod(id);
     onEngine([engine = m_engine, id] { engine->setNrMethod(id); });
+    updateProfileState();
 }
 
 void MainWindow::onParamChanged(const QString& key, double value)
 {
     m_config.params.insert(key, value);
     onEngine([engine = m_engine, key, value] { engine->setParam(key, value); });
+    updateProfileState();
 }
 
 void MainWindow::moveStage(int direction)
@@ -598,6 +689,254 @@ void MainWindow::pushStageOrder()
     for (int i = 0; i < m_order->count(); ++i) order.append(m_order->item(i)->data(Qt::UserRole).toString());
     m_config.stageOrder = order;
     onEngine([engine = m_engine, order] { engine->setStageOrder(order); });
+    updateProfileState();
+}
+
+void MainWindow::setOrderList(const QStringList& order)
+{
+    m_order->clear();
+    const QStringList ids = RxChain::normalizedOrder(order);
+    for (const QString& id : ids) {
+        auto* item = new QListWidgetItem(RxChain::stageLabel(id));
+        item->setData(Qt::UserRole, id);
+        m_order->addItem(item);
+    }
+}
+
+// ── Finding radios ──────────────────────────────────────────────────────────
+
+void MainWindow::findRadios()
+{
+    RadioDiscoveryDialog dialog(TciDiscovery::localNetworkOptions(m_port->value()), this);
+    if (dialog.exec() != QDialog::Accepted) return;
+    if (const auto radio = dialog.selectedRadio()) connectToRadio(*radio);
+}
+
+void MainWindow::connectToRadio(const DiscoveredRadio& radio)
+{
+    if (m_connect->isChecked()) m_connect->setChecked(false);
+    m_host->setText(radio.host);
+    {
+        const QSignalBlocker block(m_port);
+        m_port->setValue(radio.port);
+    }
+    // This is the radio the operator picked. If it goes away, wait for it rather than wandering
+    // off to whatever else answers on the usual ports.
+    m_config.fallbackPorts.clear();
+    m_connect->setChecked(true);
+}
+
+// ── Profiles ────────────────────────────────────────────────────────────────
+
+bool MainWindow::chainModified() const
+{
+    const Profile* profile = m_profiles->find(m_config.profileName);
+    return !sameChain(chainOf(m_config), profile ? profile->chain : defaultChain());
+}
+
+void MainWindow::refreshProfileList()
+{
+    const QSignalBlocker block(m_profileList);
+    m_profileList->clear();
+    m_profileList->addItem(QStringLiteral("Factory settings"), QString());
+    const QStringList names = m_profiles->names();
+    for (const QString& name : names) m_profileList->addItem(name, name);
+    m_profileList->setCurrentIndex(std::max(0, m_profileList->findData(m_config.profileName)));
+}
+
+void MainWindow::updateProfileState()
+{
+    const bool named = m_profiles->find(m_config.profileName) != nullptr;
+    const bool modified = chainModified();
+    if (modified) m_profileNote.clear();  // whatever it said was about the state before this change
+    m_saveAction->setEnabled(modified);
+    m_deleteAction->setEnabled(named);
+    m_exportAction->setEnabled(named);
+    m_exportAllAction->setEnabled(!m_profiles->names().isEmpty());
+    if (!m_profileNote.isEmpty()) {
+        m_profileStatus->setText(colored(kAmber, QStringLiteral("Note")));
+        m_profileStatus->setToolTip(m_profileNote);
+    } else {
+        m_profileStatus->setText(modified ? colored(kAmber, QStringLiteral("Modified")) : QString());
+        m_profileStatus->setToolTip(QString());
+    }
+}
+
+void MainWindow::showChain()
+{
+    showNrMethod(m_config.nrMethod);
+    {
+        const QSignalBlocker block(m_autoBypass);
+        m_autoBypass->setChecked(m_config.nrAutoBypass);
+    }
+    setOrderList(m_config.stageOrder);
+    for (const ParamSpec& spec : allParamSpecs()) {
+        const auto editor = m_editors.constFind(spec.key);
+        if (editor != m_editors.constEnd()) (*editor)(paramValue(m_config, spec));
+    }
+}
+
+void MainWindow::loadProfile(const QString& name)
+{
+    const Profile* profile = m_profiles->find(name);
+    const ChainSettings chain = profile ? profile->chain : defaultChain();
+
+    applyChain(m_config, chain);
+    m_config.profileName = profile ? profile->name : QString();
+    m_profileNote.clear();
+    if (!chain.nrMethod.isEmpty() && !findNrMethod(chain.nrMethod)) {
+        m_profileNote = QStringLiteral("This profile uses %1 noise reduction, which is not available on this computer, so NR is off.")
+                            .arg(chain.nrMethod.toUpper());
+    }
+
+    showChain();
+    onEngine([engine = m_engine, chain] { engine->applyChainSettings(chain); });
+    refreshProfileList();
+    updateProfileState();
+}
+
+bool MainWindow::saveProfileAs(const QString& name, QString* error)
+{
+    const QString cleaned = ProfileLibrary::cleanName(name);
+    if (!m_profiles->save(cleaned, chainOf(m_config), error)) return false;
+    m_config.profileName = m_profiles->find(cleaned)->name;
+    m_profileNote.clear();
+    refreshProfileList();
+    updateProfileState();
+    return true;
+}
+
+bool MainWindow::deleteProfile(const QString& name, QString* error)
+{
+    if (!m_profiles->remove(name, error)) return false;
+    // What is playing does not change. It just no longer has a name.
+    if (m_config.profileName.compare(name, Qt::CaseInsensitive) == 0) m_config.profileName.clear();
+    refreshProfileList();
+    updateProfileState();
+    return true;
+}
+
+ImportResult MainWindow::importProfiles(const QString& path)
+{
+    ImportResult result = m_profiles->importFile(path);
+    refreshProfileList();
+    updateProfileState();
+    return result;
+}
+
+void MainWindow::onProfileSelected(int index)
+{
+    const QString name = m_profileList->itemData(index).toString();
+    if (name == m_config.profileName) return;
+    if (chainModified()) {
+        const QString from = m_config.profileName.isEmpty() ? QStringLiteral("the current settings") : m_config.profileName;
+        const auto answer = QMessageBox::question(this, QStringLiteral("Unsaved changes"),
+            QStringLiteral("Discard your changes to %1?").arg(from),
+            QMessageBox::Discard | QMessageBox::Cancel, QMessageBox::Cancel);
+        if (answer != QMessageBox::Discard) {
+            refreshProfileList();  // back to the one still in use
+            return;
+        }
+    }
+    loadProfile(name);
+}
+
+void MainWindow::onSaveProfile()
+{
+    if (m_config.profileName.isEmpty()) {
+        onSaveProfileAs();
+        return;
+    }
+    QString error;
+    if (!saveProfileAs(m_config.profileName, &error)) {
+        QMessageBox::warning(this, QStringLiteral("Could not save the profile"), error);
+    }
+}
+
+void MainWindow::onSaveProfileAs()
+{
+    bool ok = false;
+    const QString name = ProfileLibrary::cleanName(QInputDialog::getText(this, QStringLiteral("Save Profile"),
+        QStringLiteral("Name for this profile:"), QLineEdit::Normal, m_config.profileName, &ok));
+    if (!ok || name.isEmpty()) return;
+    if (m_profiles->find(name) && name.compare(m_config.profileName, Qt::CaseInsensitive) != 0) {
+        const auto answer = QMessageBox::question(this, QStringLiteral("Replace profile"),
+            QStringLiteral("There is already a profile called %1. Replace it?").arg(name),
+            QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
+        if (answer != QMessageBox::Yes) return;
+    }
+    QString error;
+    if (!saveProfileAs(name, &error)) {
+        QMessageBox::warning(this, QStringLiteral("Could not save the profile"), error);
+    }
+}
+
+void MainWindow::onDeleteProfile()
+{
+    const QString name = m_config.profileName;
+    if (name.isEmpty()) return;
+    const auto answer = QMessageBox::question(this, QStringLiteral("Delete profile"),
+        QStringLiteral("Delete the profile %1? The current sound does not change.").arg(name),
+        QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
+    if (answer != QMessageBox::Yes) return;
+    QString error;
+    if (!deleteProfile(name, &error)) {
+        QMessageBox::warning(this, QStringLiteral("Could not delete the profile"), error);
+    }
+}
+
+void MainWindow::onImportProfiles()
+{
+    const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("Import Profiles"),
+        QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation),
+        QStringLiteral("ExpertSDR3 Audio profiles (*.json);;All files (*)"));
+    if (path.isEmpty()) return;
+
+    const ImportResult result = importProfiles(path);
+    if (!result.error.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("Could not import"), result.error);
+        return;
+    }
+    QString message = result.imported.size() == 1
+                          ? QStringLiteral("Imported the profile %1.").arg(result.imported.first())
+                          : QStringLiteral("Imported %1 profiles: %2.").arg(result.imported.size()).arg(result.imported.join(QStringLiteral(", ")));
+    if (!result.renamed.isEmpty()) {
+        message += QStringLiteral("\n\nRenamed, because the name was taken:\n") + result.renamed.join(QLatin1Char('\n'));
+    }
+    message += QStringLiteral("\n\nChoose one from the Profile list to use it.");
+    QMessageBox::information(this, QStringLiteral("Profiles imported"), message);
+}
+
+bool MainWindow::exportWithDialog(const QStringList& names, const QString& suggestedName)
+{
+    QString fileName = suggestedName;
+    fileName.replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9._ -]")), QStringLiteral("-"));
+    const QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Export Profiles"),
+        QDir(QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation)).filePath(fileName + QStringLiteral(".json")),
+        QStringLiteral("ExpertSDR3 Audio profiles (*.json)"));
+    if (path.isEmpty()) return false;
+    QString error;
+    if (!m_profiles->exportFile(path, names, &error)) {
+        QMessageBox::warning(this, QStringLiteral("Could not export"), error);
+        return false;
+    }
+    return true;
+}
+
+void MainWindow::onExportProfile()
+{
+    // The saved profile, not what is playing: unsaved changes are not part of it yet.
+    if (!m_config.profileName.isEmpty()) exportWithDialog({m_config.profileName}, m_config.profileName);
+}
+
+void MainWindow::onExportAllProfiles()
+{
+    exportWithDialog(m_profiles->names(), QStringLiteral("ExpertSDR3 Audio profiles"));
+}
+
+void MainWindow::showAbout()
+{
+    AboutDialog(this).exec();
 }
 
 void MainWindow::saveSettings()

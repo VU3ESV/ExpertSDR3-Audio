@@ -285,7 +285,7 @@ private slots:
         {
             // The previous process died holding the mute.
             Settings previous(f.settingsPath);
-            previous.saveMuteOwnership({true, false});
+            previous.saveMuteOwnership(QStringLiteral("127.0.0.1"), {true, false});
         }
         f.mock.muted = true;
         AppConfig config = f.baseConfig();
@@ -293,7 +293,75 @@ private slots:
         f.start(config);
         QTRY_VERIFY_WITH_TIMEOUT(!f.mock.muted, kTimeout);
         f.engine().shutdown();
-        QCOMPARE(Settings(f.settingsPath).loadMuteOwnership().owned, false);
+        QCOMPARE(Settings(f.settingsPath).loadMuteOwnership(QStringLiteral("127.0.0.1")).owned, false);
+    }
+
+    // With several radios on a network, a mute owed to one says nothing about another, which its
+    // operator may have muted themselves. Unmuting that one would be exactly wrong.
+    void aMuteOwedToOneRadioIsNotAppliedToAnother()
+    {
+        Fixture f;
+        {
+            Settings previous(f.settingsPath);
+            previous.saveMuteOwnership(QStringLiteral("192.168.1.50"), {true, false});
+        }
+        f.mock.muted = true;  // this radio's operator muted it
+        AppConfig config = f.baseConfig();
+        config.muteExpert = false;
+        f.start(config);
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink && f.sink->framesWritten > 0, kTimeout);
+        QTest::qWait(200);
+        f.engine().shutdown();
+
+        QCOMPARE(f.mock.muteCommandsSent(false), 0);
+        QVERIFY(f.mock.muted);
+        // And the other radio's debt is still on record for when it comes back.
+        QVERIFY(Settings(f.settingsPath).loadMuteOwnership(QStringLiteral("192.168.1.50")).owned);
+    }
+
+    void applyingAChainChangesTheSoundAtOnce()
+    {
+        Fixture f;
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink && f.sink->framesWritten > 4800, kTimeout);
+
+        float peak = 0.0f;
+        const auto measure = [&] {
+            f.sink->samples.clear();
+            QTest::qWait(150);
+            peak = 0.0f;
+            for (float v : f.sink->samples) peak = std::max(peak, std::fabs(v));
+        };
+        measure();
+        QVERIFY(peak > 0.1f && peak <= 0.2001f);  // the mock's dry signal
+
+        ChainSettings chain;
+        chain.params.insert(QStringLiteral("eq.enabled"), 1);
+        chain.params.insert(QStringLiteral("eq.master"), 12);
+        f.engine().applyChainSettings(chain);
+        QTest::qWait(100);
+        measure();
+        QVERIFY2(peak > 0.5f, "the chain did not change");
+
+        f.engine().applyChainSettings(defaultChain());
+        QTest::qWait(100);
+        measure();
+        QVERIFY2(peak <= 0.2001f, "factory settings did not restore the dry signal");
+        f.engine().shutdown();
+    }
+
+    void applyingAChainStartsItsNoiseReduction()
+    {
+        Fixture f;
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink && f.sink->framesWritten > 0, kTimeout);
+        ChainSettings chain;
+        chain.nrMethod = QStringLiteral("rn2");
+        f.engine().applyChainSettings(chain);
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.nrMethod, QStringLiteral("rn2"), kTimeout);
+        QTRY_VERIFY_WITH_TIMEOUT(!f.status.nrPreparing, kTimeout);
+        QVERIFY(!f.status.nrFailed);
+        f.engine().shutdown();
     }
 
     void ownershipIsPersistedWhileHeld()
@@ -301,11 +369,11 @@ private slots:
         Fixture f;
         f.start();
         QTRY_VERIFY_WITH_TIMEOUT(f.mock.muted, kTimeout);
-        const auto held = Settings(f.settingsPath).loadMuteOwnership();
+        const auto held = Settings(f.settingsPath).loadMuteOwnership(QStringLiteral("127.0.0.1"));
         QVERIFY(held.owned);
         QVERIFY(!held.priorMuted);
         f.engine().shutdown();
-        QVERIFY(!Settings(f.settingsPath).loadMuteOwnership().owned);
+        QVERIFY(!Settings(f.settingsPath).loadMuteOwnership(QStringLiteral("127.0.0.1")).owned);
     }
 
     void aFailedOutputMeansNoMute()
@@ -576,9 +644,87 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(f.mock.muted, kTimeout);
         QTest::qWait(100);
         f.engine().disconnectRadio();
-        QVERIFY(!f.mock.muted);
+        QTRY_VERIFY_WITH_TIMEOUT(!f.mock.muted, kTimeout);
         QTRY_VERIFY_WITH_TIMEOUT(f.mock.commands.contains(QStringLiteral("audio_stop:0")), kTimeout);
         QTRY_COMPARE_WITH_TIMEOUT(f.status.connection, TciClient::State::Disconnected, kTimeout);
+        f.engine().shutdown();
+    }
+
+    // Switching radios: a connect arriving while the old radio gets its mute back must not be
+    // undone by the disconnect still in progress. It once was, by a nested event loop.
+    void connectingDuringADisconnectEndsUpConnected()
+    {
+        Fixture f;
+        MockExpert second;
+        QVERIFY(second.listen());
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.mock.muted, kTimeout);
+        QTest::qWait(100);
+
+        f.engine().disconnectRadio();
+        AppConfig config = f.baseConfig();
+        config.port = second.port();
+        f.engine().configure(config);
+        f.engine().connectRadio();
+
+        QTRY_VERIFY_WITH_TIMEOUT(!f.mock.muted, kTimeout);  // the first radio got its mute back
+        QTRY_VERIFY_WITH_TIMEOUT(second.muted, kTimeout);   // and the second is playing
+        QTest::qWait(300);
+        QCOMPARE(f.status.connection, TciClient::State::Ready);
+        QCOMPARE(f.status.connectedPort, second.port());
+        QVERIFY2(f.status.audioFlowing, "the new connection was torn down");
+        QVERIFY(f.status.outputOpen);
+        f.engine().shutdown();
+        QVERIFY(!second.muted);
+    }
+
+    void aDisconnectAfterThatConnectCancelsIt()
+    {
+        Fixture f;
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.mock.muted, kTimeout);
+        QTest::qWait(100);
+        const int startsBefore = f.mock.audioStartCount();
+
+        f.engine().disconnectRadio();
+        f.engine().connectRadio();
+        f.engine().disconnectRadio();
+
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.connection, TciClient::State::Disconnected, kTimeout);
+        QTest::qWait(300);
+        QCOMPARE(f.status.connection, TciClient::State::Disconnected);
+        QCOMPARE(f.mock.audioStartCount(), startsBefore);
+        QVERIFY(!f.mock.muted);
+        f.engine().shutdown();
+    }
+
+    // The window closing just after Disconnect was pressed. shutdown() must still see it through.
+    void shuttingDownDuringADisconnectStillRestoresTheMute()
+    {
+        Fixture f;
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.mock.muted, kTimeout);
+        QTest::qWait(100);
+        f.engine().disconnectRadio();
+        f.engine().shutdown();
+        QVERIFY(!f.mock.muted);
+        QVERIFY(!Settings(f.settingsPath).loadMuteOwnership(QStringLiteral("127.0.0.1")).owned);
+    }
+
+    void aRadioThatNeverConfirmsTheRestoreCannotHangADisconnect()
+    {
+        Fixture f;
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.mock.muted, kTimeout);
+        QTest::qWait(100);
+        f.mock.dropMuteSets = 100;  // it will never honour the restore
+        QElapsedTimer timer;
+        timer.start();
+        f.engine().disconnectRadio();
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.connection, TciClient::State::Disconnected, kTimeout);
+        QVERIFY2(timer.elapsed() < 3000, qPrintable(QString::number(timer.elapsed())));
+        // What is owed stays on record, so the next session can still put it right.
+        QVERIFY(Settings(f.settingsPath).loadMuteOwnership(QStringLiteral("127.0.0.1")).owned);
         f.engine().shutdown();
     }
 

@@ -4,6 +4,7 @@
 #include "dsp/RxChain.h"
 
 #include <QSettings>
+#include <QUrl>
 
 #include <algorithm>
 
@@ -66,6 +67,7 @@ AppConfig Settings::load() const
     c.nrMethod = s.value(QStringLiteral("nr/method")).toString();
     if (!findNrMethod(c.nrMethod)) c.nrMethod.clear();  // e.g. settings moved from another platform
     c.nrAutoBypass = s.value(QStringLiteral("nr/autoBypass"), c.nrAutoBypass).toBool();
+    c.profileName = s.value(QStringLiteral("chain/profile")).toString();
     c.stageOrder = s.value(QStringLiteral("chain/order"), RxChain::stageIds()).toStringList();
 
     s.beginGroup(QStringLiteral("params"));
@@ -93,6 +95,7 @@ void Settings::save(const AppConfig& c)
     s.setValue(QStringLiteral("output/muteExpert"), c.muteExpert);
     s.setValue(QStringLiteral("chain/rate"), c.chainRate);
     s.setValue(QStringLiteral("chain/order"), c.stageOrder);
+    s.setValue(QStringLiteral("chain/profile"), c.profileName);
     s.setValue(QStringLiteral("nr/method"), c.nrMethod);
     s.setValue(QStringLiteral("nr/autoBypass"), c.nrAutoBypass);
 
@@ -106,18 +109,34 @@ void Settings::save(const AppConfig& c)
     s.sync();
 }
 
-Settings::MuteOwnership Settings::loadMuteOwnership() const
+namespace {
+
+QString ownershipGroup(const QString& radioHost)
 {
+    return QStringLiteral("muteOwnership/")
+           + QString::fromLatin1(QUrl::toPercentEncoding(radioHost.toLower()));
+}
+
+} // namespace
+
+Settings::MuteOwnership Settings::loadMuteOwnership(const QString& radioHost) const
+{
+    const QString group = ownershipGroup(radioHost);
     MuteOwnership o;
-    o.owned = m_settings->value(QStringLiteral("muteOwnership/owned"), false).toBool();
-    o.priorMuted = m_settings->value(QStringLiteral("muteOwnership/priorMuted"), false).toBool();
+    o.owned = m_settings->value(group + QStringLiteral("/owned"), false).toBool();
+    o.priorMuted = m_settings->value(group + QStringLiteral("/priorMuted"), false).toBool();
     return o;
 }
 
-void Settings::saveMuteOwnership(const MuteOwnership& o)
+void Settings::saveMuteOwnership(const QString& radioHost, const MuteOwnership& o)
 {
-    m_settings->setValue(QStringLiteral("muteOwnership/owned"), o.owned);
-    m_settings->setValue(QStringLiteral("muteOwnership/priorMuted"), o.priorMuted);
+    const QString group = ownershipGroup(radioHost);
+    if (o.owned) {
+        m_settings->setValue(group + QStringLiteral("/owned"), true);
+        m_settings->setValue(group + QStringLiteral("/priorMuted"), o.priorMuted);
+    } else {
+        m_settings->remove(group);  // nothing owed: leave no trace of every radio ever used
+    }
     m_settings->sync();  // must survive a crash a moment later
 }
 

@@ -51,23 +51,18 @@ Engine::Engine(const QString& settingsPath, SinkFactory sinkFactory, QObject* pa
       m_settings(std::make_unique<Settings>(settingsPath)),
       m_tci(new TciClient(this)),
       m_housekeeping(this),  // parented so moveToThread() carries them along
+      m_closeTimer(this),
       m_nrPool(this)
 {
     qRegisterMetaType<EngineStatus>();
     qRegisterMetaType<AppConfig>();
+    qRegisterMetaType<ChainSettings>();
     qRegisterMetaType<QList<AudioDeviceInfo>>();
     qRegisterMetaType<tci::StreamHeader>();
 
     m_clock.start();
 
-    const Settings::MuteOwnership stored = m_settings->loadMuteOwnership();
-    MuteController::Actions actions;
-    actions.sendMute = [this](bool muted) { m_tci->sendMute(muted); };
-    actions.persist = [this](const MuteController::Ownership& o) {
-        m_settings->saveMuteOwnership({o.owned, o.priorMuted});
-    };
-    m_mute = std::make_unique<MuteController>(std::move(actions),
-                                              MuteController::Ownership{stored.owned, stored.priorMuted});
+    prepareMuteFor(QString());
 
     connect(m_tci, &TciClient::stateChanged, this, &Engine::onConnectionState);
     connect(m_tci, &TciClient::muteReported, this, &Engine::onMuteReported);
@@ -77,6 +72,9 @@ Engine::Engine(const QString& settingsPath, SinkFactory sinkFactory, QObject* pa
     connect(m_tci, &TciClient::malformedBlock, this, [this] { ++m_malformedBlocks; });
 
     m_nrPool.setMaxThreadCount(1);
+
+    m_closeTimer.setInterval(20);
+    connect(&m_closeTimer, &QTimer::timeout, this, &Engine::continueClosing);
 
     m_housekeeping.setInterval(kHousekeepingMs);
     connect(&m_housekeeping, &QTimer::timeout, this, &Engine::onHousekeeping);
@@ -89,6 +87,21 @@ Engine::~Engine()
 }
 
 // ── Configuration ───────────────────────────────────────────────────────────
+
+void Engine::prepareMuteFor(const QString& host)
+{
+    if (m_mute && host == m_muteHost) return;  // keep what it knows, such as an operator override
+
+    const Settings::MuteOwnership stored = m_settings->loadMuteOwnership(host);
+    MuteController::Actions actions;
+    actions.sendMute = [this](bool muted) { m_tci->sendMute(muted); };
+    actions.persist = [this, host](const MuteController::Ownership& o) {
+        m_settings->saveMuteOwnership(host, {o.owned, o.priorMuted});
+    };
+    m_mute = std::make_unique<MuteController>(std::move(actions),
+                                              MuteController::Ownership{stored.owned, stored.priorMuted});
+    m_muteHost = host;
+}
 
 void Engine::configure(const AppConfig& config)
 {
@@ -172,6 +185,28 @@ void Engine::setParam(const QString& key, double value)
     }
 }
 
+void Engine::applyChainSettings(const ChainSettings& chain)
+{
+    const QString previousMethod = m_config.nrMethod;
+    applyChain(m_config, chain);
+    if (!m_chain) return;
+
+    // In table order, because the gate's mode must land before ratio and floor.
+    for (const ParamSpec& spec : RxChain::stageParams()) {
+        m_chain->setStageParam(spec.key, paramValue(m_config, spec));
+    }
+    m_chain->setStageOrder(m_config.stageOrder);
+    updateNrBypass();
+
+    if (m_config.nrMethod != previousMethod || m_nrFailed) {
+        startNrBuild();  // reads the new values, so they need setting first
+    } else if (const NrMethod* method = findNrMethod(m_config.nrMethod)) {
+        if (auto* processor = m_chain->nrProcessor()) {
+            for (const ParamSpec& spec : method->params) processor->setParam(spec.key, paramValue(m_config, spec));
+        }
+    }
+}
+
 void Engine::setStageOrder(const QStringList& order)
 {
     m_config.stageOrder = order;
@@ -207,10 +242,15 @@ void Engine::setCapture(const QString& basePath)
 
 void Engine::connectRadio()
 {
+    if (m_closing) {
+        m_connectAfterClosing = true;  // the previous radio is still getting its mute back
+        return;
+    }
     m_sessionActive = true;
     m_audioConfirmed = false;
     m_lastBlockMs = -1;
     m_counterValid = false;
+    prepareMuteFor(m_config.host);
     if (!m_chain) rebuildChain(m_config.chainRate);
     openSink();
     requestAudio();
@@ -220,29 +260,45 @@ void Engine::connectRadio()
 
 void Engine::disconnectRadio()
 {
+    m_connectAfterClosing = false;
+    if (m_closing) return;
+
     m_sessionActive = false;
     m_audioConfirmed = false;
     updateMuteWanted();
 
     // Give the restore a chance to land before the socket closes.
     if (!m_mute->settled() && m_tci->state() == TciClient::State::Ready) {
-        QEventLoop loop;
-        QTimer poll;
-        QElapsedTimer waited;
-        waited.start();
-        connect(&poll, &QTimer::timeout, &loop, [&] {
-            m_mute->tick(nowMs());
-            if (m_mute->settled() || waited.elapsed() > kShutdownWaitMs) loop.quit();
-        });
-        poll.start(20);
-        loop.exec(QEventLoop::ExcludeUserInputEvents);
+        m_closing = true;
+        m_closeDeadlineMs = nowMs() + kShutdownWaitMs;
+        m_closeTimer.start();
+        return;
     }
+    finishClosing();
+}
 
+void Engine::continueClosing()
+{
+    m_mute->tick(nowMs());
+    if (m_mute->settled() || nowMs() >= m_closeDeadlineMs
+        || m_tci->state() != TciClient::State::Ready) {
+        finishClosing();
+    }
+}
+
+void Engine::finishClosing()
+{
+    m_closeTimer.stop();
+    m_closing = false;
     m_tci->stopAudio();
     m_tci->flush();
     m_tci->close();
     closeSink();
     emitStatus();
+    if (m_connectAfterClosing) {
+        m_connectAfterClosing = false;
+        connectRadio();
+    }
 }
 
 void Engine::setReceiver(int receiver)
@@ -539,8 +595,23 @@ void Engine::emitStatus()
 
 void Engine::shutdown()
 {
+    m_connectAfterClosing = false;
     m_housekeeping.stop();
     if (m_sessionActive) disconnectRadio();
+
+    // Waiting here is safe where it was not in disconnectRadio(): the caller is blocked until this
+    // returns, so nothing can be queued that would pull the engine out from under it.
+    if (m_closing) {
+        QEventLoop loop;
+        QTimer poll;
+        connect(&poll, &QTimer::timeout, &loop, [this, &loop] {
+            if (!m_closing) loop.quit();
+        });
+        poll.start(10);
+        loop.exec(QEventLoop::ExcludeUserInputEvents);
+    }
+    m_connectAfterClosing = false;
+
     m_captureBefore.close();
     m_captureAfter.close();
     m_nrPool.waitForDone();

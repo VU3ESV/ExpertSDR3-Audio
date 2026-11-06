@@ -242,7 +242,7 @@ bool RxChain::setStageParam(const QString& key, double value)
     return true;
 }
 
-void RxChain::setStageOrder(const QStringList& order)
+QStringList RxChain::normalizedOrder(const QStringList& order)
 {
     const QStringList known = stageIds();
     QStringList result;
@@ -252,7 +252,12 @@ void RxChain::setStageOrder(const QStringList& order)
     for (const QString& id : known) {
         if (!result.contains(id)) result.append(id);
     }
-    m_order = result;
+    return result;
+}
+
+void RxChain::setStageOrder(const QStringList& order)
+{
+    m_order = normalizedOrder(order);
 }
 
 void RxChain::setNrProcessor(std::shared_ptr<NrProcessor> processor)

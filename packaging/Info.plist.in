@@ -15,6 +15,6 @@
     <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSLocalNetworkUsageDescription</key>
-    <string>Connects to ExpertSDR3's TCI server when it runs on another computer.</string>
+    <string>Finds ExpertSDR3 radios on your network, and connects to their TCI server.</string>
 </dict>
 </plist>
