@@ -24,9 +24,9 @@ published. It can also be started by hand, for just the platforms you name.
 | Platform | Files | Signing |
 |---|---|---|
 | macOS 13+ (Apple Silicon) | `-macos-arm64.dmg` | Developer ID, hardened runtime, notarized and stapled, on both the app and the DMG |
-| Windows 10+ (x64) | `-windows-x64-setup.exe`, `-windows-x64-portable.zip` | **Not Authenticode signed**, see below. Sigstore provenance once public |
-| Raspberry Pi (64-bit OS) | `-raspberrypi-arm64.deb`, `.AppImage` | Sigstore provenance once public |
-| Linux x86-64 | `-linux-x86_64.deb`, `.AppImage` | Sigstore provenance once public |
+| Windows 10+ (x64) | `-windows-x64-setup.exe`, `-windows-x64-portable.zip` | **Not Authenticode signed**, see below. Sigstore provenance |
+| Raspberry Pi (64-bit OS) | `-raspberrypi-arm64.deb`, `.AppImage` | Sigstore provenance |
+| Linux x86-64 | `-linux-x86_64.deb`, `.AppImage` | Sigstore provenance |
 
 Plus `SHA256SUMS`.
 
@@ -38,19 +38,11 @@ identity signs it through Sigstore, and anyone can check it:
 gh attestation verify <file> --repo VU3ESV/ExpertSDR3-Audio
 ```
 
-**The repository is private, and this step only runs on a public one,** because GitHub requires
-its Enterprise plan for attestations on private repositories. So for now these files have
-checksums only, and the step starts working by itself on the first release after the repository
-goes public. Also, while it is private, only people with access to it can download a release.
+GitHub only offers this on public repositories, unless on its Enterprise plan, so the step skips
+itself on a private one. v0.1.0 was built while this repository was still private and has
+checksums only; releases after it carry these signatures.
 
-## Costs while private
-
-Actions is free on a public repository. On a private one it draws on the plan's monthly minutes,
-reportedly with macOS billed at 10x and Windows at 2x. A full run takes about 5 minutes on macOS,
-17 on Windows and 25 across Linux, so about 110 billed minutes. Merges to `main` each cut a
-release, and every pull request runs CI, so both spend this automatically.
-
-To fix one platform without paying for the others:
+To fix one platform without waiting for the others:
 
 ```sh
 gh workflow run ci.yml --ref <branch> -f platforms="linux windows"
