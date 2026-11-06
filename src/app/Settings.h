@@ -45,6 +45,9 @@ double paramValue(const AppConfig& config, const ParamSpec& spec);
 class Settings {
 public:
     explicit Settings(const QString& path = QString());
+    // Another application's entry in the native store. Real installs keep their settings there,
+    // so tests use this to exercise that store without touching anyone's real settings.
+    Settings(const QString& organization, const QString& application);
     ~Settings();
 
     AppConfig load() const;
@@ -63,6 +66,9 @@ public:
     QString filePath() const;
 
 private:
+    explicit Settings(QSettings* store);
+    void adoptSingleMuteRecord();
+
     QSettings* m_settings;
 };
 

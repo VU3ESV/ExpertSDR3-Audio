@@ -33,11 +33,39 @@ double paramValue(const AppConfig& config, const ParamSpec& spec)
     return config.params.value(spec.key, spec.def);
 }
 
-Settings::Settings(const QString& path)
-    : m_settings(path.isEmpty()
-                     ? new QSettings(QStringLiteral("ExpertSDR3Audio"), QStringLiteral("ExpertSDR3Audio"))
-                     : new QSettings(path, QSettings::IniFormat))
+Settings::Settings(QSettings* store)
+    : m_settings(store)
 {
+    adoptSingleMuteRecord();
+}
+
+Settings::Settings(const QString& path)
+    : Settings(path.isEmpty()
+                   ? new QSettings(QStringLiteral("ExpertSDR3Audio"), QStringLiteral("ExpertSDR3Audio"))
+                   : new QSettings(path, QSettings::IniFormat))
+{
+}
+
+Settings::Settings(const QString& organization, const QString& application)
+    : Settings(new QSettings(organization, application))
+{
+}
+
+// v0.1.0 kept one record for whichever radio came next, naming none. Whoever it crashed on while
+// holding the mute should still get that radio back, and the saved host is the best guide there
+// is: the window saved it within seconds of connecting. Only a headless `--host` run went unsaved.
+void Settings::adoptSingleMuteRecord()
+{
+    const QString ownedKey = QStringLiteral("muteOwnership/owned");
+    const QString priorKey = QStringLiteral("muteOwnership/priorMuted");
+    if (!m_settings->contains(ownedKey)) return;
+
+    const MuteOwnership record{m_settings->value(ownedKey).toBool(), m_settings->value(priorKey).toBool()};
+    // Written before the old keys go, so dying in between only means doing this again.
+    if (record.owned) saveMuteOwnership(load().host, record);
+    m_settings->remove(ownedKey);
+    m_settings->remove(priorKey);
+    m_settings->sync();
 }
 
 Settings::~Settings()
