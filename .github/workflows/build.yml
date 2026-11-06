@@ -168,7 +168,6 @@ jobs:
           # Otherwise Qt sends its messages, including why it is aborting, to the Windows debug
           # log, and a failing test shows no output at all.
           QT_LOGGING_TO_CONSOLE: '1'
-          QT_DEBUG_PLUGINS: '1'
         run: ctest --test-dir build -C Release --output-on-failure --timeout 300
 
       - name: Package
@@ -294,12 +293,15 @@ jobs:
           path: dist
 
       # Before the .deb, so the AppImage cannot pass by borrowing what the .deb pulls in.
-      # These are the few system libraries an AppImage leaves to the host on purpose.
+      # Exactly the libraries linuxdeploy leaves to the host on purpose: any desktop has them,
+      # a headless Raspberry Pi OS Lite does not, which is why the .deb is its package.
       - name: Smoke test the AppImage
         env:
           APPIMAGE_EXTRACT_AND_RUN: '1'
         run: |
-          apt-get install -y --no-install-recommends libgl1 libegl1 libopengl0 libglib2.0-0 libfontconfig1 libfreetype6 libdbus-1-3
+          apt-get install -y --no-install-recommends \
+            libegl1 libglx0 libglvnd0 libopengl0 libx11-6 libx11-xcb1 libxcb1 libice6 libsm6 \
+            libfontconfig1 libfreetype6 libharfbuzz0b libexpat1 libuuid1 libcom-err2 libgpg-error0 zlib1g
           apt-get install -y --no-install-recommends libasound2t64 || apt-get install -y --no-install-recommends libasound2
           chmod +x dist/*.AppImage
           scripts/smoke-test.sh "$(ls "$PWD"/dist/*.AppImage)" "$VERSION" offscreen
