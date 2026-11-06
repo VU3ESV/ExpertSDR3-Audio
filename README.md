@@ -120,12 +120,13 @@ is really playing, and undoes it when you disconnect or quit.
 
 | Platform | Status |
 |---|---|
-| macOS (Apple Silicon) | Tested live against ExpertSDR3 2.1 on a ColibriDDC, including the Developer ID signed build from its DMG |
-| Windows | **Not yet built or run.** The pipeline is written but has not run |
-| Linux x86-64 | **Not yet built or run.** The pipeline is written but has not run |
-| Raspberry Pi (64-bit) | **Not yet built or run.** The pipeline is written but has not run. It builds on arm64 Debian, not on a real Pi |
+| macOS (Apple Silicon) | Tested live against ExpertSDR3 2.1 on a ColibriDDC, including the Developer ID signed build from its DMG. Built and tested in CI |
+| Windows | Built, tested and run from both the installer and the zip in CI. **Not yet tried on a real PC, with a radio or sound device** |
+| Linux x86-64 | Built, tested, and run from the `.deb` and AppImage on Debian 12 and 13 and Ubuntu 24.04 and 26.04 in CI. **Not yet tried with a radio or sound device** |
+| Raspberry Pi (64-bit) | The same, on arm64. **Not yet tried on a real Pi** |
 
-**Raspberry Pi.** Start with `nr2`. The neural methods need about 28% of an Apple Silicon
+**Raspberry Pi.** Install the `.deb`, which also suits a headless Pi OS Lite; the AppImage needs
+the desktop version's libraries. Start with `nr2`. The neural methods need about 28% of an Apple Silicon
 core here, and a Pi core is several times slower, so they may not keep up; the app warns if
 so. Note that `--rate 24000` adds about 150 ms of delay from resampling and does not make
 RN2 any cheaper, because RNNoise always runs at 48 kHz internally.

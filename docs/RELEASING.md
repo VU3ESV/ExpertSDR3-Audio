@@ -46,8 +46,9 @@ goes public. Also, while it is private, only people with access to it can downlo
 ## Costs while private
 
 Actions is free on a public repository. On a private one it draws on the plan's monthly minutes,
-with macOS reportedly billed at 10x and Windows at 2x, so the Mac build is most of the cost of
-a run. Merges to `main` each cut a release, so they spend this automatically.
+reportedly with macOS billed at 10x and Windows at 2x. A full run takes about 5 minutes on macOS,
+17 on Windows and 25 across Linux, so about 110 billed minutes. Merges to `main` each cut a
+release, and every pull request runs CI, so both spend this automatically.
 
 To fix one platform without paying for the others:
 
@@ -131,8 +132,14 @@ SMOKE_METHODS="nr2 nr4 mnr dfnr rn2 nnr" scripts/smoke-test.sh \
 - **Qt 6.10, not the 6.8 LTS:** Qt 6.8.3 links Apple's AGL framework, which current macOS SDKs
   have removed, and later 6.8 patches are commercial-only.
 - **Debian Bookworm builds the Linux packages:** the oldest supported system sets the glibc floor
-  (2.36), and CI installs the results on Bookworm, Trixie and Ubuntu 24.04 to prove they work.
-  Ubuntu 22.04 is too old.
+  (2.36), and CI installs the results on Bookworm, Trixie, Ubuntu 24.04 and Ubuntu 26.04 to prove
+  they work. Ubuntu 22.04 is too old.
+- **The `.deb` lists its dependencies by hand:** generating them adds Debian's strict
+  `qt6-websockets-abi (= 6.4.2)`, and the package then refuses to install on anything newer.
+- **No JACK on Linux:** PortAudio is linked statically without it, because an AppImage linking
+  `libjack` will not start on most desktops. Audio reaches PipeWire and PulseAudio through ALSA.
+- **The AppImage needs a desktop's libraries:** `libOpenGL`, `libharfbuzz`, `libX11` and others
+  are left to the host on purpose. The list CI tests against is in `build.yml`.
 - **linuxdeploy comes from its rolling `continuous` release,** as it publishes no stable ones, so
   an AppImage build can break through no change here.
 - **The DeepFilterNet library is AetherSDR's prebuilt one,** checked against the SHA-256 pinned in
