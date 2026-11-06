@@ -9,6 +9,10 @@
 #include <random>
 #include <vector>
 
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
+
 using namespace esa;
 
 namespace {
@@ -299,6 +303,22 @@ private slots:
                  qPrintable(QStringLiteral("speech dropped by %1 dB").arg(score.signalGainDb)));
         QVERIFY2(score.delayMs < 400.0, qPrintable(QStringLiteral("delay %1 ms").arg(score.delayMs)));
     }
+
+#ifdef HAVE_DFNR
+    // On a Mac VM DFNR would crash the app, because its library needs AMX unconditionally.
+    void dfnrIsOfferedExceptInAMacVirtualMachine()
+    {
+        bool expected = true;
+#ifdef __APPLE__
+        int virtualized = 0;
+        size_t size = sizeof(virtualized);
+        if (sysctlbyname("kern.hv_vmm_present", &virtualized, &size, nullptr, 0) == 0) {
+            expected = virtualized == 0;
+        }
+#endif
+        QCOMPARE(findNrMethod(QStringLiteral("dfnr")) != nullptr, expected);
+    }
+#endif
 
     void everyMethodSurvivesResetAndSilence()
     {

@@ -32,6 +32,9 @@ differ, but are not a listening test, and real band noise behaves differently. C
 share of one Apple Silicon core, in stereo, on a live stream. Delay excludes the output
 buffer (60 ms by default).
 
+DFNR is not offered when macOS runs in a virtual machine: its library always uses an Apple
+Silicon coprocessor that VMs do not expose, so it would crash.
+
 NR is bypassed automatically on CW and digital modes, because those signals are not speech
 and a speech model treats a steady carrier as noise. You can turn this off.
 

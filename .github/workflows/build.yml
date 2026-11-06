@@ -86,10 +86,13 @@ jobs:
       - name: Build
         run: cmake --build build
 
+      # The caps are not caution for its own sake: a crash inside a test once made QtTest loop on
+      # its signal handler, printing 5.5 million lines and billing 53 macOS minutes.
       - name: Test
+        timeout-minutes: 15
         env:
           QT_QPA_PLATFORM: offscreen
-        run: ctest --test-dir build --output-on-failure --timeout 300
+        run: ctest --test-dir build --output-on-failure --test-output-size-failed 100000 --stop-on-failure --timeout 240
 
       - name: Package, sign and notarize
         env:
@@ -103,9 +106,12 @@ jobs:
           NOTARY_PASSWORD: ${{ inputs.sign && secrets.NOTARY_PASSWORD || '' }}
         run: scripts/package-macos.sh build/ExpertSDR3Audio.app
 
+      # Not DFNR: the runner is a VM, where it is not offered. See dfnrCanRunHere(). So CI cannot
+      # cover DFNR on macOS, and docs/RELEASING.md's local rehearsal is what does.
       - name: Smoke test from the DMG
+        timeout-minutes: 10
         env:
-          SMOKE_METHODS: nr2 nr4 mnr dfnr rn2 nnr
+          SMOKE_METHODS: nr2 nr4 mnr rn2 nnr
         run: |
           MOUNT="$RUNNER_TEMP/dmg"
           mkdir -p "$MOUNT"
@@ -163,12 +169,13 @@ jobs:
         run: cmake --build build --config Release --parallel
 
       - name: Test
+        timeout-minutes: 15
         env:
           QT_QPA_PLATFORM: offscreen
           # Otherwise Qt sends its messages, including why it is aborting, to the Windows debug
           # log, and a failing test shows no output at all.
           QT_LOGGING_TO_CONSOLE: '1'
-        run: ctest --test-dir build -C Release --output-on-failure --timeout 300
+        run: ctest --test-dir build -C Release --output-on-failure --test-output-size-failed 100000 --stop-on-failure --timeout 240
 
       - name: Package
         run: scripts/package-windows.ps1 -Version $env:VERSION -BuildDir build\Release
@@ -245,9 +252,10 @@ jobs:
         run: cmake --build build
 
       - name: Test
+        timeout-minutes: 15
         env:
           QT_QPA_PLATFORM: offscreen
-        run: ctest --test-dir build --output-on-failure --timeout 300
+        run: ctest --test-dir build --output-on-failure --test-output-size-failed 100000 --stop-on-failure --timeout 240
 
       - name: Package
         run: scripts/package-linux.sh "$VERSION" build

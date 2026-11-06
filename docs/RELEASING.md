@@ -123,6 +123,11 @@ SMOKE_METHODS="nr2 nr4 mnr dfnr rn2 nnr" scripts/smoke-test.sh \
 
 ## Choices worth knowing about
 
+- **CI cannot test DFNR on macOS, so a release does not either.** GitHub's Mac runners are virtual
+  machines, where DFNR's library crashes for want of Apple's AMX coprocessor, so the app does not
+  offer it there. The local rehearsal above runs on real hardware and does cover it. Repeat it
+  whenever `vendor/aethersdr` changes.
+
 - **Qt 6.10, not the 6.8 LTS:** Qt 6.8.3 links Apple's AGL framework, which current macOS SDKs
   have removed, and later 6.8 patches are commercial-only.
 - **Debian Bookworm builds the Linux packages:** the oldest supported system sets the glibc floor
