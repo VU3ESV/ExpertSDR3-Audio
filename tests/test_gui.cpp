@@ -29,6 +29,8 @@
 #include <QTemporaryDir>
 #include <QtTest>
 
+#include <algorithm>
+
 using namespace esa;
 
 // Builds the real window against a real, unconnected engine, so it never reaches a
@@ -398,25 +400,39 @@ private slots:
         QVERIFY(radio.commands.isEmpty());
     }
 
+    // Refused at once on a Mac or Linux, but only after retries on Windows, and an address that
+    // never answers is slower still. TEST-NET is reserved: nothing is there on any real network.
+    void theDiscoveryDialogExplainsWhenThereIsNothing_data()
+    {
+        QTest::addColumn<QString>("host");
+        QTest::newRow("connection refused") << QStringLiteral("127.0.0.1");
+        QTest::newRow("no answer") << QStringLiteral("192.0.2.1");
+    }
     void theDiscoveryDialogExplainsWhenThereIsNothing()
     {
+        QFETCH(QString, host);
         QTcpServer probe;
         QVERIFY(probe.listen(QHostAddress::LocalHost, 0));
         const int closedPort = probe.serverPort();
         probe.close();
         TciDiscovery::Options options;
-        options.hosts = {QStringLiteral("127.0.0.1")};
+        options.hosts = {host};
         options.ports = {closedPort};
+        options.connectTimeoutMs = 400;
 
         RadioDiscoveryDialog dialog(options);
         dialog.show();
-        QTRY_VERIFY_WITH_TIMEOUT(!dialog.isScanning() && dialog.findChild<QListWidget*>()->count() == 0, 6000);
-        QTest::qWait(50);
+        // Waits on what the operator reads, because isScanning() is also false before a scan begins.
+        const auto explained = [&dialog] {
+            const auto labels = dialog.findChildren<QLabel*>();
+            return std::any_of(labels.begin(), labels.end(), [](const QLabel* label) {
+                return label->text().contains(QStringLiteral("TCI enabled"));
+            });
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(explained(), 6000);
+        QVERIFY(!dialog.isScanning());
+        QCOMPARE(dialog.findChild<QListWidget*>()->count(), 0);
         QVERIFY(!dialog.selectedRadio().has_value());
-        bool explained = false;
-        const auto labels = dialog.findChildren<QLabel*>();
-        for (QLabel* label : labels) explained = explained || label->text().contains(QStringLiteral("TCI enabled"));
-        QVERIFY(explained);
     }
 
     void pickingARadioConnectsToIt()
