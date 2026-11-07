@@ -35,6 +35,9 @@ run --list-params
 CHECK="--list-params exits cleanly"; check status_ok
 CHECK="--list-params lists the chain"; check contains "comp.threshold"
 
+run --list-profiles --settings "$WORK/profiles.ini"
+CHECK="--list-profiles exits cleanly"; check status_ok
+
 run --list-devices
 CHECK="--list-devices exits cleanly (PortAudio loads)"; check status_ok
 

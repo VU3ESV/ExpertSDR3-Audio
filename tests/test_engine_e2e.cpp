@@ -5,6 +5,7 @@
 
 #include <QElapsedTimer>
 #include <QHostAddress>
+#include <QRegularExpression>
 #include <QSettings>
 #include <QTcpServer>
 #include <QTemporaryDir>
@@ -14,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <memory>
 #include <vector>
 
 using namespace esa;
@@ -108,6 +110,60 @@ public:
 };
 
 constexpr int kTimeout = 5000;
+
+// One settings store for one test: an ini file like the other tests use, or the native store
+// that real installs use (a plist, the registry), under a name no real install has.
+class SettingsStore {
+public:
+    explicit SettingsStore(bool native) : m_native(native) { clear(); }
+    // The native store keeps an empty entry under this fixed name. Deleting that file as well would
+    // only race a Mac's preferences daemon, which writes it back.
+    ~SettingsStore() { clear(); }
+
+    std::unique_ptr<QSettings> raw() const
+    {
+        return m_native ? std::make_unique<QSettings>(kOrganization, kApplication)
+                        : std::make_unique<QSettings>(m_dir.filePath(QStringLiteral("settings.ini")),
+                                                      QSettings::IniFormat);
+    }
+    std::unique_ptr<Settings> open() const
+    {
+        return m_native ? std::make_unique<Settings>(kOrganization, kApplication)
+                        : std::make_unique<Settings>(m_dir.filePath(QStringLiteral("settings.ini")));
+    }
+    // Writes what v0.1.0 left behind: one record, naming no radio.
+    void writeOldMuteRecord(bool owned, bool priorMuted) const
+    {
+        const auto store = raw();
+        store->setValue(QStringLiteral("muteOwnership/owned"), owned);
+        store->setValue(QStringLiteral("muteOwnership/priorMuted"), priorMuted);
+    }
+    // Macs add global keys to allKeys(), so only ours count.
+    QStringList muteKeys() const
+    {
+        return raw()->allKeys().filter(QRegularExpression(QStringLiteral("^muteOwnership")));
+    }
+
+private:
+    void clear() const
+    {
+        const auto store = raw();
+        store->clear();
+        store->sync();
+    }
+
+    inline static const QString kOrganization = QStringLiteral("ExpertSDR3Audio-Tests");
+    inline static const QString kApplication = QStringLiteral("SettingsStore");
+    bool m_native;
+    QTemporaryDir m_dir;
+};
+
+void addEachStore()
+{
+    QTest::addColumn<bool>("native");
+    QTest::newRow("ini file") << false;
+    QTest::newRow("native store") << true;
+}
 
 } // namespace
 
@@ -285,7 +341,7 @@ private slots:
         {
             // The previous process died holding the mute.
             Settings previous(f.settingsPath);
-            previous.saveMuteOwnership({true, false});
+            previous.saveMuteOwnership(QStringLiteral("127.0.0.1"), {true, false});
         }
         f.mock.muted = true;
         AppConfig config = f.baseConfig();
@@ -293,7 +349,190 @@ private slots:
         f.start(config);
         QTRY_VERIFY_WITH_TIMEOUT(!f.mock.muted, kTimeout);
         f.engine().shutdown();
-        QCOMPARE(Settings(f.settingsPath).loadMuteOwnership().owned, false);
+        QCOMPARE(Settings(f.settingsPath).loadMuteOwnership(QStringLiteral("127.0.0.1")).owned, false);
+    }
+
+    // With several radios on a network, a mute owed to one says nothing about another, which its
+    // operator may have muted themselves. Unmuting that one would be exactly wrong.
+    void aMuteOwedToOneRadioIsNotAppliedToAnother()
+    {
+        Fixture f;
+        {
+            Settings previous(f.settingsPath);
+            previous.saveMuteOwnership(QStringLiteral("192.168.1.50"), {true, false});
+        }
+        f.mock.muted = true;  // this radio's operator muted it
+        AppConfig config = f.baseConfig();
+        config.muteExpert = false;
+        f.start(config);
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink && f.sink->framesWritten > 0, kTimeout);
+        QTest::qWait(200);
+        f.engine().shutdown();
+
+        QCOMPARE(f.mock.muteCommandsSent(false), 0);
+        QVERIFY(f.mock.muted);
+        // And the other radio's debt is still on record for when it comes back.
+        QVERIFY(Settings(f.settingsPath).loadMuteOwnership(QStringLiteral("192.168.1.50")).owned);
+    }
+
+    // v0.1.0 kept one record, naming no radio. Whoever it crashed on while holding the mute must
+    // still get their radio back after upgrading.
+    void aMuteOwedBeforeUpgradingIsStillRestored()
+    {
+        Fixture f;
+        {
+            QSettings previous(f.settingsPath, QSettings::IniFormat);
+            previous.setValue(QStringLiteral("radio/host"), QStringLiteral("127.0.0.1"));
+            previous.setValue(QStringLiteral("muteOwnership/owned"), true);
+            previous.setValue(QStringLiteral("muteOwnership/priorMuted"), false);
+        }
+        f.mock.muted = true;
+        AppConfig config = f.baseConfig();
+        config.muteExpert = false;
+        f.start(config);
+        QTRY_VERIFY_WITH_TIMEOUT(!f.mock.muted, kTimeout);
+        f.engine().shutdown();
+        QVERIFY(!Settings(f.settingsPath).loadMuteOwnership(QStringLiteral("127.0.0.1")).owned);
+    }
+
+    void theOldMuteRecordMovesToTheSavedRadio_data() { addEachStore(); }
+    void theOldMuteRecordMovesToTheSavedRadio()
+    {
+        QFETCH(bool, native);
+        const SettingsStore store(native);
+        const QString radio = QStringLiteral("192.168.1.50");
+        store.raw()->setValue(QStringLiteral("radio/host"), radio);
+        store.writeOldMuteRecord(true, false);
+
+        const auto settings = store.open();
+        QVERIFY(settings->loadMuteOwnership(radio).owned);
+        QVERIFY(!settings->loadMuteOwnership(radio).priorMuted);
+        QVERIFY(!settings->loadMuteOwnership(QStringLiteral("127.0.0.1")).owned);
+        QVERIFY(!store.raw()->contains(QStringLiteral("muteOwnership/owned")));
+        QVERIFY(!store.raw()->contains(QStringLiteral("muteOwnership/priorMuted")));
+
+        // Starting again changes nothing, and neither does the debt being paid.
+        QVERIFY(store.open()->loadMuteOwnership(radio).owned);
+        settings->saveMuteOwnership(radio, {false, false});
+        QVERIFY(!store.open()->loadMuteOwnership(radio).owned);
+        QCOMPARE(store.muteKeys(), QStringList());
+    }
+
+    // A radio that was already muted must not be unmuted later, so this has to survive the move.
+    void theOldMuteRecordKeepsWhatTheRadioWasBefore_data() { addEachStore(); }
+    void theOldMuteRecordKeepsWhatTheRadioWasBefore()
+    {
+        QFETCH(bool, native);
+        const SettingsStore store(native);
+        const QString radio = QStringLiteral("192.168.1.50");
+        store.raw()->setValue(QStringLiteral("radio/host"), radio);
+        store.writeOldMuteRecord(true, true);
+
+        const auto record = store.open()->loadMuteOwnership(radio);
+        QVERIFY(record.owned);
+        QVERIFY(record.priorMuted);
+    }
+
+    void theOldMuteRecordWithNoSavedRadioMeansTheDefaultOne_data() { addEachStore(); }
+    void theOldMuteRecordWithNoSavedRadioMeansTheDefaultOne()
+    {
+        QFETCH(bool, native);
+        const SettingsStore store(native);
+        store.writeOldMuteRecord(true, false);
+        QVERIFY(store.open()->loadMuteOwnership(AppConfig{}.host).owned);
+    }
+
+    // What nearly every upgrade looks like: v0.1.0 also wrote the record when it owed nothing.
+    void anOldMuteRecordOwingNothingLeavesNothingBehind_data() { addEachStore(); }
+    void anOldMuteRecordOwingNothingLeavesNothingBehind()
+    {
+        QFETCH(bool, native);
+        const SettingsStore store(native);
+        store.raw()->setValue(QStringLiteral("radio/host"), QStringLiteral("192.168.1.50"));
+        store.writeOldMuteRecord(false, true);
+
+        const auto settings = store.open();
+        QVERIFY(!settings->loadMuteOwnership(QStringLiteral("192.168.1.50")).owned);
+        QCOMPARE(store.muteKeys(), QStringList());
+    }
+
+    // Host names carry dots, colons and percent signs, which a store could read as structure, and
+    // clearing one radio must not take another whose name starts the same way.
+    void aRadiosMuteRecordIsKeptAndClearedInEachStore_data() { addEachStore(); }
+    void aRadiosMuteRecordIsKeptAndClearedInEachStore()
+    {
+        QFETCH(bool, native);
+        const SettingsStore store(native);
+        const auto settings = store.open();
+        const QString ip = QStringLiteral("192.168.1.5");
+        const QString longerIp = QStringLiteral("192.168.1.50");
+        const QString name = QStringLiteral("radio");
+        const QString longerName = QStringLiteral("radio.local");
+        const QString ipv6 = QStringLiteral("fe80::1%en0");
+        const QStringList hosts{ip, longerIp, name, longerName, ipv6};
+
+        for (const QString& host : hosts) settings->saveMuteOwnership(host, {true, true});
+        for (const QString& host : hosts) {
+            const auto record = store.open()->loadMuteOwnership(host);
+            QVERIFY2(record.owned, qPrintable(host));
+            QVERIFY2(record.priorMuted, qPrintable(host));
+        }
+
+        settings->saveMuteOwnership(ip, {false, false});
+        settings->saveMuteOwnership(name, {false, false});
+        QVERIFY(!store.open()->loadMuteOwnership(ip).owned);
+        QVERIFY(!store.open()->loadMuteOwnership(name).owned);
+        QVERIFY(store.open()->loadMuteOwnership(longerIp).owned);
+        QVERIFY(store.open()->loadMuteOwnership(longerName).owned);
+        QVERIFY(store.open()->loadMuteOwnership(ipv6).owned);
+
+        for (const QString& host : hosts) settings->saveMuteOwnership(host, {false, false});
+        QCOMPARE(store.muteKeys(), QStringList());
+    }
+
+    void applyingAChainChangesTheSoundAtOnce()
+    {
+        Fixture f;
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink && f.sink->framesWritten > 4800, kTimeout);
+
+        float peak = 0.0f;
+        const auto measure = [&] {
+            f.sink->samples.clear();
+            QTest::qWait(150);
+            peak = 0.0f;
+            for (float v : f.sink->samples) peak = std::max(peak, std::fabs(v));
+        };
+        measure();
+        QVERIFY(peak > 0.1f && peak <= 0.2001f);  // the mock's dry signal
+
+        ChainSettings chain;
+        chain.params.insert(QStringLiteral("eq.enabled"), 1);
+        chain.params.insert(QStringLiteral("eq.master"), 12);
+        f.engine().applyChainSettings(chain);
+        QTest::qWait(100);
+        measure();
+        QVERIFY2(peak > 0.5f, "the chain did not change");
+
+        f.engine().applyChainSettings(defaultChain());
+        QTest::qWait(100);
+        measure();
+        QVERIFY2(peak <= 0.2001f, "factory settings did not restore the dry signal");
+        f.engine().shutdown();
+    }
+
+    void applyingAChainStartsItsNoiseReduction()
+    {
+        Fixture f;
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink && f.sink->framesWritten > 0, kTimeout);
+        ChainSettings chain;
+        chain.nrMethod = QStringLiteral("rn2");
+        f.engine().applyChainSettings(chain);
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.nrMethod, QStringLiteral("rn2"), kTimeout);
+        QTRY_VERIFY_WITH_TIMEOUT(!f.status.nrPreparing, kTimeout);
+        QVERIFY(!f.status.nrFailed);
+        f.engine().shutdown();
     }
 
     void ownershipIsPersistedWhileHeld()
@@ -301,11 +540,11 @@ private slots:
         Fixture f;
         f.start();
         QTRY_VERIFY_WITH_TIMEOUT(f.mock.muted, kTimeout);
-        const auto held = Settings(f.settingsPath).loadMuteOwnership();
+        const auto held = Settings(f.settingsPath).loadMuteOwnership(QStringLiteral("127.0.0.1"));
         QVERIFY(held.owned);
         QVERIFY(!held.priorMuted);
         f.engine().shutdown();
-        QVERIFY(!Settings(f.settingsPath).loadMuteOwnership().owned);
+        QVERIFY(!Settings(f.settingsPath).loadMuteOwnership(QStringLiteral("127.0.0.1")).owned);
     }
 
     void aFailedOutputMeansNoMute()
@@ -576,9 +815,87 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(f.mock.muted, kTimeout);
         QTest::qWait(100);
         f.engine().disconnectRadio();
-        QVERIFY(!f.mock.muted);
+        QTRY_VERIFY_WITH_TIMEOUT(!f.mock.muted, kTimeout);
         QTRY_VERIFY_WITH_TIMEOUT(f.mock.commands.contains(QStringLiteral("audio_stop:0")), kTimeout);
         QTRY_COMPARE_WITH_TIMEOUT(f.status.connection, TciClient::State::Disconnected, kTimeout);
+        f.engine().shutdown();
+    }
+
+    // Switching radios: a connect arriving while the old radio gets its mute back must not be
+    // undone by the disconnect still in progress. It once was, by a nested event loop.
+    void connectingDuringADisconnectEndsUpConnected()
+    {
+        Fixture f;
+        MockExpert second;
+        QVERIFY(second.listen());
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.mock.muted, kTimeout);
+        QTest::qWait(100);
+
+        f.engine().disconnectRadio();
+        AppConfig config = f.baseConfig();
+        config.port = second.port();
+        f.engine().configure(config);
+        f.engine().connectRadio();
+
+        QTRY_VERIFY_WITH_TIMEOUT(!f.mock.muted, kTimeout);  // the first radio got its mute back
+        QTRY_VERIFY_WITH_TIMEOUT(second.muted, kTimeout);   // and the second is playing
+        QTest::qWait(300);
+        QCOMPARE(f.status.connection, TciClient::State::Ready);
+        QCOMPARE(f.status.connectedPort, second.port());
+        QVERIFY2(f.status.audioFlowing, "the new connection was torn down");
+        QVERIFY(f.status.outputOpen);
+        f.engine().shutdown();
+        QVERIFY(!second.muted);
+    }
+
+    void aDisconnectAfterThatConnectCancelsIt()
+    {
+        Fixture f;
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.mock.muted, kTimeout);
+        QTest::qWait(100);
+        const int startsBefore = f.mock.audioStartCount();
+
+        f.engine().disconnectRadio();
+        f.engine().connectRadio();
+        f.engine().disconnectRadio();
+
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.connection, TciClient::State::Disconnected, kTimeout);
+        QTest::qWait(300);
+        QCOMPARE(f.status.connection, TciClient::State::Disconnected);
+        QCOMPARE(f.mock.audioStartCount(), startsBefore);
+        QVERIFY(!f.mock.muted);
+        f.engine().shutdown();
+    }
+
+    // The window closing just after Disconnect was pressed. shutdown() must still see it through.
+    void shuttingDownDuringADisconnectStillRestoresTheMute()
+    {
+        Fixture f;
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.mock.muted, kTimeout);
+        QTest::qWait(100);
+        f.engine().disconnectRadio();
+        f.engine().shutdown();
+        QVERIFY(!f.mock.muted);
+        QVERIFY(!Settings(f.settingsPath).loadMuteOwnership(QStringLiteral("127.0.0.1")).owned);
+    }
+
+    void aRadioThatNeverConfirmsTheRestoreCannotHangADisconnect()
+    {
+        Fixture f;
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.mock.muted, kTimeout);
+        QTest::qWait(100);
+        f.mock.dropMuteSets = 100;  // it will never honour the restore
+        QElapsedTimer timer;
+        timer.start();
+        f.engine().disconnectRadio();
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.connection, TciClient::State::Disconnected, kTimeout);
+        QVERIFY2(timer.elapsed() < 3000, qPrintable(QString::number(timer.elapsed())));
+        // What is owed stays on record, so the next session can still put it right.
+        QVERIFY(Settings(f.settingsPath).loadMuteOwnership(QStringLiteral("127.0.0.1")).owned);
         f.engine().shutdown();
     }
 

@@ -109,4 +109,9 @@ void ParamControl::setValue(double value)
     apply(value, true);
 }
 
+void ParamControl::setValueSilently(double value)
+{
+    apply(value, false);
+}
+
 } // namespace esa

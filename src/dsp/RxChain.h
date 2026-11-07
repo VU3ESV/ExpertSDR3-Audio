@@ -63,6 +63,8 @@ public:
 
     // Stage ids in upstream's default order.
     static QStringList stageIds();
+    // Unknown ids dropped, duplicates removed, and missing stages added at the end.
+    static QStringList normalizedOrder(const QStringList& order);
     static QString stageLabel(const QString& id);
     // Gate, EQ, Comp, Tube and Pudu parameters.
     static const QList<ParamSpec>& stageParams();

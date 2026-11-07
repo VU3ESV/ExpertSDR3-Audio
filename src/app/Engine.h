@@ -1,5 +1,6 @@
 #pragma once
 
+#include "app/Profiles.h"
 #include "app/Settings.h"
 #include "app/WavWriter.h"
 #include "audio/AudioSink.h"
@@ -73,6 +74,8 @@ public:
 public slots:
     void configure(const esa::AppConfig& config);
     void connectRadio();
+    // Returns at once. The socket closes once ExpertSDR3's mute has been restored. A connectRadio()
+    // meanwhile takes effect straight after that, so switching radios cannot lose its way.
     void disconnectRadio();
     void setReceiver(int receiver);
     void setOutputDevice(const QString& deviceKey);
@@ -85,12 +88,14 @@ public slots:
     void setNrMethod(const QString& id);
     void setStageOrder(const QStringList& order);
     void setParam(const QString& key, double value);
+    // Replaces the whole audio chain at once, as when a profile is loaded.
+    void applyChainSettings(const esa::ChainSettings& chain);
     void setCapture(const QString& basePath);
     // Rescans audio hardware. The output reopens briefly around it, because
     // PortAudio only sees new devices across a re-init.
     void refreshDevices();
-    // Restore ExpertSDR3's mute, stop audio and close. Returns once the restore is
-    // confirmed or has timed out. Call before deleting the engine.
+    // Restore ExpertSDR3's mute, stop audio and close. Unlike disconnectRadio(), this returns only
+    // once the restore is confirmed or has timed out. Call before deleting the engine.
     void shutdown();
 
 signals:
@@ -105,10 +110,14 @@ private slots:
     void onModulationChanged(int receiver, const QString& modulation);
     void onTransmitChanged(int receiver, bool transmitting);
     void onHousekeeping();
+    void continueClosing();
 
 private:
+    void finishClosing();
     void rebuildChain(int sampleRate);
     void startNrBuild();
+    // Mute ownership belongs to one radio, so a different radio gets its own controller.
+    void prepareMuteFor(const QString& host);
     void openSink();
     void closeSink();
     void updateMuteWanted();
@@ -123,10 +132,19 @@ private:
 
     TciClient* m_tci;
     std::unique_ptr<MuteController> m_mute;
+    QString m_muteHost;
     std::unique_ptr<RxChain> m_chain;
     std::unique_ptr<AudioSink> m_sink;
     QTimer m_housekeeping;
     QElapsedTimer m_clock;
+
+    // Disconnecting is a step that takes time, not a call that waits: ExpertSDR3's mute has to be
+    // restored before the socket closes. Waiting inside a nested event loop would let queued calls
+    // run in the middle of it, so a connect could be undone by the disconnect it interrupted.
+    QTimer m_closeTimer;
+    bool m_closing{false};
+    bool m_connectAfterClosing{false};
+    qint64 m_closeDeadlineMs{0};
 
     // NR objects are slow to build (model load, FFT planning), so they are built on
     // a pool and adopted on this thread. The generation discards a build the
@@ -173,4 +191,5 @@ private:
 
 Q_DECLARE_METATYPE(esa::EngineStatus)
 Q_DECLARE_METATYPE(esa::AppConfig)
+Q_DECLARE_METATYPE(esa::ChainSettings)
 Q_DECLARE_METATYPE(esa::AudioDeviceInfo)

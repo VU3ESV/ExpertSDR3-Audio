@@ -40,6 +40,12 @@ That is below the spec's own 10 ms recommendation, despite being its suggested m
 The app asks for 1024 (512 frames, 10.7 ms), and always derives frames as
 `length / channels`.
 
+## Radios cannot be discovered, only found
+
+The spec defines no discovery, and ExpertSDR3 2.1 advertises nothing over mDNS, so `TciDiscovery`
+tries each host and port and waits for the `protocol:` and `ready;` of the init burst. A server
+sends that to anyone who connects, so a probe never has to send a command.
+
 ## Other details
 
 - Sets that change nothing are still echoed, so a set can always be confirmed.

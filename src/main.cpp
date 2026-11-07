@@ -1,9 +1,11 @@
 #include "app/Engine.h"
+#include "app/Profiles.h"
 #include "app/Settings.h"
 #include "audio/PortAudioSink.h"
 #include "dsp/NrProcessor.h"
 #include "dsp/RxChain.h"
 #include "gui/MainWindow.h"
+#include "tci/TciDiscovery.h"
 
 #include <QApplication>
 #include <QCommandLineParser>
@@ -68,6 +70,28 @@ void printParams()
         if (!s.choices.isEmpty()) out() << "  (" << s.choices.join(QStringLiteral(", ")) << ")";
         out() << "\n";
     }
+}
+
+int runDiscovery()
+{
+    const TciDiscovery::Options options = TciDiscovery::localNetworkOptions();
+    out() << "Looking for TCI radios on " << options.hosts.size() << " addresses...\n";
+    out().flush();
+
+    TciDiscovery discovery;
+    QObject::connect(&discovery, &TciDiscovery::radioFound, qApp, [](const DiscoveredRadio& radio) {
+        out() << "  " << radio.title() << "\n      --host " << radio.host << " --port " << radio.port
+              << (radio.isThisComputer() ? "   (this computer)" : "") << "\n";
+        out().flush();
+    });
+    QObject::connect(&discovery, &TciDiscovery::finished, qApp, &QCoreApplication::quit, Qt::QueuedConnection);
+    discovery.start(options);
+    QCoreApplication::exec();
+
+    if (discovery.radios().isEmpty()) {
+        out() << "No radios found. Check that ExpertSDR3 is running with TCI enabled, and that its firewall allows the port.\n";
+    }
+    return 0;
 }
 
 // A key, an exact name or a unique part of a name, so `--device "USB"` works.
@@ -228,7 +252,8 @@ int main(int argc, char** argv)
     // such as a headless Raspberry Pi cannot create a QApplication at all.
     bool consoleOnly = false;
     for (int i = 1; i < argc; ++i) {
-        for (const char* flag : {"--headless", "--list-devices", "--list-params", "--help", "-h", "--version", "-v"}) {
+        for (const char* flag : {"--headless", "--list-devices", "--list-params", "--discover", "--list-profiles",
+                                 "--import-profile", "--export-profile", "--help", "-h", "--version", "-v"}) {
             if (std::strcmp(argv[i], flag) == 0) consoleOnly = true;
         }
     }
@@ -262,6 +287,11 @@ int main(int argc, char** argv)
     const QCommandLineOption headlessOpt(QStringLiteral("headless"), QStringLiteral("Run without a window."));
     const QCommandLineOption listDevicesOpt(QStringLiteral("list-devices"), QStringLiteral("List audio output devices and exit."));
     const QCommandLineOption listParamsOpt(QStringLiteral("list-params"), QStringLiteral("List NR methods and chain parameters and exit."));
+    const QCommandLineOption discoverOpt(QStringLiteral("discover"), QStringLiteral("Look for TCI radios on the local network and exit."));
+    const QCommandLineOption listProfilesOpt(QStringLiteral("list-profiles"), QStringLiteral("List saved audio chain profiles and exit."));
+    const QCommandLineOption profileOpt(QStringLiteral("profile"), QStringLiteral("Use this saved audio chain profile. --nr and --set still apply on top."), QStringLiteral("name"));
+    const QCommandLineOption importProfileOpt(QStringLiteral("import-profile"), QStringLiteral("Import profiles from a file and exit."), QStringLiteral("file"));
+    const QCommandLineOption exportProfileOpt(QStringLiteral("export-profile"), QStringLiteral("Print a saved profile as JSON and exit. Redirect it to a file."), QStringLiteral("name"));
     const QCommandLineOption hostOpt(QStringLiteral("host"), QStringLiteral("TCI server host."), QStringLiteral("host"));
     const QCommandLineOption portOpt(QStringLiteral("port"), QStringLiteral("TCI server port."), QStringLiteral("port"));
     const QCommandLineOption rxOpt(QStringLiteral("rx"), QStringLiteral("Receiver number."), QStringLiteral("n"));
@@ -278,7 +308,8 @@ int main(int argc, char** argv)
     const QCommandLineOption settingsOpt(QStringLiteral("settings"), QStringLiteral("Use this ini file instead of the normal settings store."), QStringLiteral("file"));
     const QCommandLineOption connectOpt(QStringLiteral("connect"), QStringLiteral("Connect immediately on startup."));
     const QCommandLineOption screenshotOpt(QStringLiteral("screenshot"), QStringLiteral("Save a PNG of the window after 2 s and exit (development)."), QStringLiteral("file"));
-    parser.addOptions({headlessOpt, listDevicesOpt, listParamsOpt, hostOpt, portOpt, rxOpt, deviceOpt, nrOpt,
+    parser.addOptions({headlessOpt, listDevicesOpt, listParamsOpt, discoverOpt, listProfilesOpt, profileOpt,
+                       importProfileOpt, exportProfileOpt, hostOpt, portOpt, rxOpt, deviceOpt, nrOpt,
                        setOpt, gainOpt, bufferOpt, deviceRateOpt, rateOpt, noMuteOpt, captureOpt, durationOpt, settingsOpt,
                        connectOpt, screenshotOpt});
     parser.process(*app);
@@ -292,9 +323,47 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    if (parser.isSet(discoverOpt)) return runDiscovery();
+
     const QString settingsPath = parser.value(settingsOpt);
     Settings settings(settingsPath);
     AppConfig config = settings.load();
+
+    ProfileLibrary profiles(ProfileLibrary::defaultPath(settingsPath));
+    if (!profiles.loadWarning().isEmpty()) qWarning("%s", qPrintable(profiles.loadWarning()));
+    if (parser.isSet(listProfilesOpt)) {
+        const QStringList names = profiles.names();
+        for (const QString& name : names) out() << name << "\n";
+        return 0;
+    }
+    if (parser.isSet(importProfileOpt)) {
+        const ImportResult result = profiles.importFile(parser.value(importProfileOpt));
+        if (!result.error.isEmpty()) {
+            qCritical("%s", qPrintable(result.error));
+            return 2;
+        }
+        for (const QString& name : result.imported) out() << "Imported " << name << "\n";
+        for (const QString& rename : result.renamed) out() << "Renamed " << rename << "\n";
+        return 0;
+    }
+    if (parser.isSet(exportProfileOpt)) {
+        const QByteArray document = profiles.exportDocument({parser.value(exportProfileOpt)});
+        if (document.isEmpty()) {
+            qCritical("No profile called \"%s\". See --list-profiles.", qPrintable(parser.value(exportProfileOpt)));
+            return 2;
+        }
+        out() << document;
+        return 0;
+    }
+    if (parser.isSet(profileOpt)) {
+        const Profile* profile = profiles.find(parser.value(profileOpt));
+        if (!profile) {
+            qCritical("No profile called \"%s\". See --list-profiles.", qPrintable(parser.value(profileOpt)));
+            return 2;
+        }
+        applyChain(config, profile->chain);
+        config.profileName = profile->name;
+    }
 
     if (parser.isSet(hostOpt)) config.host = parser.value(hostOpt);
     if (parser.isSet(portOpt)) {
@@ -357,7 +426,7 @@ int main(int argc, char** argv)
 
     QApplication::setStyle(QStyleFactory::create(QStringLiteral("Fusion")));
     QApplication::setWindowIcon(QIcon(QStringLiteral(":/icons/ExpertSDR3Audio-256.png")));
-    MainWindow window(host.engine(), &settings, config);
+    MainWindow window(host.engine(), &settings, &profiles, config);
     window.show();
     if (parser.isSet(connectOpt)) window.connectNow();
 

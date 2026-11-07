@@ -28,6 +28,7 @@ struct AppConfig {
     bool muteExpert{true};
     bool nrAutoBypass{true};
     QString nrMethod;  // empty: off
+    QString profileName;  // the profile these settings came from; empty: the factory settings
     QStringList stageOrder;
     QHash<QString, double> params;  // only keys that differ from their spec defaults
 };
@@ -44,23 +45,30 @@ double paramValue(const AppConfig& config, const ParamSpec& spec);
 class Settings {
 public:
     explicit Settings(const QString& path = QString());
+    // Another application's entry in the native store. Real installs keep their settings there,
+    // so tests use this to exercise that store without touching anyone's real settings.
+    Settings(const QString& organization, const QString& application);
     ~Settings();
 
     AppConfig load() const;
     void save(const AppConfig& config);
 
-    // Ownership of ExpertSDR3's mute, kept apart from `save()`: it is written from
-    // the engine thread and must reach the disk at once to survive a crash.
+    // Ownership of a radio's mute, kept apart from `save()`: it is written from the engine thread
+    // and must reach the disk at once to survive a crash. Per radio, because a mute we owe radio A
+    // says nothing about radio B, which its operator may well have muted themselves.
     struct MuteOwnership {
         bool owned{false};
         bool priorMuted{false};
     };
-    MuteOwnership loadMuteOwnership() const;
-    void saveMuteOwnership(const MuteOwnership& ownership);
+    MuteOwnership loadMuteOwnership(const QString& radioHost) const;
+    void saveMuteOwnership(const QString& radioHost, const MuteOwnership& ownership);
 
     QString filePath() const;
 
 private:
+    explicit Settings(QSettings* store);
+    void adoptSingleMuteRecord();
+
     QSettings* m_settings;
 };
 

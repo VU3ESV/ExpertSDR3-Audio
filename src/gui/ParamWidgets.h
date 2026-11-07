@@ -27,6 +27,8 @@ public:
     double value() const { return m_value; }
     // Updates the display and notifies, as if the operator had moved it.
     void setValue(double value);
+    // Updates the display only, for when the value is already applied elsewhere.
+    void setValueSilently(double value);
 
 signals:
     void valueChanged(const QString& key, double value);
