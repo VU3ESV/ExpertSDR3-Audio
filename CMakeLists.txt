@@ -246,6 +246,7 @@ add_library(aether_gui STATIC
     src/gui/aether/AppSettingsShim.cpp
     src/gui/aether/LogShim.cpp
     src/gui/aether/Appearance.cpp
+    src/gui/aether/Guards.cpp
     src/gui/aether/fork/CanonGround.cpp
     src/gui/aether/fork/NrGainStrip.cpp)
 target_include_directories(aether_gui PUBLIC
@@ -266,8 +267,8 @@ qt_add_resources(aether_gui "aether_fonts"
     BASE ${AETHER_TP}/inter
     FILES ${AETHER_TP}/inter/Inter-Regular.ttf ${AETHER_TP}/inter/Inter-Bold.ttf)
 # The tick in a ticked check box, which a style sheet cannot draw; Qt picks @2x or @3x
-# on a sharper screen. Upstream's tick, painted by fork/make-check-ticks.cpp (see the
-# README there).
+# on a sharper screen. Upstream's tick, painted by fork/tools/make-check-ticks.cpp (see
+# fork/README.md).
 set(CANON_TICKS ${CMAKE_SOURCE_DIR}/src/gui/aether/fork)
 qt_add_resources(aether_gui "canon_ticks"
     PREFIX "/canon"
@@ -299,8 +300,23 @@ add_library(esa_gui STATIC
     src/gui/AboutDialog.cpp src/gui/RadioDiscoveryDialog.cpp
     src/gui/shell/HeaderBar.cpp src/gui/shell/StatusChip.cpp
     src/gui/pages/Pages.cpp src/gui/pages/RadioPage.cpp src/gui/pages/NrPage.cpp
-    src/gui/pages/OutputPage.cpp src/gui/pages/LegacyStagePage.cpp)
+    src/gui/pages/OutputPage.cpp src/gui/pages/LegacyStagePage.cpp
+    src/gui/pages/StageHost.cpp src/gui/pages/GatePage.cpp
+    src/gui/binding/StageBinding.cpp)
 target_link_libraries(esa_gui PUBLIC esa_core aether_gui Qt6::Gui Qt6::Widgets)
+
+# ── The window's frame (ui/frame): the platform's own, or AetherRX's ─────────
+# Its own block, so it re-applies onto a restructured build. A Mac hides the system's title
+# text through AppKit, which Qt has no call for; Windows 11 rounds a frameless window's
+# corners through the DWM.
+target_sources(esa_gui PRIVATE src/gui/shell/WindowChrome.cpp)
+if(APPLE)
+    enable_language(OBJCXX)
+    target_sources(esa_gui PRIVATE src/gui/shell/mac/WindowChromeMac.mm)
+    target_link_libraries(esa_gui PRIVATE "-framework AppKit")
+elseif(WIN32)
+    target_link_libraries(esa_gui PRIVATE dwmapi)
+endif()
 qt_add_resources(esa_gui "app_icon"
     PREFIX "/icons"
     BASE ${CMAKE_SOURCE_DIR}/packaging/icons
@@ -379,11 +395,16 @@ endif()
 if(BUILD_TESTS)
     find_package(Qt6 REQUIRED COMPONENTS Test)
     enable_testing()
+    # Every test runs in the test sandbox (src/app/TestSandbox.h): no real audio output and none
+    # of ExpertSDR3's ports. A test that forgets its fake output or its mock radio is refused
+    # them, with a "Test sandbox:" warning, instead of making a sound or reaching the real
+    # radio. TestSandbox.cpp turns it on in the program itself too, for runs outside ctest.
+    set(esa_test_env "QT_QPA_PLATFORM=offscreen;ESA_TEST_SANDBOX=1")
     function(esa_test name)
-        qt_add_executable(${name} tests/${name}.cpp ${ARGN})
+        qt_add_executable(${name} tests/${name}.cpp tests/TestSandbox.cpp ${ARGN})
         target_link_libraries(${name} PRIVATE esa_core Qt6::Test)
         add_test(NAME ${name} COMMAND ${name})
-        set_tests_properties(${name} PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+        set_tests_properties(${name} PROPERTIES ENVIRONMENT "${esa_test_env}")
     endfunction()
     esa_test(test_tci_protocol)
     esa_test(test_mute_controller)
@@ -400,26 +421,27 @@ if(BUILD_TESTS)
     target_compile_definitions(test_recorder PRIVATE ESA_APP_BINARY="$<TARGET_FILE:ExpertSDR3Audio>")
     esa_test(test_gui tests/MockExpert.cpp)
     target_link_libraries(test_gui PRIVATE esa_gui)
-    # The window's shell: rail, header, menus, geometry and every way to close it. No radio.
-    esa_test(test_shell)
+    # The window's shell: rail, header, menus, geometry and every way to close it. MockExpert
+    # only for REC and PLAY from the window, end to end.
+    esa_test(test_shell tests/MockExpert.cpp)
     target_link_libraries(test_shell PRIVATE esa_gui)
 
-    # The vendored pages against the shims alone, without esa_core: no engine, no radio.
-    # src only for dsp/StageSet.h, which is header-only, so the pages draw from the stages
-    # the window's mirror holds.
-    qt_add_executable(test_aether_gui tests/test_aether_gui.cpp)
-    target_include_directories(test_aether_gui PRIVATE src)
-    target_link_libraries(test_aether_gui PRIVATE aether_gui Qt6::Test)
-    add_test(NAME test_aether_gui COMMAND test_aether_gui)
-    set_tests_properties(test_aether_gui PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+    # The sync-safety contract: the vendored pages against the shims alone, and then in the
+    # real window against a real, unconnected engine on the test thread, where every object
+    # the window looks up and every correction it makes from outside is checked. MockExpert
+    # only to show that BYPASS sends the radio nothing.
+    esa_test(test_aether_gui tests/MockExpert.cpp)
+    target_link_libraries(test_aether_gui PRIVATE esa_gui)
     # The vendored pages cache small drawn images (check boxes, arrows) in the user's cache
     # folder, which Qt's test mode only moves to ~/.qttest. Keep the GUI tests' copies in the
     # build tree. Test mode builds its path from HOME; on macOS the system asks
     # CFFIXED_USER_HOME, so both are set. Windows test runs still use %LOCALAPPDATA%\qttest.
     set(esa_test_home "${CMAKE_BINARY_DIR}/test-home")
     file(MAKE_DIRECTORY "${esa_test_home}")
+    # ESA_CHECK_MIRROR: the window compares the pages' display mirror with its settings once a
+    # second and logs the first difference, as a debug build always does.
     set_tests_properties(test_gui test_shell test_aether_gui PROPERTIES ENVIRONMENT
-        "QT_QPA_PLATFORM=offscreen;HOME=${esa_test_home};CFFIXED_USER_HOME=${esa_test_home}")
+        "${esa_test_env};HOME=${esa_test_home};CFFIXED_USER_HOME=${esa_test_home};ESA_CHECK_MIRROR=1")
     if(ENABLE_DFNR AND EXISTS ${DF_DIR}/models/DeepFilterNet3_onnx.tar.gz)
         qt_add_resources(test_rx_chain "dfnr_model_test"
             PREFIX "/models"

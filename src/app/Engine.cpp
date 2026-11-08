@@ -10,6 +10,8 @@
 #include <QLoggingCategory>
 #include <QMetaObject>
 #include <QPair>
+#include <QRunnable>
+#include <QThread>
 
 #include <algorithm>
 #include <cmath>
@@ -32,9 +34,10 @@ constexpr int kMeterIdleMs = 250;
 // PLAY's pump. Each tick hands the output what is due by then, so the tick only sets how
 // lumpy the delivery is, not its rate.
 constexpr int kPlayTickMs = 10;
-// An output opened for a playback alone holds about its buffer setting when the file ends,
-// and its drift control lets it run up to 150 ms over that (PlaybackBuffer::kOverrunSlackMs).
-// It closes once that much more time has passed, so the end of the file is heard.
+// An output opened for a playback alone holds about its target when the file ends: the buffer
+// setting, or more once underruns have raised it. Its drift control lets it run up to 150 ms
+// over that (PlaybackBuffer::kOverrunSlackMs). It closes once that much more time has passed,
+// so the end of the file is heard.
 constexpr int kPlayOutSlackMs = 200;
 
 float toDb(float linear)
@@ -215,12 +218,17 @@ void Engine::startNrBuild()
         values.append({spec.key, paramValue(m_config, spec)});
     }
     const auto create = method->create;
-    m_nrPool.start([this, generation, rate, values, create] {
+    // Made here, before the release, so the job and everything it captured are ordered before
+    // the pool thread's acquire (m_nrHandoff).
+    QRunnable* job = QRunnable::create([this, generation, rate, values, create] {
+        (void)m_nrHandoff.load(std::memory_order_acquire);
         std::shared_ptr<NrProcessor> built(create(rate).release());
         if (built) {
             for (const auto& value : values) built->setParam(value.first, value.second);
         }
+        m_nrHandoff.fetch_add(1, std::memory_order_release);  // what was built goes back
         QMetaObject::invokeMethod(this, [this, generation, built] {
+            (void)m_nrHandoff.load(std::memory_order_acquire);
             if (generation != m_nrGeneration) return;  // superseded
             m_nrPreparing = false;
             if (!built) {
@@ -231,6 +239,8 @@ void Engine::startNrBuild()
             m_chain->setNrProcessor(built);
         }, Qt::QueuedConnection);
     });
+    m_nrHandoff.fetch_add(1, std::memory_order_release);
+    m_nrPool.start(job);
 }
 
 void Engine::setNrMethod(const QString& id)
@@ -273,6 +283,15 @@ void Engine::applyChainSettings(const ChainSettings& chain)
             for (const ParamSpec& spec : method->params) processor->setParam(spec.key, paramValue(m_config, spec));
         }
     }
+}
+
+bool Engine::chainParam(const QString& key, double* value) const
+{
+    if (QThread::currentThread() != thread()) {
+        qCWarning(lcEngine) << "chainParam() is for the engine's own thread; refused";
+        return false;
+    }
+    return m_chain && RxChain::readStageParam(m_chain->stages(), key, value);
 }
 
 void Engine::setRxBypassed(bool on)
@@ -344,8 +363,10 @@ void Engine::refuseRecording(const QString& reason)
 {
     m_recordError = reason;
     m_recordRefused = true;
+    // At once, so the button flips back, and before the signal, so whoever hears the signal
+    // already knows it was a refusal and not a recording that stopped.
+    emitStatus();
     emit recordingFailed(reason);
-    emitStatus();  // at once, so the button flips back
 }
 
 void Engine::openRecordingSession()
@@ -482,6 +503,12 @@ void Engine::onRecorderFinished(quint64 id)
         m_lastRecordingRate = m_closedRecordRate;
         m_closedRecordPath.clear();
     }
+    // A PLAY pressed while it was being written out plays it now, or says why it cannot.
+    if (m_playQueued && m_endingRecordings.isEmpty()) {
+        m_playQueued = false;
+        startPlayback();  // reports its own status
+        return;
+    }
     emitStatus();
 }
 
@@ -529,7 +556,12 @@ void Engine::finishCapture()
 
 void Engine::finishRecordings()
 {
+    // A REC pressed while the link was coming up, still waiting because it never came. Nothing
+    // was recorded, and unlike after a stop nobody chose that, so the status says so: a
+    // headless run's summary would otherwise look like a recording that got no audio.
+    const bool neverConnected = m_recording && m_recordParts.isEmpty();
     endRecording(QString());
+    if (neverConnected) refuseRecording(QStringLiteral("The radio never connected, so nothing was recorded"));
     finishCapture();
     // Waits for the disk thread, so every file is whole by the time the engine says it is
     // disconnected or gone.
@@ -540,13 +572,22 @@ void Engine::finishRecordings()
 
 void Engine::startPlayback()
 {
-    if (m_play) return;  // already playing, as the status says
-    if (m_lastRecordingPath.isEmpty()) {
-        refusePlayback(QStringLiteral("Nothing has been recorded yet"));
-        return;
-    }
+    if (m_play || m_playQueued) return;  // already playing, or about to, as the status says
+    // Before anything is queued: a press while ExpertSDR3's mute is being given back is turned
+    // down, not left to play by itself once the disconnect is over.
     if (m_closing) {
         refusePlayback(QStringLiteral("Still disconnecting from the radio"));
+        return;
+    }
+    // A recording that has just stopped is still being written out, and PLAY is for that one,
+    // not the one before it. It starts when the disk thread is done (onRecorderFinished).
+    if (!m_endingRecordings.isEmpty()) {
+        m_playQueued = true;
+        emitStatus();
+        return;
+    }
+    if (m_lastRecordingPath.isEmpty()) {
+        refusePlayback(QStringLiteral("Nothing has been recorded yet"));
         return;
     }
     if (m_sessionActive && !m_sink) {
@@ -593,6 +634,11 @@ void Engine::startPlayback()
 
 void Engine::stopPlayback()
 {
+    if (m_playQueued) {
+        m_playQueued = false;
+        emitStatus();
+        return;
+    }
     endPlayback(QString());
 }
 
@@ -627,16 +673,25 @@ void Engine::pumpPlayback()
     const qint64 due = std::min(m_playPacer.take(now, qint64(ring.size())), qint64(m_playScratch.size() / 2));
     if (due > 0) {
         const size_t frames = ring.read(m_playScratch.data(), size_t(due));
-        const float* stereo = m_playScratch.data();
-        if (m_taps->outWanted.load(std::memory_order_relaxed)) m_taps->outTap.write(stereo, frames);
-        m_sink->write(stereo, int(frames));
+        if (frames > 0) sendToOutput(m_playScratch.data(), int(frames));
     }
     // The whole file has been handed over. What the output still buffers plays on.
     if (m_play->atEnd() && ring.size() == 0) endPlayback(QString(), true);
 }
 
+void Engine::sendToOutput(const float* stereo, int frames)
+{
+    m_outputPeak = std::max(m_outputPeak, peakOf(stereo, qsizetype(frames) * 2));
+    m_taps->outBlocks.fetch_add(1, std::memory_order_relaxed);
+    // Outside the sink's check, so the meter and scope keep running with no device. A full
+    // ring drops the rest: the window has fallen behind.
+    if (m_taps->outWanted.load(std::memory_order_relaxed)) m_taps->outTap.write(stereo, size_t(frames));
+    if (m_sink) m_sink->write(stereo, frames);
+}
+
 void Engine::endPlayback(const QString& failure, bool playOut)
 {
+    m_playQueued = false;  // one still waiting for its recording is called off as well
     if (!m_play) return;
     m_playTimer.stop();
     m_recorder.stopPlaying(m_play);
@@ -645,7 +700,8 @@ void Engine::endPlayback(const QString& failure, bool playOut)
     if (m_playOwnsSink && playOut && m_sink && !m_sessionActive) {
         // Closing now would cut off the last part of the file, which is still in the output's
         // buffer. The status says the playback is over meanwhile.
-        m_playDrain.start(std::max(0, m_config.bufferMs) + kPlayOutSlackMs);
+        const double holdsMs = std::max(double(m_config.bufferMs), m_sinkTargetMs);
+        m_playDrain.start(int(std::ceil(holdsMs)) + kPlayOutSlackMs);
     } else {
         releasePlaybackSink();
     }
@@ -667,7 +723,10 @@ void Engine::connectRadio()
 {
     endPlayback(QString());  // PLAY gives way to the radio
     releasePlaybackSink();   // and so does the end of one, still playing out
-    if (m_recordRefused) {   // the refusal is answered
+    // A new session starts with no recording trouble: a refusal is answered, and a recording
+    // that stopped early was the last session's, reported then. The status kept it until now,
+    // through the disconnect, for a headless run's summary.
+    if (!m_recording) {
         m_recordError.clear();
         m_recordRefused = false;
     }
@@ -802,6 +861,7 @@ void Engine::openSink()
     QString error;
     m_sink = m_sinkFactory(m_config, &error);
     m_sinkRate = m_sink ? m_config.chainRate : 0;
+    m_sinkTargetMs = 0.0;
     m_outputError = m_sink ? QString() : error;
     if (m_sink) {
         m_sink->setGainDb(m_config.outputGainDb);
@@ -826,6 +886,7 @@ void Engine::closeSink()
 {
     m_sink.reset();
     m_sinkRate = 0;
+    m_sinkTargetMs = 0.0;
     updateMuteWanted();
 }
 
@@ -894,6 +955,9 @@ void Engine::updateMuteWanted()
 void Engine::onAudioBlock(const tci::StreamHeader& header, const QByteArray& frame)
 {
     if (int(header.receiver) != m_config.receiver || !m_chain) return;
+    // Blocks still in flight while a closed socket shuts are the ended session's. Taken as
+    // audio they would show it flowing while disconnected, and reach an output a PLAY opened.
+    if (m_tci->state() != TciClient::State::Ready) return;
 
     const int frames = tci::decodeToStereo(header, frame.constData() + tci::kHeaderBytes,
                                            frame.size() - tci::kHeaderBytes, m_decoded);
@@ -967,8 +1031,6 @@ void Engine::publishBlock(const float* stereo, int frames)
     m_taps->nrActive.store(m_chain->nrActive(), std::memory_order_relaxed);
     m_taps->blocks.fetch_add(1, std::memory_order_relaxed);
 
-    m_outputPeak = std::max(m_outputPeak, peakOf(stereo, qsizetype(frames) * 2));
-
     // Recorded whatever happens to the output: a failed device, BYPASS, PLAY. The ring takes
     // it without a lock; the disk thread writes it out.
     const int rate = m_chain->sampleRate();
@@ -981,12 +1043,9 @@ void Engine::publishBlock(const float* stereo, int frames)
     }
     pushCapture(m_captureAfter, stereo, frames, rate);
 
-    // PLAY has the speakers and the scope meanwhile (pumpPlayback).
+    // PLAY has the speakers, the scope and the output meter meanwhile (pumpPlayback).
     if (m_play) return;
-    // Outside the sink's check, so the meter and scope keep running with no device. A
-    // full ring drops the rest: the window has fallen behind.
-    if (m_taps->outWanted.load(std::memory_order_relaxed)) m_taps->outTap.write(stereo, size_t(frames));
-    if (m_sink) m_sink->write(stereo, frames);
+    sendToOutput(stereo, frames);
 }
 
 void Engine::copyStageMeters()
@@ -1092,7 +1151,10 @@ void Engine::emitStatus()
     s.outputDevice = m_outputDeviceName;
     s.outputError = m_outputError;
     s.outputOpen = m_sink != nullptr;
-    if (m_sink) s.sink = m_sink->stats();
+    if (m_sink) {
+        s.sink = m_sink->stats();
+        m_sinkTargetMs = s.sink.targetMs;
+    }
     s.inputPeakDb = toDb(m_inputPeak);
     s.outputPeakDb = toDb(m_outputPeak);
     s.audioFlowing = m_audioConfirmed && m_lastBlockMs >= 0 && nowMs() - m_lastBlockMs < 1000;
@@ -1114,12 +1176,14 @@ void Engine::emitStatus()
     }
     s.recording.error = m_recordError;
     s.recording.refused = m_recordRefused && !m_recordError.isEmpty();
-    s.playback.active = m_play != nullptr;
+    s.playback.active = m_play != nullptr || m_playQueued;
+    s.playback.waiting = m_playQueued;
     if (m_play && m_playStarted) {  // the file has been read, so its rate is known
         const double rate = m_play->sampleRate();
         s.playback.seconds = double(m_playPacer.taken()) / rate;
         s.playback.totalSeconds = double(m_play->totalFrames()) / rate;
     }
+    if (m_play) s.playback.path = m_play->path();
     s.lastRecordingAvailable = !m_lastRecordingPath.isEmpty();
     s.lastRecordingPath = m_lastRecordingPath;
     s.capture.files = m_captureFiles;

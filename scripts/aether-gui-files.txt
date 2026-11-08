@@ -5,8 +5,9 @@
 # How this list was made: start from the seven stage panels (Strip{Gate,Eq,Comp,Tube,
 # Pudu,RxOutput,Waveform}Panel), the rail (StageTabBar) and the page wrapper (StagePage),
 # follow every quoted #include, and take each reached header's .cpp along with it.
-# FramelessResizer is a root of its own: nothing here includes it, but the Windows
-# custom frame is to use its resize edges.
+# FramelessResizer is a root of its own: nothing here includes it, but the custom frame
+# of Windows and Linux (src/gui/shell/WindowChrome.cpp) uses its resize edges, and
+# FramelessMoveHelper.h to move the window by its header.
 #
 # Left out on purpose: AetherRxDialog, AetherRxSettingsDialog, AetherDspWidget and
 # CanonWindow (never opened here; CanonWindow needs Qt 6.12), and NrGainStrip, which

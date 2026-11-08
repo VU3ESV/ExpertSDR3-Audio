@@ -1,17 +1,17 @@
 // Adapted from AetherSDR src/gui/CanonIndicators.h at 141231e4 (GPL-3.0) on 2026-11-07:
 // its check box's tick, alone, with the same path, pen and colours, moved 2 px up and left
-// onto the 14 px inside of the 16 px box MainWindow's style sheet draws. README.md here
+// onto the 14 px inside of the 16 px box MainWindow's style sheet draws. ../README.md
 // records the provenance and the exact diff.
 //
-// Paints the check-tick*.png beside it, which that sheet puts in a ticked check box. A
+// Paints the check-tick*.png in fork/, which that sheet puts in a ticked check box. A
 // sheet cannot draw a tick, and an image it names must be a file or a resource; upstream
 // paints its check boxes at run time into the user's cache directory, while here the box
 // stays the sheet's, in theme tokens, and only the tick is an image, compiled in. Each is
 // written at 1x, 2x and 3x, as upstream does, so Qt picks the sharp one for the screen.
 //
-// Not part of the build: run it again only to change them. From this directory, in bash
-// (Qt's headers go in as system headers, which Apple's clang needs for Homebrew's Qt):
-//   c++ -std=c++20 make-check-ticks.cpp \
+// Not part of the build: run it again only to change them. From fork/, where it writes them,
+// in bash (Qt's headers go in as system headers, which Apple's clang needs for Homebrew's Qt):
+//   c++ -std=c++20 tools/make-check-ticks.cpp \
 //       $(pkg-config --cflags --libs Qt6Gui | sed 's/-I/-isystem /g') -o /tmp/make-check-ticks
 //   /tmp/make-check-ticks
 #include <QColor>

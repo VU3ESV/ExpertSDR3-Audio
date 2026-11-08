@@ -13,9 +13,15 @@
 class QGridLayout;
 class QLabel;
 
+namespace AetherSDR {
+class AudioEngine;
+}
+
 namespace esa {
 
+class DetailsWindow;
 class ParamControl;
+class StageBinding;
 struct PageContext;
 
 // One page of the window's stack. The window tells every page what the engine reports and
@@ -30,6 +36,9 @@ public:
     virtual void showStatus(const EngineStatus& status);
     // The chain settings were replaced (a profile load): show them again.
     virtual void showChain();
+    // Once every page is in the window. AetherRX binds its panels to their stages only
+    // after building them all, and the pages that host its panels do the same here.
+    virtual void attach();
 
 protected:
     PageContext& context() const { return m_context; }
@@ -60,6 +69,13 @@ struct PageContext {
     std::function<void(const QString& id)> selectNrMethod;
     // Opens Find Radios.
     std::function<void()> findRadios;
+
+    // The engine the AetherRX panels are built on: ours, standing in for upstream's.
+    AetherSDR::AudioEngine* aether{nullptr};
+    // Keeps those panels' display mirror and the ParamControls in step.
+    StageBinding* binding{nullptr};
+    // A chain stage's exact-values window ("gate"), which the window keeps for good.
+    std::function<DetailsWindow*(const QString& stage)> details;
 };
 
 // The rail's ids for its rows, as StageTabBar hands them back. AetherNR to Final Output

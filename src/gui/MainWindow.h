@@ -10,6 +10,7 @@
 #include <QHash>
 #include <QList>
 #include <QMainWindow>
+#include <QPointer>
 #include <QRect>
 #include <QStringList>
 
@@ -19,18 +20,25 @@
 
 class QAction;
 class QMenu;
+class QMessageBox;
+class QPushButton;
 class QStackedWidget;
 
 namespace AetherSDR {
+class AudioEngine;
 class StageTabBar;
 }
 
 namespace esa {
 
+class DetailsWindow;
 class HeaderBar;
 class NrPage;
 class OutputPage;
 class RadioPage;
+class StageBinding;
+class StageHost;
+class WindowChrome;
 
 // The AetherRX window, as a main window: a header row, the rail of pages down the left
 // (AetherSDR's own StageTabBar) and the page it selects beside it.
@@ -56,6 +64,8 @@ public:
     ImportResult importProfiles(const QString& path);
     QString currentProfile() const { return m_config.profileName; }
     bool chainModified() const;
+    // What the window holds and saves: the settings, with the chain that is playing.
+    const AppConfig& config() const { return m_config; }
 
     // The pages, by the ids --page and ui/page use, in the rail's order.
     QStringList pageIds() const;
@@ -71,6 +81,16 @@ public:
     // main() stops the engine and restores ExpertSDR3's mute; tests replace it.
     void setQuitHandler(std::function<void()> quit) { m_quit = std::move(quit); }
 
+    // Shows a file, or a folder, in the system's file manager: Finder, Explorer or the
+    // desktop's own. Everything the window reveals goes through this, so tests replace it
+    // and never open one.
+    void setRevealHandler(std::function<void(const QString& path)> reveal) { m_reveal = std::move(reveal); }
+    // Asks where recordings go, starting from the folder they go to now, and returns the
+    // choice, or nothing to leave it. A folder dialog unless replaced, as tests do.
+    void setFolderChooser(std::function<QString(const QString& current)> choose) { m_chooseFolder = std::move(choose); }
+    // What gear › Recordings › Show in… is called here: Finder, Explorer or Files.
+    static QString revealCommandText();
+
     // Whether saving (on close and every 5 s) writes the window's own state, ui/*, as well
     // as the settings. A screenshot run turns it off: its page and size are its own, and
     // the next ordinary start should open where the operator left the window.
@@ -83,13 +103,18 @@ public:
     static QSize defaultSize() { return {724, 752}; }
 
     // Where the window opens, from ui/geometry and the screens' available areas, the main
-    // screen first. Apart from the real screens, so every case can be tested anywhere.
+    // screen first. Apart from the real screens, so every case can be tested anywhere. The
+    // geometry is the content's; `titleHeight` is room left on the screen for a title bar the
+    // system draws above it, so the whole window fits. A Mac and GNOME move a window down
+    // themselves to keep its title bar on the screen; Windows leaves it where it is put, so
+    // there `placeTitle` keeps that room above the content too.
     struct Placement {
         QRect geometry;           // when not `positioned`, only its size counts
         bool positioned{false};   // false: the window system picks the place
         bool maximised{false};
     };
-    static Placement placement(const QString& savedGeometry, const QList<QRect>& screens);
+    static Placement placement(const QString& savedGeometry, const QList<QRect>& screens, int titleHeight = 0,
+                               bool placeTitle = false);
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -110,12 +135,13 @@ private slots:
     void showAbout();
 
 private:
+    void buildBinding();
     void buildPageContext();
     QWidget* buildRail();
+    void buildDetails();
     void buildPages();
     void buildActions();
     void buildMenus();
-    void wireGatePreset();
     void restoreWindowGeometry();
     void popUpGearMenu();
     void popUpStageMenu(const QString& stage, const QPoint& globalPos);
@@ -126,6 +152,30 @@ private:
     bool stageEnabled(int railId) const;
     void setStageEnabled(int railId, bool on);
     void selectNrMethod(const QString& id);
+
+    // The chain stage the current page shows ("gate"); empty on Radio, AetherNR and Final Output.
+    QString currentStage() const;
+    // Opens a stage's exact-values window, if its page has one.
+    void showDetails(const QString& stage);
+    bool hasDetails(const QString& stage) const;
+    // The header's "⋯" and the gear's Exact values for the page showing.
+    void updateExactValues();
+    // BYPASS as the engine reports it: the button, and the rail's boxes greyed while it holds.
+    void showBypass(bool bypassed);
+    // REC and PLAY as the engine reports them: the buttons, the header's clocks, and a
+    // warning for each failure reported since the last status.
+    void showRecording(const EngineStatus& s);
+    void onRecordingFailed(const QString& reason);
+    void onPlaybackFailed(const QString& reason);
+    // One warning at a time. The same cause again brings the open one forward rather than
+    // adding another saying the same; a different one takes its place. `offersFolder` adds
+    // a button that asks for another recordings folder.
+    void showNotice(const QString& cause, const QString& title, const QString& text, bool offersFolder = false);
+    void updateRecordingsMenu();
+    void chooseRecordingFolder();
+    // What Show in… shows: the last recording if it is still there, else the folder if it
+    // exists yet; empty when neither does.
+    QString revealTarget() const;
 
     void showChain();
     void refreshProfileList();
@@ -152,8 +202,16 @@ private:
     bool m_shownOnce{false};
     bool m_savesWindowState{true};
 
+    // The AetherRX panels draw from the display mirror (m_taps->view) through the stand-in
+    // engine, and the binding keeps the mirror and the controls in step.
+    StageBinding* m_binding{nullptr};
+    AetherSDR::AudioEngine* m_aether{nullptr};
+    QHash<QString, DetailsWindow*> m_details;  // by stage, one each, for good
+    QHash<QString, StageHost*> m_hosts;        // the stages whose page is AetherRX's own
+
     PageContext m_context;
     HeaderBar* m_header{nullptr};
+    WindowChrome* m_chrome{nullptr};
     AetherSDR::StageTabBar* m_rail{nullptr};
     QStackedWidget* m_stack{nullptr};
     QList<Page*> m_pages;          // in the stack's order
@@ -161,8 +219,30 @@ private:
     RadioPage* m_radio{nullptr};
     OutputPage* m_output{nullptr};
     NrPage* m_nr{nullptr};
+    QPushButton* m_bypass{nullptr};
+    bool m_bypassShown{false};
+
+    // REC and PLAY, which show what the engine reports and never just the click.
+    QPushButton* m_record{nullptr};
+    QPushButton* m_play{nullptr};
+    bool m_playing{false};
+    QString m_lastRecordingFile;  // the file REC wrote last, whether or not it is finished
+    // recordingFailed() also reports a REC turned down, which is no failure. The engine sends
+    // the status saying so before the signal, so the last status seen tells the two apart.
+    EngineStatus::Recording m_lastRecording;
+    // A failure waits here for the status sent after it, which names what was kept.
+    QStringList m_recordingFailures;
+    QPointer<QMessageBox> m_notice;
+    QString m_noticeCause;
+    std::function<void(const QString&)> m_reveal;
+    std::function<QString(const QString&)> m_chooseFolder;
 
     QMenu* m_gearMenu{nullptr};
+    QMenu* m_recordingsMenu{nullptr};
+    QAction* m_recordingsFolderAction{nullptr};
+    QAction* m_revealAction{nullptr};
+    QAction* m_folderShown{nullptr};
+    QAction* m_lastFileShown{nullptr};
     QAction* m_saveAction{nullptr};
     QAction* m_saveAsAction{nullptr};
     QAction* m_deleteAction{nullptr};
@@ -171,6 +251,7 @@ private:
     QAction* m_exportAllAction{nullptr};
     QAction* m_findRadiosAction{nullptr};
     QAction* m_resetOrderAction{nullptr};
+    QAction* m_exactValuesAction{nullptr};
     QAction* m_aboutAction{nullptr};
     QAction* m_websiteAction{nullptr};
     QAction* m_quitAction{nullptr};

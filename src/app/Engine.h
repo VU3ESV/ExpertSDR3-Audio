@@ -17,6 +17,7 @@
 #include <QThreadPool>
 #include <QTimer>
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -76,8 +77,14 @@ struct EngineStatus {
     // PLAY of the last recording.
     struct Playback {
         bool active{false};
+        // Pressed while the recording it is for was still being written out: on, but nothing
+        // plays until the file is whole, and a refusal then means it never started.
+        bool waiting{false};
         double seconds{0.0};       // played so far
         double totalSeconds{0.0};  // 0 until the file has been read
+        // The file playing; empty while waiting. Not always lastRecordingPath: a recording
+        // that finishes during the playback is the next PLAY's.
+        QString path;
     } playback;
     bool lastRecordingAvailable{false};  // PLAY has something to play
     QString lastRecordingPath;           // what it plays: the last file of the last finished recording
@@ -109,6 +116,12 @@ public:
     // it keeps the data valid after the engine is gone.
     std::shared_ptr<LiveTaps> taps() const { return m_taps; }
 
+    // For tests only: a stage parameter as the chain the audio runs through holds it. False
+    // before the first configure(), or for a key that is not a stage's. It reads the chain
+    // unguarded, so it answers only on the engine's own thread, and refuses from any other:
+    // the window's tests run the engine on their own thread to read the chain with this.
+    bool chainParam(const QString& key, double* value) const;
+
 public slots:
     void configure(const esa::AppConfig& config);
     void connectRadio();
@@ -133,15 +146,18 @@ public slots:
     void setRxBypassed(bool on);
     // REC. Records the chain's output into `folder`, named from the time and the radio's
     // frequency and mode when the link is up. Accepted only while connected, even if the link is
-    // still coming up; otherwise the status says "Connect to a radio first". Sends nothing to the
-    // radio.
+    // still coming up; otherwise the status says "Connect to a radio first". One still waiting
+    // for the link when a disconnect or quit ends it says so too, as a refusal. Sends nothing
+    // to the radio.
     void startRecording(const QString& folder);
     // The same into the file `path` (or the first free name after it): headless --record x.wav.
     void startRecordingToFile(const QString& path);
     void stopRecording();
     // PLAY: the last finished recording, through the selected output with its volume, BOOST and
     // mute, in place of the live audio, which goes on being processed (and recorded). With no
-    // radio connected it opens the output for the playback alone. Sends nothing to the radio.
+    // radio connected it opens the output for the playback alone. Pressed while a recording
+    // just stopped is still being written out, it waits for that one, showing as playing
+    // meanwhile. Sends nothing to the radio.
     void startPlayback();
     void stopPlayback();
     // Diagnostics: records the radio's audio to <base>.before.wav and the chain's output to
@@ -161,7 +177,8 @@ signals:
     void connectedPortChanged(int port);
     // Once each time REC is refused or a recording stops early (disk full, folder not writable).
     // The same text is in EngineStatus::recording.error. Whatever reached the disk is kept, and
-    // the live audio carries on.
+    // the live audio carries on. For a refusal, a status with recording.refused set comes
+    // first, so a receiver can tell the two apart when this arrives.
     void recordingFailed(const QString& reason);
     // PLAY was refused (nothing recorded, another sample rate, no output) or stopped early.
     void playbackFailed(const QString& reason);
@@ -198,6 +215,8 @@ private:
 
     void refusePlayback(const QString& reason);
     void pumpPlayback();
+    // Hands frames to the speakers and, while it is wanted, to outTap: the chain's, or PLAY's.
+    void sendToOutput(const float* stereo, int frames);
     // Stops PLAY, if it is on; a non-empty reason reports it as a failure. `playOut` lets an
     // output opened for the playback alone finish what it holds before it closes.
     void endPlayback(const QString& failure, bool playOut = false);
@@ -246,6 +265,10 @@ private:
     // a pool and adopted on this thread. The generation discards a build the
     // operator has since superseded.
     QThreadPool m_nrPool;
+    // Released before a build job or its result crosses threads, acquired where it lands. Qt's
+    // pool and event queue already order those crossings; this states the order where
+    // ThreadSanitizer can see it, so no suppression has to cover what the job itself does.
+    std::atomic<quint64> m_nrHandoff{0};
     quint64 m_nrGeneration{0};
     bool m_nrPreparing{false};
     bool m_nrFailed{false};
@@ -295,7 +318,7 @@ private:
     quint64 m_recordDroppedBefore{0};
     QString m_recordPath;
     QString m_recordError;
-    bool m_recordRefused{false};  // m_recordError is a refusal, which connecting answers
+    bool m_recordRefused{false};  // m_recordError is a refusal
     // Recordings that have ended, by their last part's session id, until the disk thread is done
     // with them; true once a failure of theirs has been reported.
     QHash<quint64, bool> m_endingRecordings;
@@ -318,12 +341,18 @@ private:
     std::shared_ptr<PlaySession> m_play;
     PlayPacer m_playPacer;
     bool m_playStarted{false};    // the file is open and the pacer running
+    // PLAY was pressed while a recording was still being written out: it starts once the disk
+    // thread has finished every recording that has ended (onRecorderFinished).
+    bool m_playQueued{false};
     // The output was opened for the playback alone. It stays set after a playback that ran to
     // its end, until m_playDrain has let the output's buffer play out.
     bool m_playOwnsSink{false};
     QTimer m_playDrain;
     int m_playRate{0};
     int m_sinkRate{0};            // the rate the open output takes
+    // What the open output last said it aims to hold, which underruns can raise above the
+    // buffer setting. Taken from the status's own reading: stats() resets the peak it reports.
+    double m_sinkTargetMs{0.0};
     std::vector<float> m_playScratch;
 };
 

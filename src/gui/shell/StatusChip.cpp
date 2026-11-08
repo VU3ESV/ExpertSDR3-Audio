@@ -144,7 +144,7 @@ QString recording(const EngineStatus& s)
 
 } // namespace statusText
 
-StatusChip::Summary StatusChip::summarize(const EngineStatus& s)
+StatusChip::Summary StatusChip::summarize(const EngineStatus& s, bool recordingFailureAnswered)
 {
     const QString radioPage = QStringLiteral("radio");
     const QString nrPage = QStringLiteral("nr");
@@ -157,8 +157,10 @@ StatusChip::Summary StatusChip::summarize(const EngineStatus& s)
     if (s.dspLoad > 0.85) return {QStringLiteral("Can't keep up: try NR2"), QStringLiteral("danger"), nrPage};
     if (s.nrFailed) return {QStringLiteral("NR failed: running dry"), QStringLiteral("danger"), nrPage};
     // No page has more to say about a recording; the tooltip names its file. A REC that was
-    // turned down is not here: the button flips back and the tooltip says why.
-    if (!s.recording.error.isEmpty() && !s.recording.refused) {
+    // turned down is not here: the button flips back and the tooltip says why. Nor is one
+    // whose warning has been answered: what went wrong is no longer news, and the chip has the
+    // connection to show.
+    if (!s.recording.error.isEmpty() && !s.recording.refused && !recordingFailureAnswered) {
         return {QStringLiteral("Recording stopped: %1").arg(s.recording.error), QStringLiteral("danger"), QString()};
     }
     switch (s.connection) {
@@ -223,9 +225,18 @@ QPushButton#statusChip[tone="success"] { color: {{color.accent.success}}; border
     showStatus(EngineStatus{});
 }
 
+void StatusChip::setRecordingFailureAnswered(bool answered)
+{
+    if (answered == m_failureAnswered) return;
+    m_failureAnswered = answered;
+    const EngineStatus last = m_status;
+    showStatus(last);
+}
+
 void StatusChip::showStatus(const EngineStatus& s)
 {
-    const Summary next = summarize(s);
+    m_status = s;
+    const Summary next = summarize(s, m_failureAnswered);
     const bool toneChanged = next.tone != m_summary.tone;
     const bool textChanged = next.text != m_summary.text;
     m_summary = next;

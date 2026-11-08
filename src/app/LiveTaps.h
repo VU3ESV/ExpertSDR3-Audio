@@ -41,6 +41,10 @@ struct LiveTaps {
     std::atomic<bool> nrActive{false};
     std::atomic<int> chainRate{48000};   // the rate the chain was last built at
     std::atomic<quint64> blocks{0};      // published blocks; stops advancing when audio stops
+    // Blocks handed to the speakers and outTap: the chain's, or PLAY's while it plays, with or
+    // without a radio. Stops advancing when nothing plays, so the output meter and scope go by
+    // this one: `blocks` stands still through a PLAY with no radio.
+    std::atomic<quint64> outBlocks{0};
 };
 
 // These must be plain loads and stores on the audio path. Where a 64-bit atomic would

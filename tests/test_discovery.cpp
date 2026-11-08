@@ -1,11 +1,17 @@
 #include "MockExpert.h"
 
+#include "app/Settings.h"
+#include "app/TestSandbox.h"
+#include "audio/PortAudioSink.h"
+#include "tci/TciClient.h"
 #include "tci/TciDiscovery.h"
 
 #include <QElapsedTimer>
+#include <QRegularExpression>
 #include <QHostAddress>
 #include <QSignalSpy>
 #include <QTcpServer>
+#include <QTcpSocket>
 #include <QTest>
 #include <QWebSocketServer>
 #include <QtTest>
@@ -35,11 +41,10 @@ TciDiscovery::Options onThisMachine(QList<int> ports)
     return options;
 }
 
+// Nothing listens there, and it is never a port a real ExpertSDR3 could be listening on.
 int closedPort()
 {
-    QTcpServer probe;
-    probe.listen(QHostAddress::LocalHost, 0);
-    return probe.serverPort();  // nothing listens here once it goes out of scope
+    return closedLocalPort();
 }
 
 } // namespace
@@ -187,7 +192,7 @@ private slots:
     void somethingElseListeningIsNotARadio()
     {
         QTcpServer notWebSocket;  // accepts TCP and says nothing, as many services do
-        QVERIFY(notWebSocket.listen(QHostAddress::LocalHost, 0));
+        QVERIFY(listenOffExpertPorts(notWebSocket));
         TciDiscovery scan;
         QSignalSpy done(&scan, &TciDiscovery::finished);
         scan.start(onThisMachine({notWebSocket.serverPort()}));
@@ -198,7 +203,7 @@ private slots:
     void aWebSocketThatIsNotTciIsNotARadio()
     {
         QWebSocketServer other(QStringLiteral("other"), QWebSocketServer::NonSecureMode);
-        QVERIFY(other.listen(QHostAddress::LocalHost, 0));
+        QVERIFY(listenOffExpertPorts(other));
         connect(&other, &QWebSocketServer::newConnection, this, [&other] {
             // A `ready;` with no `protocol:` before it is not enough either.
             other.nextPendingConnection()->sendTextMessage(QStringLiteral("hello;ready;"));
@@ -267,7 +272,7 @@ private slots:
         QList<int> ports;
         for (int i = 0; i < 12; ++i) {
             auto* server = new QTcpServer(this);
-            QVERIFY(server->listen(QHostAddress::LocalHost, 0));
+            QVERIFY(listenOffExpertPorts(*server));
             servers.append(server);
             ports.append(server->serverPort());
         }
@@ -289,13 +294,20 @@ private slots:
     {
         TciDiscovery::Options options;
         options.hosts = {QStringLiteral("192.0.2.1"), QStringLiteral("192.0.2.2")};
-        options.ports = {40001};
+        // Not one of ExpertSDR3's ports: the test sandbox finishes a probe of those before any
+        // socket opens, and this cancels connects still under way. TEST-NET never answers.
+        options.ports = {40002};
+        QVERIFY(!isExpertSdrPort(options.ports.first()));
         TciDiscovery scan;
         QSignalSpy done(&scan, &TciDiscovery::finished);
         scan.start(options);
         QVERIFY(scan.isRunning());
+        const auto sockets = scan.findChildren<QTcpSocket*>();
+        QCOMPARE(sockets.size(), 2);
+        for (const QTcpSocket* socket : sockets) QCOMPARE(socket->state(), QAbstractSocket::ConnectingState);
         scan.cancel();
         QVERIFY(!scan.isRunning());
+        QVERIFY(scan.findChildren<QTcpSocket*>().isEmpty());  // gone at once, mid-connect
         QTest::qWait(100);
         QCOMPARE(done.size(), 0);
     }
@@ -324,6 +336,104 @@ private slots:
         remote.port = 40001;
         QCOMPARE(remote.location(), QStringLiteral("192.168.1.20:40001"));
         QVERIFY(!remote.isThisComputer());
+    }
+
+    // The test sandbox (app/TestSandbox.h). The probes below aim where no radio or speaker can
+    // be, so a broken sandbox makes them fail rather than reach anything real. 192.0.2.1 is
+    // TEST-NET-1 (RFC 5737): reserved for documentation, never routed.
+    void everyTestProgramRunsInTheSandbox()
+    {
+        QVERIFY(testSandbox());
+        QVERIFY(isExpertSdrPort(40001) && isExpertSdrPort(50001) && isExpertSdrPort(60001));
+        QVERIFY(!isExpertSdrPort(40002));
+    }
+
+    void theSandboxRefusesEveryRealOutput()
+    {
+        // Asked directly: PortAudioSink::open() falls back to the default output for a name it
+        // does not know, so probing open() itself would reach the speakers if this broke.
+        const QString refusal = audio::realOutputRefusal();
+        QVERIFY2(refusal.contains(QLatin1String("ESA_TEST_SANDBOX")), qPrintable(refusal));
+    }
+
+    // Every port the app tries by itself is one the sandbox refuses.
+    void theSandboxKnowsEveryPortTheAppTries()
+    {
+        const AppConfig defaults;
+        QVERIFY(isExpertSdrPort(defaults.port));
+        for (int port : defaults.fallbackPorts) QVERIFY2(isExpertSdrPort(port), qPrintable(QString::number(port)));
+        for (int port : discovery::commonPorts()) QVERIFY2(isExpertSdrPort(port), qPrintable(QString::number(port)));
+    }
+
+    void theSandboxNeverConnectsToAnExpertSdrPort()
+    {
+        TciClient client;
+        // Refused at once, before any socket opens, and then as a refused port is: the list
+        // moves on to the next. A real connect to TEST-NET would only time out, so nothing but
+        // the refusals can have reached 50001 this soon, or said why.
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression(QStringLiteral("Test sandbox: refused to connect to .*60001")));
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression(QStringLiteral("Test sandbox: refused to connect to .*50001")));
+        client.open(QStringLiteral("192.0.2.1"), 60001, {50001});
+        QVERIFY2(client.lastError().contains(QLatin1String("Port 60001")), qPrintable(client.lastError()));
+        QTRY_VERIFY_WITH_TIMEOUT(client.lastError().contains(QLatin1String("Port 50001")), 1000);
+        QVERIFY(client.lastError().contains(QLatin1String("ESA_TEST_SANDBOX")));
+        QCOMPARE(client.state(), TciClient::State::Connecting);
+        client.close();
+    }
+
+    // A refusal ends the attempt it was made for and no other: not one closed since, and not
+    // the connection that replaced it.
+    void aSandboxRefusalEndsOnlyItsOwnAttempt()
+    {
+        MockExpert radio;
+        QVERIFY(radio.listen());
+        const int nothingThere = closedPort();
+        QVERIFY(nothingThere > 0);
+        TciClient client;
+        QSignalSpy states(&client, &TciClient::stateChanged);
+
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression(QStringLiteral("Test sandbox: refused to connect to .*60001")));
+        client.open(QStringLiteral("192.0.2.1"), 60001, {});
+        client.close();
+        QTest::qWait(50);  // the refusal's turn has come and gone
+        QCOMPARE(client.state(), TciClient::State::Disconnected);
+        QCOMPARE(states.size(), 2);  // Connecting, then Disconnected, and nothing after
+
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression(QStringLiteral("Test sandbox: refused to connect to .*60001")));
+        client.open(QStringLiteral("192.0.2.1"), 60001, {});
+        states.clear();
+        // With a port after it, so a stale refusal would move on to that one 150 ms later.
+        client.open(QStringLiteral("127.0.0.1"), radio.port(), {nothingThere});
+        QTRY_COMPARE_WITH_TIMEOUT(client.state(), TciClient::State::Ready, kTimeout);
+        QTest::qWait(400);
+        QCOMPARE(client.state(), TciClient::State::Ready);
+        int readies = 0;
+        for (const QList<QVariant>& change : std::as_const(states)) {
+            if (change.at(0).value<TciClient::State>() == TciClient::State::Ready) ++readies;
+        }
+        QCOMPARE(readies, 1);
+        QCOMPARE(client.connectedPort(), radio.port());
+        client.close();
+    }
+
+    void theSandboxNeverProbesAnExpertSdrPort()
+    {
+        TciDiscovery::Options options;
+        options.hosts = {QStringLiteral("192.0.2.1")};
+        options.ports = {40001, 50001, 60001};
+        options.connectTimeoutMs = 4000;  // what an unsandboxed probe would wait for
+        // Said for each port, so a probe that went ahead fails here whatever the network does.
+        for (int port : options.ports) {
+            QTest::ignoreMessage(QtWarningMsg, QRegularExpression(QStringLiteral("Test sandbox: refused to probe .*%1").arg(port)));
+        }
+        TciDiscovery scan;
+        QSignalSpy done(&scan, &TciDiscovery::finished);
+        QElapsedTimer clock;
+        clock.start();
+        scan.start(options);
+        QVERIFY(done.wait(kTimeout));
+        QVERIFY2(clock.elapsed() < 2000, qPrintable(QString::number(clock.elapsed())));
+        QVERIFY(scan.radios().isEmpty());
     }
 };
 

@@ -1,0 +1,33 @@
+{
+  "_comment": [
+    "Regions for scripts/compare-aetherrx.py, one entry per page, in our window's coordinates:",
+    "rectangles [x, y, width, height] or lists of [x, y] points. 'offset' is where our window's",
+    "(0, 0) falls in the reference screenshot, which has desktop round the window. A region's",
+    "'shift' is added to that for what sits elsewhere in our window: the rail, whose rows are",
+    "32 px lower for the Radio row above AetherNR. 'masks' leave out what AetherRX does not",
+    "have; those marked text only with --mask-text. Measured on 1.png (726x751, holding a",
+    "720x750 window whose last rows are cut off) against offscreen renders at 720x750."
+  ],
+  "gate": {
+    "reference": "1.png",
+    "offset": [3, 4],
+    "tolerance": 14,
+    "regions": [
+      {"name": "page", "rect": [203, 53, 502, 682]},
+      {"name": "toolbar", "rect": [203, 53, 502, 24]},
+      {"name": "plot", "rect": [211, 81, 486, 564]},
+      {"name": "knobs", "rect": [211, 651, 486, 77]},
+      {"name": "rail", "rect": [15, 85, 180, 236], "shift": [0, -32]},
+      {"name": "rec/play", "rect": [15, 668, 180, 30]},
+      {"name": "footer", "rect": [15, 700, 180, 30]},
+      {"name": "ground", "tolerance": 1,
+       "points": [[100, 450], [100, 600], [40, 380], [199, 400], [715, 400], [400, 742]]}
+    ],
+    "masks": [
+      {"name": "header", "rect": [0, 0, 726, 53]},
+      {"name": "radio row", "rect": [15, 53, 180, 32]},
+      {"name": "knob values", "rect": [211, 710, 486, 18], "text": true},
+      {"name": "level scale", "rect": [211, 81, 24, 564], "text": true}
+    ]
+  }
+}

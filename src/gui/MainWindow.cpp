@@ -4,25 +4,33 @@
 #include "dsp/NrProcessor.h"
 #include "dsp/RxChain.h"
 #include "gui/AboutDialog.h"
+#include "gui/DetailsWindow.h"
 #include "gui/RadioDiscoveryDialog.h"
 #include "gui/aether/Appearance.h"
+#include "gui/binding/StageBinding.h"
 #include "gui/pages/NrPage.h"
 #include "gui/pages/OutputPage.h"
 #include "gui/pages/RadioPage.h"
+#include "gui/pages/StageHost.h"
 #include "gui/shell/HeaderBar.h"
 #include "gui/shell/StatusChip.h"
+#include "gui/shell/WindowChrome.h"
 
 #include "StageTabBar.h"
 #include "core/AppSettings.h"
+#include "core/AudioEngine.h"
 
 #include <QAction>
 #include <QApplication>
+#include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QCursor>
 #include <QDesktopServices>
 #include <QDir>
 #include <QFileDialog>
+#include <QFileInfo>
+#include <QFontMetrics>
 #include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QInputDialog>
@@ -40,8 +48,12 @@
 #include <QTimer>
 #include <QUrl>
 #include <QVBoxLayout>
+#ifdef Q_OS_MACOS
+#include <QProcess>
+#endif
 
 #include <algorithm>
+#include <utility>
 
 namespace esa {
 
@@ -109,13 +121,64 @@ QString railSlug(const PageEntry& page)
     return QString(page.label).remove(QLatin1Char(' '));
 }
 
+QString recordToolTip()
+{
+    return QStringLiteral("Record what the stages make of the radio's audio, before Volume, BOOST and MUTE, to a "
+                          "WAV file in the recordings folder (Settings, Recordings). Works while connected to a "
+                          "radio. Click again to stop. Nothing is sent to the radio.");
+}
+
+QString playToolTip()
+{
+    return QStringLiteral("Play the last recording through the output, in place of the radio's audio, which "
+                          "goes on being processed. Click again to stop. Nothing is sent to the radio.");
+}
+
+// Finder points at the file itself. Elsewhere the folder opens: Explorer's /select takes its
+// path in a quoting of its own, and a desktop's file manager has no common way to select.
+void revealInFileManager(const QString& path)
+{
+    const QFileInfo info(path);
+    if (!info.exists()) return;
+#ifdef Q_OS_MACOS
+    QProcess::startDetached(QStringLiteral("/usr/bin/open"), {QStringLiteral("-R"), info.absoluteFilePath()});
+#else
+    QDesktopServices::openUrl(QUrl::fromLocalFile(info.isDir() ? info.absoluteFilePath() : info.absolutePath()));
+#endif
+}
+
+// The nearest folder that exists at or above `path`, for a dialog to open at: the recordings
+// folder is made by the first recording, never by looking for it.
+QString nearestExistingFolder(const QString& path)
+{
+    QString at = QDir::cleanPath(QDir(path).absolutePath());
+    while (!QFileInfo(at).isDir()) {
+        const QString up = QFileInfo(at).absolutePath();
+        if (up == at) return QString();
+        at = up;
+    }
+    return at;
+}
+
+// A path as a menu entry shows it: shortened in the middle, and with any & shown as itself
+// rather than taken as a shortcut marker.
+QString menuText(const QMenu* menu, const QString& text, int width)
+{
+    return QFontMetrics(menu->font()).elidedText(text, Qt::ElideMiddle, width).replace(QLatin1Char('&'),
+                                                                                         QStringLiteral("&&"));
+}
+
 } // namespace
 
 MainWindow::MainWindow(Engine* engine, std::shared_ptr<LiveTaps> taps, Settings* settings, ProfileLibrary* profiles,
                        const AppConfig& config)
     : m_engine(engine), m_taps(std::move(taps)), m_settings(settings), m_profiles(profiles), m_config(config),
-      m_window(settings->loadWindowState()), m_quit([] { QApplication::quit(); })
+      m_window(settings->loadWindowState()), m_quit([] { QApplication::quit(); }), m_reveal(revealInFileManager)
 {
+    m_chooseFolder = [this](const QString& current) {
+        return QFileDialog::getExistingDirectory(this, QStringLiteral("Recordings Folder"),
+                                                 nearestExistingFolder(current));
+    };
     setWindowTitle(QString::fromUtf8(kAppDisplayName));
     // AetherRX's minimum is 600x400. The height is kept. The width is left to the layout,
     // whose own (the rail beside the page stack's 400) is a little wider: a fixed 600 would
@@ -123,6 +186,7 @@ MainWindow::MainWindow(Engine* engine, std::shared_ptr<LiveTaps> taps, Settings*
     setMinimumHeight(400);
     applyTheme();
     buildActions();
+    buildBinding();
     buildPageContext();
 
     // Before any AetherSDR page exists: the few display choices they keep for good
@@ -153,13 +217,21 @@ MainWindow::MainWindow(Engine* engine, std::shared_ptr<LiveTaps> taps, Settings*
     m_stack->setMinimumSize(400, 300);
     body->addWidget(m_stack, 1);
     setCentralWidget(central);
+    // The frame ui/frame asks for, the system's unless Custom was chosen; the gear's Window
+    // frame menu changes it at once, and the choice is saved with the window's state.
+    m_chrome = new WindowChrome(this, m_header, WindowChrome::parse(m_window.frame));
+    connect(m_chrome, &WindowChrome::frameChosen, this, [this](WindowChrome::Frame frame) {
+        m_window.frame = WindowChrome::name(frame);
+        saveSettings();
+    });
 
+    buildDetails();
     buildPages();
-    wireGatePreset();
     buildMenus();
 
     connect(m_header->profileList(), &QComboBox::activated, this, &MainWindow::onProfileSelected);
     connect(m_header->statusChip(), &StatusChip::pageRequested, this, &MainWindow::showPage);
+    connect(m_header->exactValuesButton(), &QPushButton::clicked, this, [this] { showDetails(currentStage()); });
 
     // The profile may have been deleted since these settings were saved.
     if (!m_config.profileName.isEmpty() && !m_profiles->find(m_config.profileName)) m_config.profileName.clear();
@@ -173,6 +245,9 @@ MainWindow::MainWindow(Engine* engine, std::shared_ptr<LiveTaps> taps, Settings*
     restoreWindowGeometry();
 
     connect(m_engine, &Engine::statusChanged, this, &MainWindow::onStatus, Qt::QueuedConnection);
+    // Queued like the status, so each arrives before the status the engine sends after it.
+    connect(m_engine, &Engine::recordingFailed, this, &MainWindow::onRecordingFailed, Qt::QueuedConnection);
+    connect(m_engine, &Engine::playbackFailed, this, &MainWindow::onPlaybackFailed, Qt::QueuedConnection);
     connect(m_engine, &Engine::devicesChanged, m_output, &OutputPage::showDevices, Qt::QueuedConnection);
     connect(m_engine, &Engine::connectedPortChanged, m_radio, &RadioPage::showConnectedPort, Qt::QueuedConnection);
 
@@ -190,8 +265,14 @@ MainWindow::MainWindow(Engine* engine, std::shared_ptr<LiveTaps> taps, Settings*
 
 MainWindow::~MainWindow()
 {
-    // The pages first, while the context they were built with is still here.
+    // Nothing torn down below may reach back into a window half gone.
+    for (ParamControl* control : std::as_const(m_controls)) control->disconnect(this);
+    // The pages first, while the context they were built with is still here, then the
+    // exact-values windows, whose controls reach the binding the pages were bound through.
     delete centralWidget();
+    qDeleteAll(m_details);
+    m_details.clear();
+    m_hosts.clear();
     // The settings may go before the next window comes; until then the pages' choices stay
     // in memory.
     AetherSDR::AppSettings::instance().setStore({});
@@ -202,6 +283,29 @@ void MainWindow::applyTheme()
     // AetherRX's look on every platform, from AetherSDR's theme tokens. The style, the
     // font and the palette are the application's, set by Appearance::install().
     Appearance::apply(this, windowSheet());
+}
+
+void MainWindow::buildBinding()
+{
+    // The AetherRX panels draw from the display mirror and write into it. It is seeded from
+    // the settings before any panel exists, so none starts from the mirror's own defaults.
+    StageBinding::Host host;
+    host.value = [this](const QString& key) {
+        const ParamSpec* spec = findParamSpec(key);
+        return spec ? paramValue(m_config, *spec) : 0.0;
+    };
+    host.control = [this](const QString& key) { return m_controls.value(key); };
+    m_binding = new StageBinding(&m_taps->view, host, this);
+    m_binding->seed();
+
+    // Upstream's engine, as far as the panels use it: the mirror's stages and their saves.
+    // Mute, BOOST and the output trim are the Final Output page's, and the EQ's analyser
+    // samples the EQ page's; until those pages come, the stand-in reads them as off and
+    // drops writes.
+    AetherSDR::AudioEngine::Hooks hooks;
+    m_binding->fillHooks(&hooks);
+    m_aether = new AetherSDR::AudioEngine(this);
+    m_aether->setHooks(hooks);
 }
 
 void MainWindow::buildPageContext()
@@ -223,6 +327,9 @@ void MainWindow::buildPageContext()
     };
     m_context.selectNrMethod = [this](const QString& id) { selectNrMethod(id); };
     m_context.findRadios = [this] { findRadios(); };
+    m_context.aether = m_aether;
+    m_context.binding = m_binding;
+    m_context.details = [this](const QString& stage) { return m_details.value(stage); };
 }
 
 ParamControl* MainWindow::registerControl(ParamControl* control)
@@ -262,10 +369,51 @@ QWidget* MainWindow::buildRail()
     m_rail->setHost(host);
 
     for (const PageEntry& page : pageTable()) m_rail->addStage(page.railId, page.label, page.checkbox);
-    // REC, PLAY and BYPASS join the footer once they do something; until then the gear has
-    // the row to itself.
+
+    // REC and PLAY on one row above BYPASS, as in AetherRX. A click asks the engine, and the
+    // status it sends straight back sets the button, so a REC turned down (no radio) flips
+    // back at once. Neither sends anything to the radio.
+    const QVector<QPushButton*> recordAndPlay = m_rail->addFooterToggleRow({
+        {QStringLiteral("REC"), QStringLiteral("aetherRxRecord"), recordToolTip(), StageTabBar::Accent::Red},
+        {QStringLiteral("PLAY"), QStringLiteral("aetherRxPlay"), playToolTip(), StageTabBar::Accent::Green},
+    });
+    m_record = recordAndPlay.at(0);
+    m_play = recordAndPlay.at(1);
+    // The short labels fit the row; a screen reader says whole words.
+    m_record->setAccessibleName(QStringLiteral("Record"));
+    m_play->setAccessibleName(QStringLiteral("Play"));
+    connect(m_record, &QPushButton::clicked, this, [this](bool on) {
+        if (on) {
+            // Read at each press, so a folder chosen meanwhile is where this recording goes.
+            const QString folder = m_settings->recordingFolder();
+            onEngine([engine = m_engine, folder] { engine->startRecording(folder); });
+        } else {
+            onEngine([engine = m_engine] { engine->stopRecording(); });
+        }
+    });
+    connect(m_play, &QPushButton::clicked, this, [this](bool on) {
+        if (on) {
+            onEngine([engine = m_engine] { engine->startPlayback(); });
+        } else {
+            onEngine([engine = m_engine] { engine->stopPlayback(); });
+        }
+    });
+    // Greyed until there is something to play, as in AetherRX.
+    m_play->setEnabled(false);
+    m_play->setAccessibleDescription(QStringLiteral("Unavailable until something has been recorded. Use REC first."));
+
+    // BYPASS shares the gear's row, as in AetherRX. It is the engine's, for this session only:
+    // no box is unticked, nothing is saved, and nothing is sent to the radio. The button shows
+    // what the engine reports.
+    m_bypass = m_rail->addFooterToggle(
+        QStringLiteral("BYPASS"), QStringLiteral("aetherRxBypass"),
+        QStringLiteral("Hear the radio unprocessed: AetherNR and every stage are passed by until you click "
+                       "again. Nothing is changed or saved."));
+    connect(m_bypass, &QPushButton::toggled, this, [this](bool on) {
+        onEngine([engine = m_engine, on] { engine->setRxBypassed(on); });
+    });
     m_rail->addFooterGearButton(QStringLiteral("Settings"), QStringLiteral("aetherRxSettingsButton"),
-                                QStringLiteral("Profiles, Find Radios, stage order and About."));
+                                QStringLiteral("Profiles, Find Radios, exact values, stage order, recordings, window frame and About."));
 
     connect(m_rail, &StageTabBar::stageSelected, this, [this](int railId) {
         if (const PageEntry* page = pageOfRail(railId)) showPage(page->id);
@@ -290,6 +438,16 @@ QWidget* MainWindow::buildRail()
     return m_rail;
 }
 
+void MainWindow::buildDetails()
+{
+    // One per stage, made now and kept hidden, so every stage's controls exist from the
+    // start. A stage page fills its own; today's grids keep theirs on the page.
+    for (const QString& stage : RxChain::stageIds()) {
+        const QString title = QStringLiteral("%1: exact values").arg(RxChain::stageLabel(stage));
+        m_details.insert(stage, new DetailsWindow(stage, title, this));
+    }
+}
+
 void MainWindow::buildPages()
 {
     for (const PageEntry& entry : pageTable()) {
@@ -297,22 +455,25 @@ void MainWindow::buildPages()
         page->setObjectName(QStringLiteral("page_") + entry.id);
         m_stack->addWidget(page);
         m_pages.append(page);
+        if (auto* host = qobject_cast<StageHost*>(page)) m_hosts.insert(host->stage(), host);
     }
+    // As AetherRxDialog: the panels are bound to their stages once every page is built.
+    for (Page* page : std::as_const(m_pages)) page->attach();
+
+    // Saves from here on are the operator's. Whatever the panels wrote into the mirror while
+    // binding themselves gives way to what is set, and they redraw from that.
+    m_binding->goLive();
+    m_binding->seed();
+    for (StageHost* host : std::as_const(m_hosts)) host->syncPanel();
+
+    for (DetailsWindow* details : std::as_const(m_details)) {
+        if (!details->hasControls()) details->setNote(QStringLiteral("All of this stage's values are on its page."));
+    }
+
     m_radio = m_stack->findChild<RadioPage*>();
     m_output = m_stack->findChild<OutputPage*>();
     m_nr = m_stack->findChild<NrPage*>();
     Q_ASSERT(m_radio && m_output && m_nr);
-}
-
-void MainWindow::wireGatePreset()
-{
-    // Upstream's setMode() is a preset that overwrites ratio and floor, so show what it
-    // did. Going through the controls also re-sends them in order.
-    connect(m_controls.value(QStringLiteral("gate.mode")), &ParamControl::valueChanged, this,
-            [this](const QString&, double mode) {
-                m_controls.value(QStringLiteral("gate.ratio"))->setValue(mode == 0.0 ? 2.0 : 10.0);
-                m_controls.value(QStringLiteral("gate.floor"))->setValue(mode == 0.0 ? -15.0 : -40.0);
-            });
 }
 
 void MainWindow::buildActions()
@@ -334,9 +495,31 @@ void MainWindow::buildActions()
 
     m_findRadiosAction = new QAction(QStringLiteral("Find Radios..."), this);
     connect(m_findRadiosAction, &QAction::triggered, this, &MainWindow::findRadios);
+    m_exactValuesAction = new QAction(QStringLiteral("Exact values..."), this);
+    m_exactValuesAction->setToolTip(QStringLiteral("Every setting of the stage on show, including those its page does not show."));
+    connect(m_exactValuesAction, &QAction::triggered, this, [this] { showDetails(currentStage()); });
     m_resetOrderAction = new QAction(QStringLiteral("Reset stage order"), this);
     m_resetOrderAction->setToolTip(QStringLiteral("Put the stages back in AetherRX's order: Gate, EQ, Compressor, Tube, Exciter."));
     connect(m_resetOrderAction, &QAction::triggered, this, [this] { setStageOrder(RxChain::stageIds()); });
+
+    // Recordings: where REC saves, and a way there.
+    m_recordingsFolderAction = new QAction(QStringLiteral("Folder..."), this);
+    m_recordingsFolderAction->setObjectName(QStringLiteral("recordingsFolder"));
+    m_recordingsFolderAction->setToolTip(QStringLiteral("Choose where REC saves its recordings, from the next one on."));
+    connect(m_recordingsFolderAction, &QAction::triggered, this, &MainWindow::chooseRecordingFolder);
+    m_revealAction = new QAction(revealCommandText(), this);
+    m_revealAction->setObjectName(QStringLiteral("recordingsReveal"));
+    connect(m_revealAction, &QAction::triggered, this, [this] {
+        const QString target = revealTarget();
+        if (!target.isEmpty() && m_reveal) m_reveal(target);
+    });
+    // What the menu says, not what it does: the folder and the last recording.
+    m_folderShown = new QAction(this);
+    m_folderShown->setObjectName(QStringLiteral("recordingsFolderShown"));
+    m_folderShown->setEnabled(false);
+    m_lastFileShown = new QAction(this);
+    m_lastFileShown->setObjectName(QStringLiteral("recordingsLastShown"));
+    m_lastFileShown->setEnabled(false);
 
     m_websiteAction = new QAction(QStringLiteral("Project Website"), this);
     connect(m_websiteAction, &QAction::triggered, this, [] {
@@ -380,7 +563,20 @@ void MainWindow::buildMenus()
     m_gearMenu->setObjectName(QStringLiteral("gearMenu"));
     addProfileActions(m_gearMenu->addMenu(QStringLiteral("Profiles")));
     m_gearMenu->addAction(m_findRadiosAction);
+    m_gearMenu->addAction(m_exactValuesAction);
     m_gearMenu->addAction(m_resetOrderAction);
+    m_recordingsMenu = m_gearMenu->addMenu(QStringLiteral("Recordings"));
+    m_recordingsMenu->setObjectName(QStringLiteral("recordingsMenu"));
+    m_recordingsMenu->setToolTipsVisible(true);  // the shortened paths, in full
+    m_recordingsMenu->addAction(m_recordingsFolderAction);
+    m_recordingsMenu->addAction(m_revealAction);
+    m_recordingsMenu->addSeparator();
+    m_recordingsMenu->addAction(m_folderShown);
+    m_recordingsMenu->addAction(m_lastFileShown);
+    // Filled in as it opens, which is the only time the folder is looked at: on a Mac, a look
+    // inside Documents can ask the operator's permission, which a start must never do.
+    connect(m_recordingsMenu, &QMenu::aboutToShow, this, &MainWindow::updateRecordingsMenu);
+    m_gearMenu->addMenu(m_chrome->menu());
     m_gearMenu->addSeparator();
     m_gearMenu->addAction(m_aboutAction);
     m_gearMenu->addAction(m_websiteAction);
@@ -431,6 +627,10 @@ void MainWindow::popUpStageMenu(const QString& stage, const QPoint& globalPos)
     connect(down, &QAction::triggered, this, [this, stage] { moveStage(stage, 1); });
     menu->addSeparator();
     menu->addAction(m_resetOrderAction);
+    menu->addSeparator();
+    QAction* exact = menu->addAction(QStringLiteral("Exact values..."));
+    exact->setEnabled(hasDetails(stage));
+    connect(exact, &QAction::triggered, this, [this, stage] { showDetails(stage); });
     menu->popup(globalPos);
 }
 
@@ -461,7 +661,17 @@ void MainWindow::restoreWindowGeometry()
         if (screen != primary) screens.append(screen->availableGeometry());
     }
 
-    const Placement place = placement(m_window.geometry, screens);
+    // The saved geometry is the content's. With the system's frame its title bar sits above
+    // that, and how tall it is is known only once the window is on screen, so room is left
+    // for the tallest usual one: about 28 px on a Mac, 31 on Windows, 37 under GNOME.
+    constexpr int kSystemTitleAllowance = 38;
+    const int title = m_chrome->mode() == WindowChrome::Mode::System ? kSystemTitleAllowance : 0;
+#ifdef Q_OS_WIN
+    constexpr bool kPlaceTitle = true;  // Windows leaves a window where it is put, title bar and all
+#else
+    constexpr bool kPlaceTitle = false;  // a Mac and GNOME move it down themselves
+#endif
+    const Placement place = placement(m_window.geometry, screens, title, kPlaceTitle);
     if (place.positioned) {
         setGeometry(place.geometry);
     } else {
@@ -470,11 +680,19 @@ void MainWindow::restoreWindowGeometry()
     if (place.maximised) setWindowState(windowState() | Qt::WindowMaximized);
 }
 
-MainWindow::Placement MainWindow::placement(const QString& savedGeometry, const QList<QRect>& screens)
+MainWindow::Placement MainWindow::placement(const QString& savedGeometry, const QList<QRect>& screens, int titleHeight,
+                                            bool placeTitle)
 {
     Placement place;
     const QRect primary = screens.value(0);  // empty when there is no screen at all
     QRect home = primary;
+    // The most of a screen the content may fill: all of it less a title bar, which must be on
+    // the screen too, so the bottom stays on it as well.
+    const auto room = [titleHeight](const QRect& screen) {
+        return QSize(screen.width(), std::max(screen.height() / 2, screen.height() - titleHeight));
+    };
+    // Where the title bar is placed here rather than by the system, the content starts below it.
+    const int above = placeTitle ? titleHeight : 0;
     const QRect saved = parseRect(savedGeometry);
     if (saved.isValid()) {
         // The screen it was on is the one under its top edge. If that screen has gone (a
@@ -483,17 +701,23 @@ MainWindow::Placement MainWindow::placement(const QString& savedGeometry, const 
         const auto on = std::find_if(screens.begin(), screens.end(), [top](const QRect& s) { return s.contains(top); });
         if (on != screens.end()) {
             home = *on;
-            place.geometry = saved;
+            // Its screen may have shrunk since (a lower resolution, a dock): keep it whole on it.
+            place.geometry = QRect(saved.topLeft(), saved.size().boundedTo(room(home)));
+            if (place.geometry.right() > home.right()) place.geometry.moveRight(home.right());
+            if (place.geometry.bottom() > home.bottom()) place.geometry.moveBottom(home.bottom());
+            if (place.geometry.left() < home.left()) place.geometry.moveLeft(home.left());
+            if (place.geometry.top() < home.top() + above) place.geometry.moveTop(home.top() + above);
             place.positioned = true;
         } else if (!primary.isEmpty()) {
-            place.geometry = QRect(QPoint(), saved.size().boundedTo(primary.size()));
-            place.geometry.moveCenter(primary.center());
+            // The whole window centred, its title bar included where it is placed here.
+            place.geometry = QRect(QPoint(), saved.size().boundedTo(room(primary)));
+            place.geometry.moveCenter(primary.center() + QPoint(0, above / 2));
             place.positioned = true;
         } else {
             place.geometry = QRect(QPoint(), saved.size());
         }
     } else {
-        place.geometry = QRect(QPoint(), primary.isEmpty() ? defaultSize() : defaultSize().boundedTo(primary.size()));
+        place.geometry = QRect(QPoint(), primary.isEmpty() ? defaultSize() : defaultSize().boundedTo(room(primary)));
     }
     place.maximised = !home.isEmpty() && isSmallScreen(home.size());
     return place;
@@ -528,6 +752,32 @@ void MainWindow::showPage(const QString& id)
     m_stack->setCurrentIndex(index);
     m_rail->setCurrentStage(pageTable().at(index).railId);
     m_window.page = id;
+    updateExactValues();
+}
+
+QString MainWindow::currentStage() const
+{
+    const PageEntry* page = findPage(currentPage());
+    return page ? page->stage : QString();
+}
+
+bool MainWindow::hasDetails(const QString& stage) const
+{
+    const DetailsWindow* details = m_details.value(stage);
+    return details && details->hasControls();
+}
+
+void MainWindow::showDetails(const QString& stage)
+{
+    if (hasDetails(stage)) m_details.value(stage)->present();
+}
+
+void MainWindow::updateExactValues()
+{
+    const QString stage = currentStage();
+    const StageHost* host = m_hosts.value(stage);
+    m_header->setExactValues(hasDetails(stage), host && host->hidesChangedValue(), !stage.isEmpty());
+    m_exactValuesAction->setEnabled(hasDetails(stage));
 }
 
 bool MainWindow::stageEnabled(int railId) const
@@ -607,6 +857,14 @@ void MainWindow::onParamChanged(const QString& key, double value)
 {
     m_config.params.insert(key, value);
     onEngine([engine = m_engine, key, value] { engine->setParam(key, value); });
+    const QString stage = StageBinding::stageOf(key);
+    if (!stage.isEmpty()) {
+        // The pages draw the value the control settled on. A change that moves others in its
+        // stage (the gate's mode presets ratio and floor) then reaches their controls, which
+        // send them on after it, in table order.
+        m_binding->apply(key, value);
+        m_binding->pull(stage);
+    }
     updateProfileState();
     if (key.endsWith(QLatin1String(".enabled"))) m_rail->refreshFromHost();
 }
@@ -659,15 +917,20 @@ void MainWindow::updateProfileState()
     } else {
         m_header->setProfileState(modified ? QStringLiteral("Modified") : QString(), QString());
     }
+    updateExactValues();
 }
 
 void MainWindow::showChain()
 {
-    for (Page* page : std::as_const(m_pages)) page->showChain();
     for (const ParamSpec& spec : allParamSpecs()) {
         if (ParamControl* control = m_controls.value(spec.key)) control->setValueSilently(paramValue(m_config, spec));
     }
+    // The mirror takes every stage key in table order, so a saved ratio lands after the gate
+    // mode that would otherwise preset it; then each page redraws from it.
+    m_binding->seed();
+    for (Page* page : std::as_const(m_pages)) page->showChain();
     m_rail->refreshFromHost();
+    updateExactValues();
 }
 
 void MainWindow::loadProfile(const QString& name)
@@ -873,7 +1136,188 @@ void MainWindow::onStatus(const EngineStatus& s)
 {
     for (Page* page : std::as_const(m_pages)) page->showStatus(s);
     m_header->statusChip()->showStatus(s);
+    showBypass(s.rxBypassed);
+    showRecording(s);
     m_rail->refreshFromHost();
+}
+
+void MainWindow::showRecording(const EngineStatus& s)
+{
+    {
+        const QSignalBlocker block(m_record);
+        m_record->setChecked(s.recording.active);
+    }
+    // A REC turned down says why where it was pressed, as the chip's tooltip does.
+    QString recordTip = recordToolTip();
+    if (s.recording.refused && !s.recording.error.isEmpty()) {
+        recordTip += QStringLiteral("\n\nNot recording: %1").arg(s.recording.error);
+    }
+    if (recordTip != m_record->toolTip()) m_record->setToolTip(recordTip);
+
+    {
+        const QSignalBlocker block(m_play);
+        m_play->setChecked(s.playback.active);
+    }
+    // Something to play, or a playback to stop.
+    const bool playable = s.lastRecordingAvailable || s.playback.active;
+    if (playable != m_play->isEnabled()) {
+        m_play->setEnabled(playable);
+        m_play->setAccessibleDescription(playable ? QStringLiteral("Play back the last recording. Click again to stop.")
+                                                  : QStringLiteral("Unavailable until something has been recorded. Use REC first."));
+    }
+    // A PLAY still waiting for its recording to be written out has played nothing yet, so a
+    // refusal then is one that never started.
+    m_playing = s.playback.active && !s.playback.waiting;
+    m_header->showActivity(s);
+    if (!s.recording.path.isEmpty()) {
+        m_lastRecordingFile = s.recording.path;
+    } else if (!s.lastRecordingPath.isEmpty()) {
+        m_lastRecordingFile = s.lastRecordingPath;
+    }
+
+    m_lastRecording = s.recording;
+    const QStringList failures = std::exchange(m_recordingFailures, QStringList());
+    for (const QString& reason : failures) {
+        QString text = reason;
+        if (s.recording.error == reason && !s.recording.path.isEmpty()) {
+            text += QStringLiteral("\n\nWhat was recorded until then is kept in %1.")
+                        .arg(QDir::toNativeSeparators(s.recording.path));
+        }
+        text += QStringLiteral("\n\nThe radio's audio carries on. To record somewhere else, choose another folder, "
+                               "here or at any time from the gear button's Recordings menu.");
+        // A folder that cannot be made or written to, such as Documents once macOS has been
+        // refused access to it, fails the same way at every REC: the way out is offered here.
+        showNotice(QStringLiteral("record:") + reason, QStringLiteral("Recording stopped"), text, true);
+    }
+}
+
+void MainWindow::onRecordingFailed(const QString& reason)
+{
+    // A press turned down recorded nothing, so nothing failed: the button has flipped back
+    // and the chip's tooltip says why. Its reason must match too, so that a refusal still on
+    // show cannot hide a recording that stopped since.
+    if (m_lastRecording.refused && m_lastRecording.error == reason) return;
+    m_recordingFailures.append(reason);
+    m_header->statusChip()->setRecordingFailureAnswered(false);  // news again, until its warning is answered
+}
+
+void MainWindow::onPlaybackFailed(const QString& reason)
+{
+    // Turned down, or cut short: the last status says whether it was playing.
+    if (m_playing) {
+        showNotice(QStringLiteral("play:") + reason, QStringLiteral("Playback stopped"), reason);
+    } else {
+        showNotice(QStringLiteral("play:") + reason, QStringLiteral("Could not play the recording"), reason);
+    }
+}
+
+void MainWindow::showNotice(const QString& cause, const QString& title, const QString& text, bool offersFolder)
+{
+    // An answered warning is hidden at once but deleted only later, so until then it is still
+    // here: only one on screen counts, or a failure arriving meanwhile would go unsaid.
+    if (m_notice && m_notice->isVisible()) {
+        if (m_noticeCause == cause) {
+            // Still unanswered: brought forward rather than said again.
+            m_notice->raise();
+            m_notice->activateWindow();
+            return;
+        }
+        // A newer problem takes its place. A recording failure it covers up has not been
+        // answered, so the chip goes on showing it.
+        m_notice->disconnect(this);
+        m_notice->close();
+    }
+    // The summary as the text, because a Mac shows no title on a message box.
+    auto* box = new QMessageBox(QMessageBox::Warning, QString::fromUtf8(kAppDisplayName), title, QMessageBox::Ok, this);
+    box->setInformativeText(text);
+    box->setObjectName(QStringLiteral("recordingNotice"));
+    box->setAttribute(Qt::WA_DeleteOnClose);
+    if (offersFolder) {
+        QPushButton* choose = box->addButton(QStringLiteral("Choose Folder..."), QMessageBox::ActionRole);
+        choose->setObjectName(QStringLiteral("noticeChooseFolder"));
+        // Any button answers the warning; this one then asks where to record from now on.
+        connect(choose, &QPushButton::clicked, this, &MainWindow::chooseRecordingFolder);
+    }
+    if (cause.startsWith(QLatin1String("record:"))) {
+        // Answered, the failure is no longer news, and the chip goes back to the connection.
+        connect(box, &QDialog::finished, this, [this] { m_header->statusChip()->setRecordingFailureAnswered(true); });
+    }
+    m_notice = box;
+    m_noticeCause = cause;
+    // Not modal, so the window goes on working beneath it; a message box would otherwise block
+    // the whole application, and open() would block the window. Shown, never exec()'d: this
+    // returns at once, with no event loop inside the window's own, so the engine's reports and
+    // every other queued call go on arriving in order.
+    box->setWindowModality(Qt::NonModal);
+    box->show();
+}
+
+// ── Recordings ──────────────────────────────────────────────────────────────
+
+QString MainWindow::revealCommandText()
+{
+#if defined(Q_OS_MACOS)
+    return QStringLiteral("Show in Finder");
+#elif defined(Q_OS_WIN)
+    return QStringLiteral("Show in Explorer");
+#else
+    return QStringLiteral("Show in Files");
+#endif
+}
+
+QString MainWindow::revealTarget() const
+{
+    if (!m_lastRecordingFile.isEmpty() && QFileInfo::exists(m_lastRecordingFile)) return m_lastRecordingFile;
+    const QString folder = m_settings->recordingFolder();
+    return QFileInfo(folder).isDir() ? folder : QString();
+}
+
+void MainWindow::updateRecordingsMenu()
+{
+    // As wide as a usual path; the tooltip has the rest.
+    constexpr int kPathWidth = 340;
+    const QString folder = QDir::toNativeSeparators(m_settings->recordingFolder());
+    m_folderShown->setText(menuText(m_recordingsMenu, folder, kPathWidth));
+    m_folderShown->setToolTip(folder);
+    if (m_lastRecordingFile.isEmpty()) {
+        m_lastFileShown->setText(QStringLiteral("No recording yet this session"));
+        m_lastFileShown->setToolTip(QString());
+    } else {
+        // Moved or deleted since: said so, because Show in… then shows the folder instead.
+        const bool there = QFileInfo::exists(m_lastRecordingFile);
+        QString last = QStringLiteral("Last: %1").arg(QFileInfo(m_lastRecordingFile).fileName());
+        if (!there) last += QStringLiteral(" (not found)");
+        m_lastFileShown->setText(menuText(m_recordingsMenu, last, kPathWidth));
+        QString tip = QDir::toNativeSeparators(m_lastRecordingFile);
+        if (!there) tip += QStringLiteral("\nNo longer there: moved or deleted.");
+        m_lastFileShown->setToolTip(tip);
+    }
+    const QString target = revealTarget();
+    m_revealAction->setEnabled(!target.isEmpty());
+    m_revealAction->setToolTip(target.isEmpty() ? QStringLiteral("The folder is made by the first recording.")
+                                                : QDir::toNativeSeparators(target));
+}
+
+void MainWindow::chooseRecordingFolder()
+{
+    if (!m_chooseFolder) return;
+    const QString chosen = m_chooseFolder(m_settings->recordingFolder());
+    if (!chosen.isEmpty()) m_settings->setRecordingFolder(chosen);
+}
+
+void MainWindow::showBypass(bool bypassed)
+{
+    {
+        const QSignalBlocker block(m_bypass);
+        m_bypass->setChecked(bypassed);
+    }
+    if (bypassed == m_bypassShown) return;
+    m_bypassShown = bypassed;
+    // Nothing is unticked: each box keeps what will play again, greyed while BYPASS holds.
+    const auto boxes = m_rail->findChildren<QCheckBox*>();
+    for (QCheckBox* box : boxes) {
+        if (box->objectName().startsWith(QLatin1String("aetherRxEnable"))) box->setEnabled(!bypassed);
+    }
 }
 
 } // namespace esa

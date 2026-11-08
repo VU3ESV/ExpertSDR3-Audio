@@ -69,8 +69,9 @@ public:
     struct WindowState {
         QString page;      // ui/page: the page it showed last
         QString geometry;  // ui/geometry: "x,y,w,h" of the window when not maximised
-        // ui/frame: "System" or "Custom". Stored only, until the custom frame exists; empty
-        // means the platform's default, so a later change of default still reaches it.
+        // ui/frame: "System" or "Custom", as last chosen from the gear's Window frame menu
+        // (WindowChrome). Empty means the platform's default, so a later change of default
+        // still reaches it.
         QString frame;
     };
     WindowState loadWindowState() const;

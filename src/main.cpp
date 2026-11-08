@@ -385,11 +385,14 @@ int main(int argc, char** argv)
             }
         }
         if (parser.isSet(sizeOpt)) {
+            // Bigger than any screen is a typing mistake, and one far beyond it builds an image
+            // so large that grabbing it never finishes.
+            constexpr int kMaxSide = 8192;
             const QRegularExpressionMatch match =
-                QRegularExpression(QStringLiteral("^(\\d+)x(\\d+)$")).match(parser.value(sizeOpt));
+                QRegularExpression(QStringLiteral("^(\\d{1,5})x(\\d{1,5})$")).match(parser.value(sizeOpt));
             screenshotSize = match.hasMatch() ? QSize(match.captured(1).toInt(), match.captured(2).toInt()) : QSize();
-            if (screenshotSize.isEmpty()) {
-                qCritical("--size takes a width and height such as 724x752");
+            if (screenshotSize.isEmpty() || screenshotSize.width() > kMaxSide || screenshotSize.height() > kMaxSide) {
+                qCritical("--size takes a width and height of 1 to %d each, such as 724x752", kMaxSide);
                 return 2;
             }
         }

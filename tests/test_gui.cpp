@@ -11,6 +11,8 @@
 #include "gui/RadioDiscoveryDialog.h"
 #include "gui/aether/Appearance.h"
 
+#include "ClientCompKnob.h"
+
 #include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
@@ -26,7 +28,6 @@
 #include <QSpinBox>
 #include <QSlider>
 #include <QStandardPaths>
-#include <QTcpServer>
 #include <QTemporaryDir>
 #include <QtTest>
 
@@ -52,9 +53,14 @@ private:
         m_window.reset();
         m_engine = std::make_unique<Engine>(path);
         m_settings = std::make_unique<Settings>(path);
+        // Whatever a test presses, REC never reaches the real Documents folder.
+        m_settings->setRecordingFolder(m_dir.filePath(QStringLiteral("Recordings")));
         m_profiles = std::make_unique<ProfileLibrary>(ProfileLibrary::defaultPath(path));
         m_window = std::make_unique<MainWindow>(m_engine.get(), m_engine->taps(), m_settings.get(), m_profiles.get(),
                                                 config);
+        // Nor does anything open a file manager or a folder dialog.
+        m_window->setRevealHandler([](const QString&) {});
+        m_window->setFolderChooser([](const QString&) { return QString(); });
         m_window->show();
         QCoreApplication::processEvents();
     }
@@ -225,7 +231,8 @@ private slots:
         control(QStringLiteral("comp.threshold"))->setValue(-30);
         control(QStringLiteral("gate.mode"))->setValue(1);
         control(QStringLiteral("gate.ratio"))->setValue(3.5);  // not the preset the mode implies
-        // RN2, chosen on the AetherNR page as the operator would.
+        // RN2, chosen on the AetherNR page as the operator would. Once that page has its method
+        // tabs, this presses nrTab_rn2 instead of setting the interim combo.
         m_window->showPage(QStringLiteral("nr"));
         auto* method = m_window->findChild<QComboBox*>(QStringLiteral("nrMethod"));
         QVERIFY(method);
@@ -264,6 +271,9 @@ private slots:
         QCOMPARE(railOrder(), chain.stageOrder);             // and what the rail shows
         QCOMPARE(control(QStringLiteral("eq.b4.freq"))->value(), 850.0);
         QCOMPARE(control(QStringLiteral("eq.b4.on"))->value(), 1.0);
+        // And what the AetherRX pages draw from.
+        QCOMPARE(m_engine->taps()->view.eq.band(4).freqHz, 850.0f);
+        QVERIFY(m_engine->taps()->view.eq.band(4).enabled);
     }
 
     void aProfileLeavesTheStationSettingsAlone()
@@ -279,10 +289,35 @@ private slots:
         auto* host = m_window->findChild<QLineEdit*>(QStringLiteral("host"));
         QVERIFY(host);
         QCOMPARE(host->text(), QStringLiteral("10.0.0.9"));
+        // Once Final Output is AetherRX's own, this reads its Volume knob's value() instead.
         auto* volume = m_window->findChild<QSlider*>(QStringLiteral("volume"));
         QVERIFY(volume);
         QCOMPARE(volume->minimum(), -60);
         QCOMPARE(volume->value(), -12);
+    }
+
+    // An AetherRX knob, found as the operator finds it: by what it is and what it says.
+    AetherSDR::ClientCompKnob* knob(const QString& label)
+    {
+        const auto knobs = m_window->findChildren<AetherSDR::ClientCompKnob*>();
+        for (AetherSDR::ClientCompKnob* k : knobs) {
+            if (k->accessibleName() == label) return k;
+        }
+        return nullptr;
+    }
+
+    // Typed into the knob's value field once it has the keyboard, then Return.
+    static void turn(AetherSDR::ClientCompKnob* k, double value)
+    {
+        auto* field = k->findChild<QLineEdit*>();
+        QVERIFY(field);
+        k->window()->activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(k->window()));
+        field->setFocus(Qt::MouseFocusReason);
+        QTRY_VERIFY(field->hasFocus());
+        field->selectAll();
+        QTest::keyClicks(field, QString::number(value));
+        QTest::keyClick(field, Qt::Key_Return);
     }
 
     void changingAnythingShowsAsModified()
@@ -290,9 +325,13 @@ private slots:
         make(AppConfig{});
         QVERIFY(m_window->saveProfileAs(QStringLiteral("Base")));
 
-        control(QStringLiteral("tube.drive"))->setValue(6);
+        m_window->showPage(QStringLiteral("gate"));
+        AetherSDR::ClientCompKnob* thresh = knob(QStringLiteral("Thresh"));
+        QVERIFY(thresh);
+        turn(thresh, -30);
+        QCOMPARE(control(QStringLiteral("gate.threshold"))->value(), -30.0);
         QVERIFY(m_window->chainModified());
-        control(QStringLiteral("tube.drive"))->setValue(0);
+        turn(thresh, -40);
         QVERIFY2(!m_window->chainModified(), "back to the saved value is not a change");
 
         ParamControl* q = control(QStringLiteral("eq.b9.q"));
@@ -425,10 +464,8 @@ private slots:
     void theDiscoveryDialogExplainsWhenThereIsNothing()
     {
         QFETCH(QString, host);
-        QTcpServer probe;
-        QVERIFY(probe.listen(QHostAddress::LocalHost, 0));
-        const int closedPort = probe.serverPort();
-        probe.close();
+        const int closedPort = closedLocalPort();  // nothing listens there, and no radio could
+        QVERIFY(closedPort > 0);
         TciDiscovery::Options options;
         options.hosts = {host};
         options.ports = {closedPort};

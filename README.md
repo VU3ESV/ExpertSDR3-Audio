@@ -205,7 +205,9 @@ QT_QPA_PLATFORM=offscreen ctest --test-dir build --output-on-failure
 ```
 
 These need no radio or sound device. `test_engine_e2e` runs the real engine against a
-simulated server built from measurements of the real one.
+simulated server built from measurements of the real one. Its settings tests skip the
+native store (a Mac's preferences, the Windows registry), which belongs to your user
+account, unless `ESA_TEST_NATIVE_SETTINGS=1` is set, as CI sets it.
 
 ## License
 

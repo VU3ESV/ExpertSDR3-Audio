@@ -8,11 +8,11 @@
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
+#include <QLockFile>
 #include <QHostAddress>
 #include <QRegularExpression>
 #include <QSettings>
 #include <QStandardPaths>
-#include <QTcpServer>
 #include <QTemporaryDir>
 #include <QThread>
 #include <QTimer>
@@ -51,6 +51,7 @@ public:
     {
         SinkStats s;
         s.framesPlayed = framesWritten;
+        s.targetMs = targetMs;
         return s;
     }
     void setGainDb(double) override {}
@@ -61,6 +62,7 @@ public:
     std::vector<float> samples;
     quint64 framesWritten{0};
     bool isAlive{true};
+    double targetMs{0.0};  // what a real device's buffer aims to hold, raised by underruns
     std::function<void(const RecordingSink&)> onClose;  // the engine let go of it
 };
 
@@ -210,13 +212,33 @@ public:
 
 constexpr int kTimeout = 5000;
 
+// The native store is this user's own (~/Library/Preferences on a Mac, the registry on Windows,
+// ~/.config elsewhere), and on a Mac neither HOME nor CFFIXED_USER_HOME moves it. So the rows
+// that use it run only where that was asked for, as CI does: ESA_TEST_NATIVE_SETTINGS=1.
+bool nativeStoreWanted()
+{
+    return qEnvironmentVariableIntValue("ESA_TEST_NATIVE_SETTINGS") == 1;
+}
+
 // One settings store for one test: an ini file like the other tests use, or the native store
 // that real installs use (a plist, the registry), under a name no real install has.
 class SettingsStore {
 public:
-    explicit SettingsStore(bool native) : m_native(native) { clear(); }
+    explicit SettingsStore(bool native) : m_native(native)
+    {
+        // One name for every run, so runs at once (ctest -j, two build folders) take turns with
+        // it, or one would clear what another has just written. A run that died leaves a lock
+        // that the next sees is stale, by its process being gone.
+        if (m_native) {
+            m_lock = std::make_unique<QLockFile>(
+                QDir(QDir::tempPath()).filePath(QStringLiteral("ExpertSDR3Audio-Tests-SettingsStore.lock")));
+            m_lock->setStaleLockTime(0);
+            m_lock->lock();
+        }
+        clear();
+    }
     // The native store keeps an empty entry under this fixed name. Deleting that file as well would
-    // only race a Mac's preferences daemon, which writes it back.
+    // only race a Mac's preferences daemon, which writes it back. The lock goes after this.
     ~SettingsStore() { clear(); }
 
     std::unique_ptr<QSettings> raw() const
@@ -254,6 +276,7 @@ private:
     inline static const QString kOrganization = QStringLiteral("ExpertSDR3Audio-Tests");
     inline static const QString kApplication = QStringLiteral("SettingsStore");
     bool m_native;
+    std::unique_ptr<QLockFile> m_lock;
     QTemporaryDir m_dir;
 };
 
@@ -603,6 +626,7 @@ private slots:
     void theOldMuteRecordMovesToTheSavedRadio()
     {
         QFETCH(bool, native);
+        if (native && !nativeStoreWanted()) QSKIP("Writes this user's own settings store; ESA_TEST_NATIVE_SETTINGS=1 runs it");
         const SettingsStore store(native);
         const QString radio = QStringLiteral("192.168.1.50");
         store.raw()->setValue(QStringLiteral("radio/host"), radio);
@@ -627,6 +651,7 @@ private slots:
     void theOldMuteRecordKeepsWhatTheRadioWasBefore()
     {
         QFETCH(bool, native);
+        if (native && !nativeStoreWanted()) QSKIP("Writes this user's own settings store; ESA_TEST_NATIVE_SETTINGS=1 runs it");
         const SettingsStore store(native);
         const QString radio = QStringLiteral("192.168.1.50");
         store.raw()->setValue(QStringLiteral("radio/host"), radio);
@@ -641,6 +666,7 @@ private slots:
     void theOldMuteRecordWithNoSavedRadioMeansTheDefaultOne()
     {
         QFETCH(bool, native);
+        if (native && !nativeStoreWanted()) QSKIP("Writes this user's own settings store; ESA_TEST_NATIVE_SETTINGS=1 runs it");
         const SettingsStore store(native);
         store.writeOldMuteRecord(true, false);
         QVERIFY(store.open()->loadMuteOwnership(AppConfig{}.host).owned);
@@ -651,6 +677,7 @@ private slots:
     void anOldMuteRecordOwingNothingLeavesNothingBehind()
     {
         QFETCH(bool, native);
+        if (native && !nativeStoreWanted()) QSKIP("Writes this user's own settings store; ESA_TEST_NATIVE_SETTINGS=1 runs it");
         const SettingsStore store(native);
         store.raw()->setValue(QStringLiteral("radio/host"), QStringLiteral("192.168.1.50"));
         store.writeOldMuteRecord(false, true);
@@ -666,6 +693,7 @@ private slots:
     void aRadiosMuteRecordIsKeptAndClearedInEachStore()
     {
         QFETCH(bool, native);
+        if (native && !nativeStoreWanted()) QSKIP("Writes this user's own settings store; ESA_TEST_NATIVE_SETTINGS=1 runs it");
         const SettingsStore store(native);
         const auto settings = store.open();
         const QString ip = QStringLiteral("192.168.1.5");
@@ -900,6 +928,40 @@ private slots:
         f.engine().shutdown();
     }
 
+    // Blocks the radio sent before it saw the disconnect still arrive while the socket closes.
+    // They belong to the session that has ended: not played, not metered, not taken as audio.
+    void audioStillArrivingAfterADisconnectIsIgnored()
+    {
+        Fixture f;
+        AppConfig config = f.baseConfig();
+        config.muteExpert = false;  // no mute to give back, so the socket closes at once
+        f.start(config);
+        QTRY_VERIFY_WITH_TIMEOUT(f.audioFlowing(), kTimeout);
+        const std::shared_ptr<LiveTaps> taps = f.engine().taps();
+        f.engine().disconnectRadio();
+        QCOMPARE(f.status.connection, TciClient::State::Disconnected);
+        QVERIFY(!f.status.audioFlowing);
+        const quint64 blocks = taps->blocks.load();
+
+        // Whole blocks, as the stream sends them, from a server that has not yet seen the close.
+        QByteArray frame(64 + 1024 * int(sizeof(float)), '\0');
+        qToLittleEndian<quint32>(0, frame.data());  // receiver 0
+        qToLittleEndian<quint32>(48000, frame.data() + 4);
+        qToLittleEndian<quint32>(3, frame.data() + 8);  // float32
+        qToLittleEndian<quint32>(1024, frame.data() + 20);
+        qToLittleEndian<quint32>(1, frame.data() + 24);  // RX audio
+        qToLittleEndian<quint32>(2, frame.data() + 28);  // stereo
+        auto* samples = reinterpret_cast<float*>(frame.data() + 64);
+        for (int i = 0; i < 1024; ++i) samples[i] = 0.25f;
+        QVERIFY(f.mock.hasClient());  // its end is still open: it has not processed the close yet
+        for (int i = 0; i < 5; ++i) f.mock.sendBinary(frame);
+        QTest::qWait(300);
+        QCOMPARE(taps->blocks.load(), blocks);
+        QVERIFY(!f.status.audioFlowing);
+        QCOMPARE(f.status.connection, TciClient::State::Disconnected);
+        f.engine().shutdown();
+    }
+
     void forwardCounterGapsAreCountedAsLoss()
     {
         Fixture f;
@@ -946,7 +1008,7 @@ private slots:
     {
         // Accepts the WebSocket, then sends nothing: not a usable TCI server.
         QWebSocketServer silent(QStringLiteral("silent"), QWebSocketServer::NonSecureMode);
-        QVERIFY(silent.listen(QHostAddress::LocalHost, 0));
+        QVERIFY(listenOffExpertPorts(silent));
         Fixture f;
         AppConfig config = f.baseConfig();
         config.port = silent.serverPort();
@@ -963,10 +1025,8 @@ private slots:
     void aRefusedPortFallsBackAndThenStaysOnTheOneThatWorked()
     {
         Fixture f;
-        QTcpServer probe;
-        QVERIFY(probe.listen(QHostAddress::LocalHost, 0));
-        const int closedPort = probe.serverPort();
-        probe.close();  // reserved a number nothing is listening on
+        const int closedPort = closedLocalPort();  // nothing listens there, and no radio could
+        QVERIFY(closedPort > 0);
 
         AppConfig config = f.baseConfig();
         config.port = closedPort;
@@ -985,10 +1045,8 @@ private slots:
     void anExplicitPortNeverWandersOffToAnotherServer()
     {
         Fixture f;
-        QTcpServer probe;
-        QVERIFY(probe.listen(QHostAddress::LocalHost, 0));
-        const int closedPort = probe.serverPort();
-        probe.close();
+        const int closedPort = closedLocalPort();  // nothing listens there, and no radio could
+        QVERIFY(closedPort > 0);
 
         AppConfig config = f.baseConfig();
         config.port = closedPort;
@@ -1406,8 +1464,17 @@ private slots:
         QObject::connect(engine, &Engine::statusChanged, &mock, [&](const EngineStatus& s) { status = s; });
         QObject::connect(engine, &Engine::recordingFailed, &mock, [&](const QString& r) { failures << r; });
         QObject::connect(engine, &Engine::playbackFailed, &mock, [&](const QString& r) { failures << r; });
-        const auto call = [engine](std::function<void(Engine*)> fn) {
-            QMetaObject::invokeMethod(engine, [engine, fn] { fn(engine); });
+        // A std::function keeps its target on the heap, written here and read on the engine's
+        // thread. Qt's queue orders that, out of ThreadSanitizer's sight; a release once the
+        // call is built and an acquire where it runs state the order where it can see it.
+        std::atomic<int> handoff{0};
+        const auto call = [engine, &handoff](std::function<void(Engine*)> fn) {
+            auto run = [engine, fn = std::move(fn), &handoff] {
+                (void)handoff.load(std::memory_order_acquire);
+                fn(engine);
+            };
+            handoff.fetch_add(1, std::memory_order_release);
+            QMetaObject::invokeMethod(engine, std::move(run));
         };
 
         AppConfig config;
@@ -1485,8 +1552,16 @@ private slots:
             e->connectRadio();
             e->startRecordingToFile(last);
         });
-        QTRY_VERIFY_WITH_TIMEOUT(status.audioFlowing && status.recording.seconds > 0.3, kTimeout);
-        QVERIFY(!status.playback.active);
+        // A status from after the call: until then the status still shows the last
+        // recording's length.
+        QTRY_VERIFY_WITH_TIMEOUT(status.recording.active && status.recording.path == last && status.audioFlowing
+                                     && status.recording.seconds > 0.3,
+                                 kTimeout);
+        QVERIFY2(!status.playback.active, qPrintable(QStringLiteral("playing %1 of %2 s, connection %3, recording %4")
+                                                         .arg(status.playback.seconds)
+                                                         .arg(status.playback.totalSeconds)
+                                                         .arg(int(status.connection))
+                                                         .arg(status.recording.path)));
         QVERIFY(polls > 50);
         window.stop();
         taps->eqWanted = false;
@@ -1508,6 +1583,36 @@ private slots:
     }
 
     // ── Recording and playback ───────────────────────────────────────────────
+
+    // The status names the file playing. A recording finished meanwhile is the last one, and
+    // the next PLAY's, but not what is playing now.
+    void thePlaybackSaysWhichFileItPlays()
+    {
+        Fixture f;
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink && f.sink->framesWritten > 4800, kTimeout);
+        const QString first = f.dir.filePath(QStringLiteral("first.wav"));
+        f.engine().startRecordingToFile(first);
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.recording.seconds >= 3.0, 2 * kTimeout);
+        f.engine().stopRecording();
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.lastRecordingPath, first, kTimeout);
+        QVERIFY(f.status.playback.path.isEmpty());
+
+        f.engine().startPlayback();
+        QVERIFY(f.status.playback.active);
+        QCOMPARE(f.status.playback.path, first);
+        const QString second = f.dir.filePath(QStringLiteral("second.wav"));
+        f.engine().startRecordingToFile(second);
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.recording.seconds >= 0.2, kTimeout);
+        f.engine().stopRecording();
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.lastRecordingPath, second, kTimeout);
+        QVERIFY2(f.status.playback.active, "the first recording should still be playing");
+        QCOMPARE(f.status.playback.path, first);
+
+        QTRY_VERIFY_WITH_TIMEOUT(!f.status.playback.active, kTimeout);
+        QVERIFY(f.status.playback.path.isEmpty());
+        f.engine().shutdown();
+    }
 
     // REC holds the chain's output, before the volume: exactly what the speakers were handed.
     void aRecordingHoldsExactlyWhatTheSpeakersGot()
@@ -1849,6 +1954,37 @@ private slots:
         f.engine().shutdown();
     }
 
+    // A recording that stopped early belongs to its session. The status keeps the reason
+    // through the disconnect that ends it, as a headless run's summary reports it, and the
+    // next connection starts with none.
+    void aNewConnectionStartsWithNoRecordingFailure()
+    {
+        Fixture f;
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink && f.sink->framesWritten > 4800, kTimeout);
+        QSignalSpy failed(&f.engine(), &Engine::recordingFailed);
+        QFile blocker(f.dir.filePath(QStringLiteral("blocked")));
+        QVERIFY(blocker.open(QIODevice::WriteOnly));
+        blocker.close();
+        f.engine().startRecording(f.dir.filePath(QStringLiteral("blocked/Recordings")));
+        QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, kTimeout);
+        const QString reason = f.status.recording.error;
+        QVERIFY(!reason.isEmpty());
+        QVERIFY(!f.status.recording.refused);
+
+        f.engine().disconnectRadio();
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.connection, TciClient::State::Disconnected, kTimeout);
+        QCOMPARE(f.status.recording.error, reason);
+
+        f.engine().connectRadio();
+        QVERIFY2(f.status.recording.error.isEmpty(), qPrintable(f.status.recording.error));
+        QVERIFY(!f.status.recording.refused);
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.audioFlowing, kTimeout);
+        QVERIFY(f.status.recording.error.isEmpty());
+        QCOMPARE(failed.count(), 1);
+        f.engine().shutdown();
+    }
+
     // The disk fills up mid-recording: the file keeps every whole frame that fitted, the
     // failure is reported once, PLAY can have what was kept, and the live audio never stopped.
     void aFullDiskStopsTheRecordingButNotTheAudio()
@@ -1883,6 +2019,171 @@ private slots:
         QTest::qWait(300);
         QCOMPARE(failures.size(), 1);
         f.engine().shutdown();
+    }
+
+    // The recording is the chain's output whatever becomes of the speakers: a device that dies
+    // mid-recording and will not open again stops nothing.
+    void aRecordingGoesOnWhenTheOutputFails()
+    {
+        Fixture f;
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink && f.sink->framesWritten > 4800, kTimeout);
+        QStringList failures;
+        QObject::connect(&f.engine(), &Engine::recordingFailed, &f.mock,
+                         [&](const QString& reason) { failures << reason; });
+        // The chain's output as the scope gets it, which goes on without a device.
+        const std::shared_ptr<LiveTaps> taps = f.engine().taps();
+        std::vector<float> chain;
+        QTimer window;
+        window.setInterval(5);
+        QObject::connect(&window, &QTimer::timeout, &f.mock, [&] {
+            const std::vector<float> got = drain(taps->outTap);
+            chain.insert(chain.end(), got.begin(), got.end());
+        });
+
+        // The engine runs on this thread, so no block lands between these lines.
+        taps->outTap.skip(taps->outTap.size());
+        taps->outWanted = true;
+        window.start();
+        const QString path = f.dir.filePath(QStringLiteral("take.wav"));
+        f.engine().startRecordingToFile(path);
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.recording.seconds > 0.3, kTimeout);
+
+        // Unplugged, and it does not come back.
+        f.failSinkOpen = true;
+        f.sink->isAlive = false;
+        QTRY_VERIFY_WITH_TIMEOUT(!f.status.outputOpen, kTimeout);
+        QVERIFY(!f.status.outputError.isEmpty());
+        const double atFailure = f.status.recording.seconds;
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.recording.seconds > atFailure + 1.0, kTimeout);
+        QVERIFY(f.status.recording.active);
+        QVERIFY(f.status.recording.error.isEmpty());
+        QVERIFY(!f.status.outputOpen);
+
+        f.engine().stopRecording();
+        window.stop();
+        const std::vector<float> rest = drain(taps->outTap);
+        chain.insert(chain.end(), rest.begin(), rest.end());
+        taps->outWanted = false;
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.lastRecordingPath, path, kTimeout);
+        const std::optional<Recorded> file = readRecording(path);
+        QVERIFY(file);
+        QCOMPARE(file->info.declaredFrames, file->info.framesInFile);
+        QCOMPARE(file->frames.size(), chain.size());
+        QVERIFY2(sameBits(file->frames.data(), chain.data(), chain.size()), "the recording is not the chain's output");
+        QCOMPARE(f.status.recording.seconds, double(file->info.frames) / 48000.0);
+        QVERIFY(failures.isEmpty());
+        f.engine().shutdown();
+    }
+
+    // A stream-rate change ends a recording's part and goes on in the next. When the old part's
+    // last write fails, the recorder fails its continuation too, with the same reason: one
+    // cause, so one report.
+    void aRateRollWhoseOldPartFailsIsReportedOnce()
+    {
+        Fixture f;
+        auto failing = std::make_shared<std::atomic<bool>>(false);
+        f.recorderOptions.drainIntervalMs = 5000;  // only the drain at the roll writes
+        f.recorderOptions.openDevice = [failing](const QString& path) -> std::unique_ptr<QFileDevice> {
+            return std::make_unique<FailingFile>(path, failing);
+        };
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.audioFlowing(), kTimeout);
+        QStringList failures;
+        QObject::connect(&f.engine(), &Engine::recordingFailed, &f.mock,
+                         [&](const QString& reason) { failures << reason; });
+        const QString path = f.dir.filePath(QStringLiteral("take.wav"));
+        f.engine().startRecordingToFile(path);
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.recording.seconds > 0.3, kTimeout);
+
+        failing->store(true);
+        f.mock.operatorSetStreamRate(24000);
+        QTRY_COMPARE_WITH_TIMEOUT(failures.size(), 1, kTimeout);
+        QVERIFY2(failures.first().contains(QStringLiteral("take.wav"))
+                     && failures.first().contains(QStringLiteral("injected failure")),
+                 qPrintable(failures.first()));
+        QTRY_VERIFY_WITH_TIMEOUT(!f.status.recording.active, kTimeout);
+        QCOMPARE(f.status.recording.error, failures.first());
+        QVERIFY(!f.status.recording.refused);
+        QCOMPARE(f.status.chainRate, 24000);
+        QTest::qWait(500);  // the continuation's failure and the end of both have come by now
+        QCOMPARE(failures.size(), 1);
+        QVERIFY(!QFileInfo::exists(f.dir.filePath(QStringLiteral("take_part2.wav"))));
+        f.engine().shutdown();
+        QCOMPARE(failures.size(), 1);
+    }
+
+    // REC pressed while connecting to a radio that never answers waits for it. When a disconnect
+    // or quit ends it still waiting, the status (and so a headless run's summary) says nothing
+    // was recorded, rather than looking like a recording that got no audio. A refusal, so the
+    // status that says so comes before the signal. A stop is the operator's own choice, and
+    // says nothing (as in recIsRefusedUntilARadioIsConnected).
+    void aRecordingWaitingForARadioThatNeverAnswersSaysSo()
+    {
+        Fixture f;
+        const int closedPort = closedLocalPort();  // nothing listens there, and no radio could
+        QVERIFY(closedPort > 0);
+        AppConfig config = f.baseConfig();
+        config.port = closedPort;
+        config.fallbackPorts = {};  // never the real radio's ports
+        config.muteExpert = false;  // and nothing to say to one, were it reached
+        f.engine().configure(config);
+        QStringList events;  // statuses carrying a refusal, and the signal, in the order they came
+        QObject::connect(&f.engine(), &Engine::statusChanged, &f.mock, [&](const EngineStatus& s) {
+            if (s.recording.refused) events << QStringLiteral("status: ") + s.recording.error;
+        });
+        QObject::connect(&f.engine(), &Engine::recordingFailed, &f.mock,
+                         [&](const QString& reason) { events << QStringLiteral("signal: ") + reason; });
+        const QString folder = f.dir.filePath(QStringLiteral("Recordings"));
+        const QString never = QStringLiteral("The radio never connected, so nothing was recorded");
+
+        // Disconnected: refused at once.
+        f.engine().startRecording(folder);
+        const QString notConnected = QStringLiteral("Connect to a radio first");
+        QCOMPARE(events.mid(0, 2), QStringList({QStringLiteral("status: ") + notConnected,
+                                                QStringLiteral("signal: ") + notConnected}));
+
+        // Connecting: taken, and waits.
+        f.engine().connectRadio();
+        f.engine().startRecording(folder);
+        QVERIFY(f.status.recording.active);
+        QVERIFY(f.status.recording.error.isEmpty());
+        QTest::qWait(500);
+        QVERIFY(f.status.connection != TciClient::State::Ready);
+        QVERIFY(f.status.recording.active);
+        QCOMPARE(f.status.recording.seconds, 0.0);
+
+        events.clear();
+        f.engine().stopRecording();
+        QVERIFY(!f.status.recording.active);
+        QVERIFY(f.status.recording.error.isEmpty());
+        QVERIFY(events.isEmpty());
+
+        // A disconnect while it waits.
+        f.engine().startRecording(folder);
+        QVERIFY(f.status.recording.active);
+        QTest::qWait(300);
+        f.engine().disconnectRadio();
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.connection, TciClient::State::Disconnected, kTimeout);
+        QVERIFY(!f.status.recording.active);
+        QCOMPARE(f.status.recording.error, never);
+        QVERIFY(f.status.recording.refused);  // nothing was kept, so nothing to warn about
+        QVERIFY(f.status.recording.path.isEmpty());
+        QCOMPARE(events.mid(0, 2), QStringList({QStringLiteral("status: ") + never, QStringLiteral("signal: ") + never}));
+
+        // Quitting while it waits says the same in the last status, which a headless run prints.
+        f.engine().connectRadio();
+        QVERIFY(f.status.recording.error.isEmpty());  // connecting answers a refusal
+        f.engine().startRecording(folder);
+        QVERIFY(f.status.recording.active);
+        QTest::qWait(300);
+        f.engine().shutdown();
+        QVERIFY(!f.status.recording.active);
+        QCOMPARE(f.status.recording.error, never);
+        QVERIFY(f.status.recording.refused);
+        QVERIFY(f.status.recording.path.isEmpty());
+        QCOMPARE(f.status.recording.seconds, 0.0);
+        QVERIFY(!QFileInfo::exists(folder));
     }
 
     // PLAY sends the speakers exactly the file's frames, at the pace of the file, in place of
@@ -2112,6 +2413,178 @@ private slots:
         QVERIFY2(failures.last().contains(QStringLiteral("48000")) && failures.last().contains(QStringLiteral("24000")),
                  qPrintable(failures.last()));
         QCOMPARE(f.sinkOpenCount, opens);
+        f.engine().shutdown();
+    }
+
+    // PLAY pressed straight after REC stops, before the disk thread has finished the file, is
+    // for that recording: it waits for it, showing as playing, rather than being refused or
+    // playing the one before. A second click while it waits calls it off.
+    void playPressedAsARecordingStopsWaitsForIt()
+    {
+        Fixture f;
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink && f.sink->framesWritten > 4800, kTimeout);
+        QStringList failures;
+        QObject::connect(&f.engine(), &Engine::playbackFailed, &f.mock,
+                         [&](const QString& reason) { failures << reason; });
+        double totalSeconds = 0.0;
+        QObject::connect(&f.engine(), &Engine::statusChanged, &f.mock, [&](const EngineStatus& s) {
+            if (s.playback.totalSeconds > 0.0) totalSeconds = s.playback.totalSeconds;
+        });
+        const QString older = f.dir.filePath(QStringLiteral("older.wav"));
+        QVERIFY(recordFor(f, older, 0.3));
+
+        const QString newer = f.dir.filePath(QStringLiteral("newer.wav"));
+        f.engine().startRecordingToFile(newer);
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.recording.seconds > 0.8, kTimeout);
+        // The engine runs on this thread, so the disk thread's word that the file is finished
+        // cannot have arrived between these lines.
+        f.engine().stopRecording();
+        f.engine().startPlayback();
+        QVERIFY(failures.isEmpty());
+        QVERIFY(f.status.playback.active);
+        QVERIFY(f.status.playback.waiting);  // on, but nothing plays yet
+        QCOMPARE(f.status.lastRecordingPath, older);  // the newer one is still being written
+
+        QTRY_VERIFY_WITH_TIMEOUT(totalSeconds > 0.0, kTimeout);
+        QVERIFY(!f.status.playback.waiting);
+        QCOMPARE(f.status.lastRecordingPath, newer);
+        const std::optional<WavFile::Info> info = WavFile::parseFile(newer);
+        QVERIFY(info);
+        QCOMPARE(totalSeconds, double(info->frames) / 48000.0);
+        QTRY_VERIFY_WITH_TIMEOUT(!f.status.playback.active, kTimeout);
+        QVERIFY2(failures.isEmpty(), qPrintable(failures.join(u'\n')));
+
+        // Called off while it waits: nothing plays.
+        const QString third = f.dir.filePath(QStringLiteral("third.wav"));
+        f.engine().startRecordingToFile(third);
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.recording.seconds > 0.3, kTimeout);
+        f.engine().stopRecording();
+        f.engine().startPlayback();
+        QVERIFY(f.status.playback.active && f.status.playback.waiting);
+        f.engine().stopPlayback();
+        QVERIFY(!f.status.playback.active && !f.status.playback.waiting);
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.lastRecordingPath, third, kTimeout);
+        QTest::qWait(200);
+        QVERIFY(!f.status.playback.active);
+        QVERIFY(failures.isEmpty());
+        f.engine().shutdown();
+    }
+
+    // PLAY pressed while a disconnect waits for ExpertSDR3's mute to come back is turned down,
+    // even with a recording still being written out: it does not wait, to play by itself once
+    // the radio has gone.
+    void playPressedWhileDisconnectingIsRefused()
+    {
+        Fixture f;
+        f.start();
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.mutePhase, MuteController::Phase::Holding, kTimeout);
+        QStringList failures;
+        QObject::connect(&f.engine(), &Engine::playbackFailed, &f.mock,
+                         [&](const QString& reason) { failures << reason; });
+        const QString path = f.dir.filePath(QStringLiteral("take.wav"));
+        f.engine().startRecordingToFile(path);
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.recording.seconds > 0.3, kTimeout);
+
+        // The engine runs on this thread, so neither the disk thread's word that the file is
+        // finished nor the radio's answer to the mute can arrive between these lines.
+        f.engine().stopRecording();
+        f.engine().disconnectRadio();
+        f.engine().startPlayback();
+        QCOMPARE(failures, QStringList{QStringLiteral("Still disconnecting from the radio")});
+        QVERIFY(!f.status.playback.active && !f.status.playback.waiting);
+
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.connection, TciClient::State::Disconnected, kTimeout);
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.lastRecordingPath, path, kTimeout);
+        const int opens = f.sinkOpenCount;
+        QTest::qWait(300);
+        QVERIFY(!f.status.playback.active);
+        QVERIFY(!f.status.outputOpen);
+        QCOMPARE(f.sinkOpenCount, opens);  // nothing opened the output to play
+        QCOMPARE(failures.size(), 1);
+        f.engine().shutdown();
+    }
+
+    // While PLAY plays, the status's output peak and the output's freshness counter follow the
+    // playback, not the live chain, with or without a radio: the window's output meter and
+    // scope go by them.
+    void theOutputMeterFollowsWhatPlays()
+    {
+        Fixture f;
+        AppConfig config = f.baseConfig();
+        config.params.insert(QStringLiteral("tube.enabled"), 1);
+        config.params.insert(QStringLiteral("tube.drive"), 12);  // a loud recording
+        f.start(config);
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink && f.sink->framesWritten > 4800, kTimeout);
+        const QString path = f.dir.filePath(QStringLiteral("take.wav"));
+        QVERIFY(recordFor(f, path, 1.0));
+        const std::optional<Recorded> file = readRecording(path);
+        QVERIFY(file);
+        const float fileDb = 20.0f * std::log10(peakOf(file->frames));
+        QVERIFY2(fileDb > -12.0f, qPrintable(QString::number(fileDb)));
+        // The live audio turned well down.
+        f.engine().setParam(QStringLiteral("tube.enabled"), 0);
+        f.engine().setParam(QStringLiteral("eq.enabled"), 1);
+        f.engine().setParam(QStringLiteral("eq.master"), -24);
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.outputPeakDb < -20.0f && f.status.outputPeakDb > -100.0f, kTimeout);
+
+        const std::shared_ptr<LiveTaps> taps = f.engine().taps();
+        float loudest = -120.0f;
+        QObject::connect(&f.engine(), &Engine::statusChanged, &f.mock, [&](const EngineStatus& s) {
+            if (s.playback.active) loudest = std::max(loudest, s.outputPeakDb);
+        });
+        const quint64 outBefore = taps->outBlocks.load();
+        f.engine().startPlayback();
+        QVERIFY(f.status.playback.active);
+        QTRY_VERIFY_WITH_TIMEOUT(!f.status.playback.active, kTimeout);
+        QVERIFY2(loudest > fileDb - 1.0f, qPrintable(QStringLiteral("%1 against %2").arg(loudest).arg(fileDb)));
+        QVERIFY(taps->outBlocks.load() > outBefore + 20);  // a second at a 10 ms pump: about 100
+
+        // No radio: only PLAY feeds the output, and the counter moves for it alone.
+        f.engine().disconnectRadio();
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.connection, TciClient::State::Disconnected, kTimeout);
+        QTRY_VERIFY_WITH_TIMEOUT(!f.status.outputOpen, kTimeout);
+        const quint64 blocks = taps->blocks.load();
+        const quint64 still = taps->outBlocks.load();
+        QTest::qWait(100);
+        QCOMPARE(taps->outBlocks.load(), still);  // nothing plays, so it stands still
+        loudest = -120.0f;
+        f.engine().startPlayback();
+        QVERIFY(f.status.playback.active);
+        QTRY_VERIFY_WITH_TIMEOUT(!f.status.playback.active, kTimeout);
+        QCOMPARE(taps->blocks.load(), blocks);  // no radio, so no chain
+        QVERIFY2(taps->outBlocks.load() > still + 20, qPrintable(QString::number(taps->outBlocks.load() - still)));
+        QVERIFY2(loudest > fileDb - 1.0f, qPrintable(QStringLiteral("%1 against %2").arg(loudest).arg(fileDb)));
+        f.engine().shutdown();
+    }
+
+    // With no radio, the output PLAY opened for itself stays open after the file ends for as long
+    // as the output says it holds, which underruns can have raised well above the buffer setting.
+    void playWithNoRadioWaitsForWhatTheOutputHolds()
+    {
+        Fixture f;
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.audioFlowing(), kTimeout);
+        QVERIFY(recordFor(f, f.dir.filePath(QStringLiteral("take.wav")), 0.5));
+        f.engine().disconnectRadio();
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.connection, TciClient::State::Disconnected, kTimeout);
+        QTRY_VERIFY_WITH_TIMEOUT(!f.status.outputOpen, kTimeout);
+
+        QElapsedTimer clock;
+        clock.start();
+        std::optional<qint64> endedAt;
+        qint64 closedAfterMs = -1;
+        QObject::connect(&f.engine(), &Engine::statusChanged, &f.mock, [&](const EngineStatus& s) {
+            if (!endedAt && !s.playback.active) endedAt = clock.elapsed();
+            if (endedAt && closedAfterMs < 0 && !s.outputOpen) closedAfterMs = clock.elapsed() - *endedAt;
+        });
+        f.engine().startPlayback();
+        QVERIFY(f.status.playback.active);
+        constexpr double kGrownMs = 420.0;  // far past the 60 ms buffer setting
+        f.sink->targetMs = kGrownMs;
+        QTRY_VERIFY_WITH_TIMEOUT(endedAt.has_value(), kTimeout);
+        QTRY_VERIFY_WITH_TIMEOUT(closedAfterMs >= 0, kTimeout);
+        QVERIFY2(closedAfterMs >= qint64(kGrownMs), qPrintable(QString::number(closedAfterMs)));
         f.engine().shutdown();
     }
 

@@ -33,15 +33,19 @@ public:
         QString page;  // the page id a click opens; empty for none
     };
     // The first that applies, most serious first: the output failing, ExpertSDR3's mute
-    // failing, the computer not keeping up, NR failing, a recording that stopped early, the
-    // connection, no audio from the radio, a recording losing audio, NR's state, and then
-    // the frequency.
-    static Summary summarize(const EngineStatus& s);
+    // failing, the computer not keeping up, NR failing, a recording that stopped early (until
+    // its warning is answered), the connection, no audio from the radio, a recording losing
+    // audio, NR's state, and then the frequency.
+    static Summary summarize(const EngineStatus& s, bool recordingFailureAnswered = false);
 
     explicit StatusChip(QWidget* parent = nullptr);
 
     void showStatus(const EngineStatus& s);
     const Summary& summary() const { return m_summary; }
+    // Whether the operator has answered the warning about the recording failure in the status.
+    // A failure is news: once answered, the chip shows the rest of the status again, and the
+    // tooltip still has the failure. The window sets it back for each new failure.
+    void setRecordingFailureAnswered(bool answered);
 
     // Sized for the whole summary, up to a limit; narrower than that, it is shortened with an
     // ellipsis and the tooltip has it all.
@@ -60,6 +64,8 @@ private:
     void refreshText();
 
     Summary m_summary;
+    EngineStatus m_status;  // the last shown
+    bool m_failureAnswered{false};
 };
 
 } // namespace esa

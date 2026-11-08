@@ -1,22 +1,35 @@
 # ThreadSanitizer suppressions for the sanitizer job (TSAN_OPTIONS=suppressions=...).
 #
-# Qt is not built with ThreadSanitizer, so the ordering its event queue and thread pool
-# provide is invisible: data copied into a queued call or a pool job on one thread, then
-# used on the thread that runs it, looks like a race although Qt's own lock orders it.
-# Only those handoffs are listed, by the frames that build the job, which appear only in
-# the posting thread's stack. A race inside a slot, or on the engine's live data
-# (LiveTaps, the rings, the stage meters), still reports: weakening the taps' ring to
-# relaxed ordering was caught with this file in place.
+# Qt is not built with ThreadSanitizer, so the ordering its event queue and thread pool provide
+# is invisible: a queued call or pool job, built on one thread and run on another, looks like
+# a race although Qt's own lock orders it. Only the frames that build that object are listed. They are on the
+# posting thread's stack, never on the stack of the code that runs later, so a race inside a
+# slot, a queued lambda or a pool job still reports, as does one on the engine's live data
+# (LiveTaps, the rings, the stage meters).
+#
+# How a pattern matches: by name, anywhere in either access's stack, and also in the stack
+# that created either thread. So a pattern must never name a frame that encloses running
+# code, or that starts a thread (QThreadPool::start would blind every race on the pool's
+# threads). Where our own code hands data across threads it states the ordering itself with a
+# release and an acquire (Recorder::post, Engine::startNrBuild), so what a job or queued call
+# reads beyond its own captures needs no entry.
 #
 # Checked against Qt 6.10, the version the job installs, with ignore_interceptors_accesses=0
 # and ignore_noninstrumented_modules=1 (set in the job; Linux and macOS default differently).
 
-# A lambda handed to QMetaObject::invokeMethod: its allocation and its captured copies.
-race:QMetaObject::invokeMethod
-# A lambda in a queued connection, built on the connecting thread.
+# The object a lambda handed to QMetaObject::invokeMethod becomes: allocated here, on the posting
+# thread. One gap: a lambda invokeMethod runs at once, on its own thread (a direct or same-thread
+# automatic call), runs inside this frame too, so a race in such a call is not reported. Nothing
+# that crosses threads in this code is called that way.
+race:QMetaObject::invokeMethodCallableHelper
+# A lambda's captured copies, moved into that object, or into a queued connection's, on the
+# connecting thread. Only the constructor: the lambda itself runs in impl(), which this misses.
 race:QtPrivate::QCallableObject*::QCallableObject
-# A lambda handed to QThreadPool::start, which wraps it in this.
-race:QRunnable::QGenericRunnable
+# The same for a lambda made into a pool job (QRunnable::create): its allocation and captured
+# copies, on the posting thread. The job runs in Helper::impl, which this misses. A pool job
+# must read a capture to reach its own acquire, so that one read needs this entry; everything
+# else it reads is ordered by the release and acquire its code states.
+race:QRunnable::QGenericRunnable::QGenericRunnable
 # A value copied into a queued signal's event by Qt's metatype system, on the emitting thread,
 # then read and destroyed where it is delivered: the EngineStatus a headless run (src/main.cpp)
 # and the window receive from the engine's thread. test_recorder runs the app as a child, and

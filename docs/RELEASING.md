@@ -114,6 +114,81 @@ SMOKE_METHODS="nr2 nr4 mnr dfnr rn2 nnr" scripts/smoke-test.sh \
   dist/ExpertSDR3Audio.app/Contents/MacOS/ExpertSDR3Audio 0.1.0 native
 ```
 
+## Checking the custom window frame by hand
+
+Gear > Window frame chooses between the system's frame, the default on every platform, and
+AetherRX's (Custom). Tests run offscreen, where windows have no frame at all, so they check the
+window flags, the chips and the switching, but not how a frame looks or behaves on a desktop.
+Before a release that changes `src/gui/shell/WindowChrome.*`, and before making Custom any
+platform's default, go through that platform's list on a real screen with a release build.
+
+Every platform:
+
+- Switching System to Custom and back from the gear applies at once, with no restart. The
+  window comes back on the same page, with its content where it was and the same size;
+  maximised, it stays maximised. The choice is still there after quitting and starting again.
+- Closing from the custom frame (its close chip, or a Mac's red button) restores ExpertSDR3's
+  mute, as every other way out does.
+
+macOS (Custom needs Qt 6.9 or later; release builds use 6.10):
+
+- The traffic lights sit over the ground at the top left, with no title text and no title bar
+  background behind them, and the header starts below them, clear of them.
+- Dragging the strip the traffic lights are in moves the window, and double-clicking it zooms
+  or minimises as System Settings says. Every edge resizes.
+- Full screen (the green button, or Control-Command-F): the strip goes and the header moves up,
+  then comes back down on leaving. On a MacBook with a notch, nothing sits under the notch.
+  Switching the frame while full screen leaves the window full screen.
+- It is still the main window: Stage Manager and Mission Control show it and switch to it,
+  and the menu bar's commands (Find Radios, Profiles, About) work while it is in front, as
+  they do with the system frame.
+- On a Retina and a non-Retina screen, and moved from one to the other.
+- Switching keeps the window's content area where it was, and in Custom the strip under the
+  traffic lights is part of it: judge whether the window's top edge moving by the title bar's
+  height, and the pages losing that height, is acceptable.
+
+Windows 10 and 11:
+
+- Dragging the header's empty part (the title, or the space before the status chip) moves the
+  window. Dragged to a screen's edge or corner it snaps there, and to the top it maximises.
+  Win+Arrow keys snap, maximise and minimise it.
+- Double-clicking the header's empty part maximises it, and again restores it. Maximised,
+  however it got there, it stops at the taskbar rather than covering it.
+- Every edge and corner resizes it, with the resize cursor, from a 6 px band, and nothing in
+  the header, the rail or a page is lost under that band.
+- The minimise chip minimises; the taskbar button restores and minimises; the close chip
+  quits as Alt+F4 does.
+- Windows 11 rounds the corners; Windows 10 leaves them square. Note whether the window
+  casts a shadow on each.
+- At 100 %, 150 % and 200 % display scaling, and moved between screens scaled differently:
+  the header, its chips and the resize band keep their size and stay sharp.
+
+Linux and the Raspberry Pi:
+
+- On Wayland (GNOME and KDE) and on X11, with and without a compositor (the Pi's own desktop
+  among them): the header moves the window, double-clicking it maximises, the edges resize,
+  and the chips minimise and close.
+- No black corners on X11 without a compositor: the window is opaque and square.
+- Where the window comes back after switching the frame on Wayland: changing the frame shows
+  the window again, and Wayland lets the compositor place a window it shows.
+- On the Pi's touchscreen: dragging the header with a finger, and tapping both chips.
+
+## Checking REC, PLAY and Recordings by hand
+
+Tests replace the file manager and the folder dialog, so neither has run for real. Before a
+release that changes recording or the Recordings menu, on each platform with a release build:
+
+- Gear > Recordings > Folder... opens the system's folder dialog at the folder, or at the
+  nearest folder above it that exists, and creates nothing. The folder chosen is where the
+  next REC records.
+- Show in Finder (Explorer, Files) shows the last recording, selected where the platform can
+  select it, or the folder when there is no recording yet.
+- macOS, signed build, a fresh user: starting the app never asks for access to Documents. The
+  first time REC records into the default folder, the Recordings menu opens, or Folder...
+  opens its dialog, macOS may ask once. Refuse it once, and check that REC says why it could
+  not record, that its warning's Choose Folder... button opens the folder dialog, that REC
+  then records into the folder chosen there, and that the window carries on.
+
 ## Choices worth knowing about
 
 - **CI cannot test DFNR on macOS, so a release does not either.** GitHub's Mac runners are virtual

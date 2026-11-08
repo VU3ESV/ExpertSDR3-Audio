@@ -9,6 +9,8 @@
 #include <QWebSocket>
 #include <QWebSocketServer>
 
+class QTcpServer;
+
 // A stand-in for ExpertSDR3's TCI server, modelled on behaviour measured from the
 // real one (ExpertSDR3 2.1, ColibriDDC): the same init burst in the same order,
 // state echoes on a 30 ms tick (including for sets that change nothing), the 200 ms
@@ -75,3 +77,16 @@ private:
     // (onNewConnection) still uses the timers above. macOS's Qt 6.4.2 emits there and crashed.
     QWebSocketServer m_server;
 };
+
+// A port on this machine that nothing listens on, for a radio that is not there; 0 if none
+// could be found. Never one of ExpertSDR3's own ports (40001, 50001, 60001): the system can
+// hand those out as free here while ExpertSDR3 listens on every address, and a test pointed
+// at one would then reach the real radio.
+int closedLocalPort();
+
+// Listens on this machine, on a port the system picks that is not one of ExpertSDR3's: a test
+// pointed there could reach the real radio once the server is gone, and the test sandbox
+// refuses those ports on any host anyway, so a client would never reach this server. Every
+// server a test listens with goes through one of these. False if none could be had.
+bool listenOffExpertPorts(QTcpServer& server);
+bool listenOffExpertPorts(QWebSocketServer& server);

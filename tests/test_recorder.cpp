@@ -3,8 +3,9 @@
 // disk-full and crash cases run this binary again as a child process (kChildFlag).
 //
 // At the end, the app itself: headless --record and --capture, and a recording killed
-// mid-write, each run against a MockExpert in this process. The engine's own REC and PLAY
-// tests are in test_engine_e2e.
+// mid-write, each run against a MockExpert in this process, and the command-line checks
+// that refuse a run before it starts. The engine's own REC and PLAY tests are in
+// test_engine_e2e.
 
 #include "MockExpert.h"
 
@@ -306,11 +307,12 @@ void say(const QByteArray& line)
 }
 
 // Records for ever, as fast as real time, until killed. Capped at 30 s in case nobody does.
+// A cadence of 0 leaves the shipping default.
 int childRecordUntilKilled(const QString& folder, int drainMs, int headerMs)
 {
     Recorder::Options o;
-    o.drainIntervalMs = drainMs;
-    o.headerIntervalMs = headerMs;
+    if (drainMs > 0) o.drainIntervalMs = drainMs;
+    if (headerMs > 0) o.headerIntervalMs = headerMs;
     Recorder recorder(o);
     QObject::connect(&recorder, &Recorder::fileOpened, qApp,
                      [](quint64, const QString& path) { say("opened=" + path.toUtf8()); });
@@ -361,23 +363,41 @@ int childDiskFull(const QString& folder, qint64 limit)
     const std::shared_ptr<RecordSession> session = recorder.start({folder, QStringLiteral("full"), 48000});
 
     // The engine thread: a block every 5 ms, recorded and played. 960 frames per 5 ms is four
-    // times real time, to be done sooner.
+    // times real time, to be done sooner. Once the failure is reported it goes on for a fixed
+    // time, and says how it kept its beat meanwhile.
     constexpr int kBlock = 960;
+    constexpr qint64 kRunOnMs = 400;
     quint64 next = 0;
-    quint64 playedAfterFailure = 0;
+    quint64 blocksAfterFailure = 0;  // what the sink went on receiving
+    qint64 longestPushNs = 0;        // into the failed recording
+    qint64 longestGapMs = 0;         // between blocks, after the failure
+    QElapsedTimer sinceFailure;
+    QElapsedTimer sinceBlock;
     QTimer engine;
     engine.setInterval(5);
     QObject::connect(&engine, &QTimer::timeout, qApp, [&] {
         const std::vector<float> block = pattern(next, kBlock);
+        QElapsedTimer push;
+        push.start();
         session->push(block.data(), kBlock);
+        const qint64 pushNs = push.nsecsElapsed();
         next += kBlock;
-        if (session->failed()) playedAfterFailure += kBlock;  // what the sink went on receiving
-        if (!reason.isEmpty() && playedAfterFailure >= 48000) QCoreApplication::exit(0);
+        if (reason.isEmpty()) return;  // not failed yet, as far as this thread has heard
+        if (!sinceFailure.isValid()) {
+            sinceFailure.start();
+            sinceBlock.start();
+            return;
+        }
+        ++blocksAfterFailure;
+        longestPushNs = std::max(longestPushNs, pushNs);
+        longestGapMs = std::max(longestGapMs, sinceBlock.restart());
+        if (sinceFailure.elapsed() >= kRunOnMs) QCoreApplication::exit(0);
     });
     engine.start();
     QTimer::singleShot(20000, qApp, [] { QCoreApplication::exit(4); });
     const int rc = QCoreApplication::exec();
     engine.stop();
+    const qint64 msAfterFailure = sinceFailure.isValid() ? sinceFailure.elapsed() : 0;
     recorder.finish(session);
     recorder.shutdown();
 
@@ -387,7 +407,10 @@ int childDiskFull(const QString& folder, qint64 limit)
     say("written=" + QByteArray::number(session->framesWritten()));
     say("dropped=" + QByteArray::number(session->droppedFrames()));
     say("pushed=" + QByteArray::number(next));
-    say("playedAfterFailure=" + QByteArray::number(playedAfterFailure));
+    say("msAfterFailure=" + QByteArray::number(msAfterFailure));
+    say("blocksAfterFailure=" + QByteArray::number(blocksAfterFailure));
+    say("longestPushUs=" + QByteArray::number(longestPushNs / 1000));
+    say("longestGapMs=" + QByteArray::number(longestGapMs));
     return rc;
 }
 #endif
@@ -1248,8 +1271,23 @@ private slots:
         QCOMPARE(kv.value(QStringLiteral("failedFlag")), QStringLiteral("1"));
         QCOMPARE(kv.value(QStringLiteral("written")), QStringLiteral("48000"));
         QCOMPARE(kv.value(QStringLiteral("dropped")), QStringLiteral("0"));
-        QVERIFY(kv.value(QStringLiteral("playedAfterFailure")).toLongLong() >= 48000);  // live audio went on
         qInfo("child reported: %s", qPrintable(kv.value(QStringLiteral("reason"))));
+        // Live audio went on: after the failure the producer kept its 5 ms beat, with no gap a
+        // listener would hear as the audio stopping (the stage meters call 250 ms silence),
+        // and pushing into the failed recording cost it nothing.
+        const qint64 msAfter = kv.value(QStringLiteral("msAfterFailure")).toLongLong();
+        const qint64 blocksAfter = kv.value(QStringLiteral("blocksAfterFailure")).toLongLong();
+        const qint64 longestGapMs = kv.value(QStringLiteral("longestGapMs")).toLongLong();
+        const qint64 longestPushUs = kv.value(QStringLiteral("longestPushUs")).toLongLong();
+        qInfo("after the failure: %lld blocks in %lld ms, longest gap %lld ms, longest push %lld us", blocksAfter,
+              msAfter, longestGapMs, longestPushUs);
+        QVERIFY2(msAfter >= 400, out.constData());
+        QVERIFY2(blocksAfter >= msAfter / 5 / 4, out.constData());  // a quarter of the beat: room for a busy machine
+        QVERIFY2(longestGapMs < 250, out.constData());
+        // A push into a failed recording is two atomic loads. Timed by the wall clock, which on
+        // a busy shared machine can also count a few ms of the thread not running at all; one
+        // that waited on the disk would take far longer than this.
+        QVERIFY2(longestPushUs < 50000, out.constData());
 
         QCOMPARE(QFileInfo(path).size(), qint64(58 + 48000 * 8));
         const std::optional<WavFile::Info> info = WavFile::parseFile(path);
@@ -1265,7 +1303,7 @@ private slots:
         QTest::addColumn<int>("drainMs");
         QTest::addColumn<int>("headerMs");
         QTest::addColumn<int>("killAfterMs");
-        QTest::newRow("shipping cadence") << 200 << 1000 << 2600;
+        QTest::newRow("shipping cadence") << 0 << 0 << 2600;  // the defaults, whatever they are
         QTest::newRow("patching every 20 ms, a") << 5 << 20 << 600;
         QTest::newRow("patching every 20 ms, b") << 5 << 20 << 777;
         QTest::newRow("patching every 7 ms") << 2 << 7 << 913;
@@ -1277,6 +1315,9 @@ private slots:
         QFETCH(int, drainMs);
         QFETCH(int, headerMs);
         QFETCH(int, killAfterMs);
+        const Recorder::Options shipping;
+        const int drainEveryMs = drainMs > 0 ? drainMs : shipping.drainIntervalMs;
+        const int patchEveryMs = headerMs > 0 ? headerMs : shipping.headerIntervalMs;
         QTemporaryDir dir;
         QProcess child;
         child.start(QCoreApplication::applicationFilePath(),
@@ -1303,7 +1344,7 @@ private slots:
         const quint64 behind = info->framesInFile - info->declaredFrames;
         qInfo("declared %llu of %llu frames on disk; %llu behind", (unsigned long long)info->declaredFrames,
               (unsigned long long)info->framesInFile, (unsigned long long)behind);
-        QVERIFY2(behind <= quint64(48) * quint64(headerMs + 2 * drainMs + 500),
+        QVERIFY2(behind <= quint64(48) * quint64(patchEveryMs + 2 * drainEveryMs + 500),
                  qPrintable(QString::number(behind)));
     }
 
@@ -1539,6 +1580,37 @@ private slots:
         QCOMPARE(child.exitCode(), 2);
         QVERIFY2(child.readAllStandardError().contains("--record needs --headless"), "no reason given");
         QVERIFY(!QFileInfo::exists(dir.filePath(QStringLiteral("Recordings"))));
+    }
+
+    // --size is for screenshots. One beyond any screen is refused before a window opens: grabbing
+    // a window that size never finishes. Checked here, beside --record's own check, because this
+    // is where the app's command line is run.
+    void aScreenshotSizeBeyondAnyScreenIsRefused_data()
+    {
+        QTest::addColumn<QString>("size");
+        QTest::newRow("far beyond") << QStringLiteral("99999x99999");
+        QTest::newRow("one past the limit") << QStringLiteral("8193x600");
+        QTest::newRow("too many digits") << QStringLiteral("724x7520000000");
+        QTest::newRow("empty") << QStringLiteral("0x752");
+    }
+    void aScreenshotSizeBeyondAnyScreenIsRefused()
+    {
+        QFETCH(QString, size);
+        QTemporaryDir dir;
+        const QString shot = dir.filePath(QStringLiteral("shot.png"));
+        QProcess child;
+        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+        env.insert(QStringLiteral("QT_QPA_PLATFORM"), QStringLiteral("offscreen"));
+        env.insert(QStringLiteral("QT_FORCE_STDERR_LOGGING"), QStringLiteral("1"));  // as recordNeedsHeadless
+        child.setProcessEnvironment(env);
+        child.start(QStringLiteral(ESA_APP_BINARY),
+                    {QStringLiteral("--settings"), dir.filePath(QStringLiteral("settings.ini")),
+                     QStringLiteral("--screenshot"), shot, QStringLiteral("--size"), size});
+        QVERIFY(child.waitForFinished(30000));
+        QCOMPARE(child.exitStatus(), QProcess::NormalExit);
+        QCOMPARE(child.exitCode(), 2);
+        QVERIFY2(child.readAllStandardError().contains("--size takes"), "no reason given");
+        QVERIFY(!QFileInfo::exists(shot));
     }
 
     // SIGKILL on POSIX, TerminateProcess on Windows, in the middle of a headless --record.

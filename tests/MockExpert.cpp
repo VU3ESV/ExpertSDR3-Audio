@@ -1,11 +1,63 @@
 #include "MockExpert.h"
 
+#include "app/TestSandbox.h"
+
 #include <QHostAddress>
+#include <QTcpServer>
 #include <QtEndian>
 
 #include <algorithm>
 #include <cmath>
+#include <memory>
 #include <utility>
+#include <vector>
+
+using esa::isExpertSdrPort;
+
+namespace {
+
+template <typename Server>
+bool listenOff(Server& server)
+{
+    // Those turned down stay taken until one will do, so none is handed out again.
+    std::vector<std::unique_ptr<QTcpServer>> skipped;
+    for (int i = 0; i < 64; ++i) {
+        if (!server.listen(QHostAddress::LocalHost, 0)) return false;
+        const int port = server.serverPort();
+        if (!isExpertSdrPort(port)) return true;
+        server.close();
+        auto hold = std::make_unique<QTcpServer>();
+        hold->listen(QHostAddress::LocalHost, quint16(port));
+        skipped.push_back(std::move(hold));
+    }
+    return false;
+}
+
+} // namespace
+
+int closedLocalPort()
+{
+    // Those turned down stay taken until one will do, so none is handed out twice.
+    std::vector<std::unique_ptr<QTcpServer>> skipped;
+    for (int i = 0; i < 64; ++i) {
+        auto probe = std::make_unique<QTcpServer>();
+        if (!probe->listen(QHostAddress::LocalHost, 0)) return 0;
+        const int port = probe->serverPort();
+        if (!isExpertSdrPort(port)) return port;  // and closed, as `probe` goes
+        skipped.push_back(std::move(probe));
+    }
+    return 0;
+}
+
+bool listenOffExpertPorts(QTcpServer& server)
+{
+    return listenOff(server);
+}
+
+bool listenOffExpertPorts(QWebSocketServer& server)
+{
+    return listenOff(server);
+}
 
 MockExpert::MockExpert(QObject* parent)
     : QObject(parent),
@@ -19,7 +71,9 @@ MockExpert::MockExpert(QObject* parent)
 
 bool MockExpert::listen()
 {
-    return m_server.listen(QHostAddress::LocalHost, 0);
+    // Never on one of ExpertSDR3's ports, as closedLocalPort() explains: an engine still
+    // trying this port once the mock is gone would reach the real radio there.
+    return listenOffExpertPorts(m_server);
 }
 
 void MockExpert::stopListening()

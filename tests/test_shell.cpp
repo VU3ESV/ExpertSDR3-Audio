@@ -1,6 +1,10 @@
+#include "MockExpert.h"
+
+#include "app/AppInfo.h"
 #include "app/Engine.h"
 #include "app/Profiles.h"
 #include "app/Settings.h"
+#include "app/WavFile.h"
 #include "dsp/NrProcessor.h"
 #include "dsp/RxChain.h"
 #include "gui/AboutDialog.h"
@@ -8,8 +12,13 @@
 #include "gui/MainWindow.h"
 #include "gui/ParamWidgets.h"
 #include "gui/aether/Appearance.h"
+#include "gui/pages/Pages.h"
+#include "gui/shell/HeaderBar.h"
 #include "gui/shell/StatusChip.h"
+#include "gui/shell/WindowChrome.h"
 
+#include "ClientCompKnob.h"
+#include "FramelessResizer.h"
 #include "RxStageReorder.h"
 #include "StageTabBar.h"
 #include "core/AppSettings.h"
@@ -21,27 +30,40 @@
 #include <QDoubleSpinBox>
 #include <QDragEnterEvent>
 #include <QDropEvent>
+#include <QElapsedTimer>
+#include <QFile>
+#include <QFileInfo>
 #include <QGridLayout>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMainWindow>
 #include <QMenu>
 #include <QMenuBar>
+#include <QMessageBox>
 #include <QMimeData>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QScreen>
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QSettings>
 #include <QStackedWidget>
 #include <QStandardPaths>
+#include <QStyle>
+#include <QStyleOptionComboBox>
 #include <QTemporaryDir>
 #include <QTimer>
+#include <QToolButton>
+#include <QVBoxLayout>
 #include <QWindow>
 #include <QtTest>
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <memory>
+#include <optional>
+#include <vector>
 
 using namespace esa;
 
@@ -121,10 +143,84 @@ struct LoneBar {
     int commits{0};
 };
 
+// Keeps what would have reached the speakers, so a test can hear what PLAY played.
+class RecordingSink final : public AudioSink {
+public:
+    QString deviceName() const override { return QStringLiteral("recording"); }
+    void write(const float* stereo, int frames) override
+    {
+        samples.insert(samples.end(), stereo, stereo + qsizetype(frames) * 2);
+    }
+    bool alive() const override { return true; }
+    SinkStats stats() override { return {}; }
+    void setGainDb(double) override {}
+    void setBoost(bool) override {}
+    void setMuted(bool) override {}
+    void setTargetLatencyMs(int) override {}
+
+    std::vector<float> samples;
+};
+
+// A recording's frames, as a player reads them.
+std::optional<std::vector<float>> framesOf(const QString& path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) return std::nullopt;
+    const std::optional<WavFile::Info> info = WavFile::parse(file);
+    if (!info || info->sampleRate != 48000) return std::nullopt;
+    std::vector<float> frames(size_t(info->frames) * 2);
+    const qint64 bytes = qint64(frames.size() * sizeof(float));
+    if (file.read(reinterpret_cast<char*>(frames.data()), bytes) != bytes) return std::nullopt;
+    return frames;
+}
+
+// What would change what the radio does or how it sounds. VOLUME also clears MUTE on
+// ExpertSDR3 (docs/TCI-NOTES.md), which is why REC and PLAY must never send one.
+QStringList radioChangingCommands(const QStringList& commands)
+{
+    QStringList found;
+    for (const QString& c : commands) {
+        if (c.startsWith(QLatin1String("trx")) || c.startsWith(QLatin1String("volume"))
+            || c.startsWith(QLatin1String("mute"))) {
+            found << c;
+        }
+    }
+    return found;
+}
+
+// While it lives, and when `on`, Custom is the frameless frame of Windows and Linux, so that
+// path runs on every machine. A test makes and uses its window within its lifetime.
+struct FramelessCustom {
+    explicit FramelessCustom(bool on)
+    {
+        if (on) WindowChrome::overrideCustomMode(WindowChrome::Mode::Frameless);
+    }
+    ~FramelessCustom() { WindowChrome::overrideCustomMode(std::nullopt); }
+    FramelessCustom(const FramelessCustom&) = delete;
+    FramelessCustom& operator=(const FramelessCustom&) = delete;
+};
+
+// A main window's flags as Qt gives them, frame and all.
+Qt::WindowFlags plainFlags()
+{
+    return QMainWindow().windowFlags();
+}
+
+// Whether a combo box has room for its current text whole, in the field its style draws it in.
+bool showsItsTextWhole(const QComboBox* combo)
+{
+    QStyleOptionComboBox option;
+    option.initFrom(combo);
+    option.currentText = combo->currentText();
+    const QRect field = combo->style()->subControlRect(QStyle::CC_ComboBox, &option, QStyle::SC_ComboBoxEditField, combo);
+    return combo->fontMetrics().horizontalAdvance(combo->currentText()) <= field.width();
+}
+
 } // namespace
 
 // The window's shell: the rail, the header, the menus, where it opens and every way it
-// closes. Built against a real, unconnected engine, so it never reaches a radio.
+// closes. Built against a real engine that is never connected unless a test hands it a
+// MockExpert, and then only to that.
 class TestShell : public QObject {
     Q_OBJECT
 
@@ -136,21 +232,119 @@ private:
     std::unique_ptr<MainWindow> m_window;
     int m_quits{0};
 
+    // Where REC saves in every test: never the real Documents folder. Made fresh for each
+    // test and only by a recording, so a test can tell whether one made it.
+    std::unique_ptr<QTemporaryDir> m_recordings;
+    QString m_recordingFolder;  // set before make() to record somewhere else
+    // The window's ways out to the desktop, replaced: what it asked to reveal, and the folder
+    // the next Folder... returns.
+    QStringList m_revealed;
+    QString m_folderChoice;
+    int m_folderAsks{0};
+    // With a radio: what reached the speakers, and the engine's last status.
+    bool m_withSink{false};
+    RecordingSink* m_sink{nullptr};
+    EngineStatus m_status;
+
     QString iniPath() const { return m_dir.filePath(QStringLiteral("shell.ini")); }
+
+    QString recordingsFolder()
+    {
+        if (!m_recordings) m_recordings = std::make_unique<QTemporaryDir>();
+        return m_recordings->filePath(QStringLiteral("Recordings"));
+    }
 
     // `window` is what the last session left in ui/*.
     void make(const Settings::WindowState& window = {}, const AppConfig& config = {})
     {
         m_window.reset();
-        m_engine = std::make_unique<Engine>(iniPath());
+        if (m_withSink) {
+            m_engine = std::make_unique<Engine>(iniPath(), [this](const AppConfig&, QString*) {
+                auto sink = std::make_unique<RecordingSink>();
+                m_sink = sink.get();
+                return std::unique_ptr<AudioSink>(std::move(sink));
+            });
+        } else {
+            m_engine = std::make_unique<Engine>(iniPath());
+        }
+        // The engine runs on this thread, so this sees each status as it is sent.
+        connect(m_engine.get(), &Engine::statusChanged, this, [this](const EngineStatus& s) { m_status = s; });
         m_settings = std::make_unique<Settings>(iniPath());
         m_settings->saveWindowState(window);
+        m_settings->setRecordingFolder(m_recordingFolder.isEmpty() ? recordingsFolder() : m_recordingFolder);
         m_profiles = std::make_unique<ProfileLibrary>(ProfileLibrary::defaultPath(iniPath()));
         m_window = std::make_unique<MainWindow>(m_engine.get(), m_engine->taps(), m_settings.get(), m_profiles.get(),
                                                 config);
         m_window->setQuitHandler([this] { ++m_quits; });
+        m_window->setRevealHandler([this](const QString& path) { m_revealed << path; });
+        m_window->setFolderChooser([this](const QString&) {
+            ++m_folderAsks;
+            return m_folderChoice;
+        });
         m_window->show();
         QVERIFY(QTest::qWaitForWindowExposed(m_window.get()));
+    }
+
+    // The window on an engine connected to `radio` alone, playing into a RecordingSink.
+    void makeOnRadio(MockExpert& radio)
+    {
+        AppConfig config;
+        config.host = QStringLiteral("127.0.0.1");
+        config.port = radio.port();
+        // Never the defaults: one of them is where a real ExpertSDR3 may be listening.
+        config.fallbackPorts.clear();
+        m_withSink = true;
+        make({}, config);
+        if (QTest::currentTestFailed()) return;
+        DiscoveredRadio picked;
+        picked.host = QStringLiteral("127.0.0.1");
+        picked.port = radio.port();
+        m_window->connectToRadio(picked);
+        QTRY_VERIFY_WITH_TIMEOUT(m_status.audioFlowing && m_status.frequencyHz > 0, 6000);
+    }
+
+    // Nothing more from the engine, so a test can hand the window statuses of its own.
+    void quieten()
+    {
+        m_engine->shutdown();
+        QCoreApplication::processEvents();
+    }
+
+    // A status, as the engine sends it.
+    void feed(const EngineStatus& s)
+    {
+        emit m_engine->statusChanged(s);
+        QCoreApplication::processEvents();
+    }
+
+    QPushButton* recordButton() { return rail()->findChild<QPushButton*>(QStringLiteral("aetherRxRecord")); }
+    QPushButton* playButton() { return rail()->findChild<QPushButton*>(QStringLiteral("aetherRxPlay")); }
+
+    // The warnings on screen.
+    QList<QMessageBox*> notices()
+    {
+        QList<QMessageBox*> shown;
+        const auto boxes = m_window->findChildren<QMessageBox*>();
+        for (QMessageBox* box : boxes) {
+            if (box->isVisible()) shown << box;
+        }
+        return shown;
+    }
+
+    // Opens gear › Recordings, which fills it in as it opens.
+    QMenu* openRecordingsMenu()
+    {
+        auto* menu = m_window->findChild<QMenu*>(QStringLiteral("recordingsMenu"));
+        if (!menu) return nullptr;
+        menu->popup(m_window->mapToGlobal(QPoint(40, 40)));
+        if (!QTest::qWaitFor([menu] { return menu->isVisible(); })) return nullptr;
+        return menu;
+    }
+
+    QString menuEntry(const char* name)
+    {
+        auto* action = m_window->findChild<QAction*>(QLatin1String(name));
+        return action ? action->text() : QString();
     }
 
     // Shows it at the size of the references, not maximised however small the screen.
@@ -285,6 +479,15 @@ private slots:
         m_settings.reset();
         m_profiles.reset();
         m_quits = 0;
+        // After the engine, which has finished every file in it by now.
+        m_recordings.reset();
+        m_recordingFolder.clear();
+        m_revealed.clear();
+        m_folderChoice.clear();
+        m_folderAsks = 0;
+        m_withSink = false;
+        m_sink = nullptr;
+        m_status = EngineStatus();
         QDir dir(m_dir.path());
         const QStringList files = dir.entryList(QDir::Files);
         for (const QString& file : files) dir.remove(file);
@@ -309,10 +512,22 @@ private slots:
         host->setFocus();
         QTest::keyClick(host, Qt::Key_Escape);
 
+        // An AetherRX knob's value field, where Escape reverts what was typed.
         m_window->showPage(QStringLiteral("gate"));
         auto* page = m_window->findChild<QWidget*>(QStringLiteral("page_gate"));
         QVERIFY(page);
-        auto* field = page->findChild<QDoubleSpinBox*>();  // a parameter's exact value
+        auto* knob = page->findChild<AetherSDR::ClientCompKnob*>();
+        QVERIFY(knob);
+        auto* knobField = knob->findChild<QLineEdit*>();
+        QVERIFY(knobField);
+        knobField->setFocus();
+        QTest::keyClick(knobField, Qt::Key_Escape);
+
+        // A parameter's exact value, on a page that still shows today's controls.
+        m_window->showPage(QStringLiteral("comp"));
+        auto* grid = m_window->findChild<QWidget*>(QStringLiteral("page_comp"));
+        QVERIFY(grid);
+        auto* field = grid->findChild<QDoubleSpinBox*>();
         QVERIFY(field);
         field->setFocus();
         QTest::keyClick(field, Qt::Key_Escape);
@@ -445,12 +660,13 @@ private slots:
     void theGeometryRoundTrips()
     {
         Settings::WindowState window;
-        window.geometry = QStringLiteral("120,90,700,650");
+        // Whole on the offscreen platform's 800x800 screen: one hanging off it is moved back on.
+        window.geometry = QStringLiteral("80,90,700,650");
         make(window);
         // Maximised or not (a small screen opens it maximised), this is where it returns to.
-        QCOMPARE(m_window->normalGeometry(), QRect(120, 90, 700, 650));
+        QCOMPARE(m_window->normalGeometry(), QRect(80, 90, 700, 650));
         m_window->close();
-        QCOMPARE(savedWindow().geometry, QStringLiteral("120,90,700,650"));
+        QCOMPARE(savedWindow().geometry, QStringLiteral("80,90,700,650"));
     }
 
     void aWindowFromAScreenThatHasGoneIsCentred()
@@ -479,7 +695,7 @@ private slots:
     }
 
     // Every case of where the window opens, on screens the offscreen platform cannot have:
-    // its one screen is 800x600, small enough that the window always opens maximised there.
+    // its one screen is 800x800, where the usual size fits.
     void whereTheWindowOpens_data()
     {
         QTest::addColumn<QString>("saved");
@@ -487,29 +703,73 @@ private slots:
         QTest::addColumn<QRect>("geometry");
         QTest::addColumn<bool>("positioned");
         QTest::addColumn<bool>("maximised");
+        QTest::addColumn<int>("title");  // the system's title bar above the content; 0 for none
+        QTest::addColumn<bool>("placeTitle");  // the system leaves the title bar where it is put
         const QRect desk(0, 25, 1920, 1055);    // a desktop under a menu bar
         const QRect side(1920, 0, 1280, 720);   // a small second screen to its right
         const QRect pi(0, 0, 800, 444);         // a Pi touchscreen above its panel
         const QRect wide(800, 0, 1920, 1080);   // a big screen beside the Pi's
         QTest::newRow("first run, a big screen: the default size")
-            << QString() << QList<QRect>{desk} << QRect(0, 0, 724, 752) << false << false;
+            << QString() << QList<QRect>{desk} << QRect(0, 0, 724, 752) << false << false << 0 << false;
         QTest::newRow("first run, a small screen: maximised")
-            << QString() << QList<QRect>{pi} << QRect(0, 0, 724, 444) << false << true;
+            << QString() << QList<QRect>{pi} << QRect(0, 0, 724, 444) << false << true << 0 << false;
         QTest::newRow("first run, no screen at all")
-            << QString() << QList<QRect>{} << QRect(0, 0, 724, 752) << false << false;
+            << QString() << QList<QRect>{} << QRect(0, 0, 724, 752) << false << false << 0 << false;
         QTest::newRow("a saved geometry that does not parse")
-            << QStringLiteral("700x650") << QList<QRect>{desk} << QRect(0, 0, 724, 752) << false << false;
+            << QStringLiteral("700x650") << QList<QRect>{desk} << QRect(0, 0, 724, 752) << false << false << 0 << false;
         QTest::newRow("saved on the main screen")
-            << QStringLiteral("100,100,900,800") << QList<QRect>{desk, side} << QRect(100, 100, 900, 800) << true << false;
+            << QStringLiteral("100,100,900,800") << QList<QRect>{desk, side} << QRect(100, 100, 900, 800) << true << false << 0 << false;
         QTest::newRow("saved on a small second screen: maximised there")
-            << QStringLiteral("2000,50,700,600") << QList<QRect>{desk, side} << QRect(2000, 50, 700, 600) << true << true;
+            << QStringLiteral("2000,50,700,600") << QList<QRect>{desk, side} << QRect(2000, 50, 700, 600) << true << true << 0 << false;
         QTest::newRow("saved on a big second screen, the main one small")
-            << QStringLiteral("900,100,724,752") << QList<QRect>{pi, wide} << QRect(900, 100, 724, 752) << true << false;
+            << QStringLiteral("900,100,724,752") << QList<QRect>{pi, wide} << QRect(900, 100, 724, 752) << true << false << 0 << false;
         QTest::newRow("its screen has gone: the same size, centred on the main one")
-            << QStringLiteral("2000,50,700,600") << QList<QRect>{desk} << QRect(610, 253, 700, 600) << true << false;
+            << QStringLiteral("2000,50,700,600") << QList<QRect>{desk} << QRect(610, 253, 700, 600) << true << false << 0 << false;
         QTest::newRow("its screen has gone, and it is bigger than the main one")
-            << QStringLiteral("-5000,-5000,2500,1400") << QList<QRect>{desk} << desk << true << false;
+            << QStringLiteral("-5000,-5000,2500,1400") << QList<QRect>{desk} << desk << true << false << 0 << false;
+        QTest::newRow("saved on a screen that has since shrunk: kept whole on it")
+            << QStringLiteral("100,100,1600,1000") << QList<QRect>{QRect(0, 25, 1440, 875)} << QRect(0, 25, 1440, 875)
+            << true << false << 0 << false;
+        QTest::newRow("saved hanging off its screen's corner: moved back onto it")
+            << QStringLiteral("1500,900,724,752") << QList<QRect>{desk} << QRect(1196, 328, 724, 752) << true << false << 0 << false;
+        // With the system's frame, room for its title bar: content as tall as the screen would
+        // leave the title above the top, and the window system, moving it down, would push the
+        // bottom off. Where it fits, it stays where it was.
+        QTest::newRow("saved on a screen that has since shrunk, with a title bar: room left for it")
+            << QStringLiteral("100,100,1600,1000") << QList<QRect>{QRect(0, 25, 1440, 875)} << QRect(0, 63, 1440, 837)
+            << true << false << 38 << false;
+        QTest::newRow("saved just under the menu bar, with a title bar: left where it was")
+            << QStringLiteral("200,53,724,752") << QList<QRect>{desk} << QRect(200, 53, 724, 752) << true << false << 38 << false;
+        QTest::newRow("its screen has gone, and it is bigger than the main one, with a title bar")
+            << QStringLiteral("-5000,-5000,2500,1400") << QList<QRect>{desk} << QRect(0, 44, 1920, 1017) << true << false
+            << 38 << false;
+        QTest::newRow("its screen has gone, with a title bar: still centred")
+            << QStringLiteral("2000,50,700,600") << QList<QRect>{desk} << QRect(610, 253, 700, 600) << true << false << 38 << false;
+        QTest::newRow("first run, a short screen, with a title bar: the default size less the title")
+            << QString() << QList<QRect>{QRect(0, 0, 1024, 768)} << QRect(0, 0, 724, 730) << false << true << 38 << false;
+        // Windows leaves a window where it is put, its title bar above the screen or not, so
+        // the content starts a title bar's height down, and a centred window is centred whole.
+        const QRect work(0, 0, 1920, 1040);  // a Windows desktop over its taskbar
+        QTest::newRow("saved near the top, a system that leaves the title bar where it is put: moved under it")
+            << QStringLiteral("300,10,724,752") << QList<QRect>{work} << QRect(300, 38, 724, 752) << true << false << 38
+            << true;
+        QTest::newRow("saved lower down, a system that leaves the title bar where it is put: left where it was")
+            << QStringLiteral("300,38,724,752") << QList<QRect>{work} << QRect(300, 38, 724, 752) << true << false << 38
+            << true;
+        QTest::newRow("its screen has gone, a system that leaves the title bar where it is put: centred whole")
+            << QStringLiteral("2000,50,700,600") << QList<QRect>{desk} << QRect(610, 272, 700, 600) << true << false << 38
+            << true;
+        QTest::newRow("its screen has gone, bigger than the main one, a system that leaves the title bar")
+            << QStringLiteral("-5000,-5000,2500,1400") << QList<QRect>{desk} << QRect(0, 63, 1920, 1017) << true << false
+            << 38 << true;
+        QTest::newRow("saved on a shrunk screen, a system that leaves the title bar: kept whole under it")
+            << QStringLiteral("100,0,1600,1000") << QList<QRect>{QRect(0, 0, 1440, 860)} << QRect(0, 38, 1440, 822)
+            << true << false << 38 << true;
+        QTest::newRow("no title bar, a system that leaves the title bar where it is put: nothing to place")
+            << QStringLiteral("300,0,724,752") << QList<QRect>{work} << QRect(300, 0, 724, 752) << true << false << 0
+            << true;
     }
+
     void whereTheWindowOpens()
     {
         QFETCH(QString, saved);
@@ -517,7 +777,9 @@ private slots:
         QFETCH(QRect, geometry);
         QFETCH(bool, positioned);
         QFETCH(bool, maximised);
-        const MainWindow::Placement place = MainWindow::placement(saved, screens);
+        QFETCH(int, title);
+        QFETCH(bool, placeTitle);
+        const MainWindow::Placement place = MainWindow::placement(saved, screens, title, placeTitle);
         QCOMPARE(place.positioned, positioned);
         QCOMPARE(positioned ? place.geometry : QRect(QPoint(), place.geometry.size()), geometry);
         QCOMPARE(place.maximised, maximised);
@@ -582,24 +844,361 @@ private slots:
         pages.remove(geometry);
     }
 
-    // Until the custom frame exists, ui/frame is kept as it was found and changes nothing.
-    void theFrameSettingIsStoredAndTheFrameIsTheSystems_data()
+    // ── The frame ─────────────────────────────────────────────────────────────
+
+    // The system's frame on every platform until its custom one is signed off on a real
+    // screen. A fresh settings file says nothing, and nothing is written for it.
+    void aFreshSettingsFileGivesTheSystemFrame()
+    {
+        QCOMPARE(WindowChrome::defaultFrame(), WindowChrome::Frame::System);
+        QCOMPARE(WindowChrome::parse(QString()), WindowChrome::Frame::System);
+        QCOMPARE(WindowChrome::parse(QStringLiteral("Fancy")), WindowChrome::Frame::System);
+        make();
+        QCOMPARE(m_window->windowFlags(), plainFlags());
+        QVERIFY(!m_window->testAttribute(Qt::WA_TranslucentBackground));
+        QVERIFY(m_window->testAttribute(Qt::WA_ContentsMarginsRespectsSafeArea));
+        QVERIFY(!m_window->findChild<QToolButton*>(QStringLiteral("headerClose")));
+        QVERIFY(!m_window->findChild<AetherSDR::FramelessResizer*>());
+        QMenu* gear = m_window->findChild<QMenu*>(QStringLiteral("gearMenu"));
+        QVERIFY(actionNamed(gear, QStringLiteral("System"))->isChecked());
+        QVERIFY(!actionNamed(gear, QStringLiteral("Custom"))->isChecked());
+        m_window->close();
+        QVERIFY(savedWindow().frame.isEmpty());  // still the default, should the default change
+    }
+
+    // What each ui/frame value gives on this platform: Custom draws the title bar over the
+    // ground on a Mac, and has no system frame at all on Windows and Linux. Never see-through.
+    void theFrameFlagsForEachValue_data()
     {
         QTest::addColumn<QString>("frame");
-        QTest::newRow("never chosen") << QString();
-        QTest::newRow("System") << QStringLiteral("System");
-        QTest::newRow("Custom") << QStringLiteral("Custom");
+        QTest::addColumn<bool>("custom");
+        QTest::newRow("never chosen") << QString() << false;
+        QTest::newRow("System") << QStringLiteral("System") << false;
+        QTest::newRow("Custom") << QStringLiteral("Custom") << true;
+        QTest::newRow("not a frame") << QStringLiteral("Fancy") << false;
     }
-    void theFrameSettingIsStoredAndTheFrameIsTheSystems()
+    void theFrameFlagsForEachValue()
     {
         QFETCH(QString, frame);
+        QFETCH(bool, custom);
         Settings::WindowState window;
         window.frame = frame;
         make(window);
-        QVERIFY(!(m_window->windowFlags() & Qt::FramelessWindowHint));
+        const Qt::WindowFlags flags = m_window->windowFlags();
+        const Qt::WindowFlags plain = plainFlags();
         QVERIFY(!m_window->testAttribute(Qt::WA_TranslucentBackground));
+        bool chips = false;
+#if defined(Q_OS_MACOS) && QT_VERSION >= QT_VERSION_CHECK(6, 9, 0)
+        QCOMPARE(flags, custom ? plain | Qt::ExpandedClientAreaHint | Qt::NoTitleBarBackgroundHint : plain);
+        // The content spreads under the title bar, and keeps clear of it by its own margins.
+        QCOMPARE(m_window->testAttribute(Qt::WA_ContentsMarginsRespectsSafeArea), !custom);
+        QCOMPARE(m_window->centralWidget()->testAttribute(Qt::WA_ContentsMarginsRespectsSafeArea), !custom);
+#elif defined(Q_OS_MACOS)
+        QCOMPARE(flags, plain);  // Qt before 6.9 cannot draw a title bar over the content
+#else
+        QCOMPARE(flags, custom ? plain | Qt::FramelessWindowHint : plain);
+        chips = custom;
+#endif
+        // The chips come only with a window that has no buttons of its own.
+        QCOMPARE(m_window->findChild<QToolButton*>(QStringLiteral("headerMinimise")) != nullptr, chips);
+        QCOMPARE(m_window->findChild<QToolButton*>(QStringLiteral("headerClose")) != nullptr, chips);
+        QCOMPARE(m_window->findChild<AetherSDR::FramelessResizer*>() != nullptr, chips);
+        QMenu* gear = m_window->findChild<QMenu*>(QStringLiteral("gearMenu"));
+        const bool customShown = custom && WindowChrome::customMode() != WindowChrome::Mode::System;
+        QCOMPARE(actionNamed(gear, QStringLiteral("Custom"))->isChecked(), customShown);
+        QCOMPARE(actionNamed(gear, QStringLiteral("System"))->isChecked(), !customShown);
         m_window->close();
-        QCOMPARE(savedWindow().frame, frame);  // an unset frame stays unset, for its default
+        // Kept as it was found; a value that is not a frame reads as never chosen.
+        QCOMPARE(savedWindow().frame, custom || frame == QLatin1String("System") ? frame : QString());
+    }
+
+    // The flags each way of making a frame gives, whatever this machine is, and what Custom
+    // is here.
+    void theFrameFlagsOnEveryPlatform()
+    {
+        using Mode = WindowChrome::Mode;
+        const Qt::WindowFlags plain = plainFlags();
+        QCOMPARE(WindowChrome::flagsFor(plain, Mode::System), plain);
+        // Nothing but the frame changes: Windows' minimise and maximise come from the rest.
+        QCOMPARE(WindowChrome::flagsFor(plain, Mode::Frameless), plain | Qt::FramelessWindowHint);
+#if QT_VERSION >= QT_VERSION_CHECK(6, 9, 0)
+        QCOMPARE(WindowChrome::flagsFor(plain, Mode::ExpandedClientArea),
+                 plain | Qt::ExpandedClientAreaHint | Qt::NoTitleBarBackgroundHint);
+#else
+        QCOMPARE(WindowChrome::flagsFor(plain, Mode::ExpandedClientArea), plain);
+#endif
+        for (Mode from : {Mode::ExpandedClientArea, Mode::Frameless}) {
+            QCOMPARE(WindowChrome::flagsFor(WindowChrome::flagsFor(plain, from), Mode::System), plain);
+        }
+#if defined(Q_OS_MACOS) && QT_VERSION >= QT_VERSION_CHECK(6, 9, 0)
+        QCOMPARE(WindowChrome::customMode(), Mode::ExpandedClientArea);
+#elif defined(Q_OS_MACOS)
+        QCOMPARE(WindowChrome::customMode(), Mode::System);
+#else
+        QCOMPARE(WindowChrome::customMode(), Mode::Frameless);
+#endif
+        QCOMPARE(WindowChrome::modeFor(WindowChrome::Frame::System), Mode::System);
+    }
+
+    // Gear > Window frame applies at once, with no restart: the window comes back where it
+    // was, at its size, on its page, with the keyboard where it was, and the choice is saved.
+    // Then the same with the window maximised.
+    void switchingTheFrameAppliesAtOnce_data()
+    {
+        QTest::addColumn<bool>("frameless");
+        QTest::newRow("this platform's Custom") << false;
+        QTest::newRow("Windows' and Linux's Custom") << true;
+    }
+    void switchingTheFrameAppliesAtOnce()
+    {
+        QFETCH(bool, frameless);
+        const FramelessCustom asOnWindows(frameless);
+        make();
+        QMenu* gear = m_window->findChild<QMenu*>(QStringLiteral("gearMenu"));
+        QAction* custom = actionNamed(gear, QStringLiteral("Custom"));
+        QAction* system = actionNamed(gear, QStringLiteral("System"));
+        QVERIFY(custom && system && custom->isCheckable() && system->isCheckable());
+        if (WindowChrome::customMode() == WindowChrome::Mode::System) {
+            QVERIFY(!custom->isEnabled());
+            QSKIP("this build's Qt has no custom frame on this platform");
+        }
+        atReferenceSize();
+        m_window->move(30, 20);
+        QTRY_COMPARE(m_window->pos(), QPoint(30, 20));
+        m_window->showPage(QStringLiteral("gate"));
+        activate();
+        railTab(QStringLiteral("Gate"))->setFocus();
+        auto* stack = m_window->findChild<QStackedWidget*>();
+        const QRect before = m_window->geometry();
+        const QSize minimum = m_window->minimumSizeHint();
+        const Qt::WindowFlags plain = m_window->windowFlags();
+
+        custom->trigger();
+        QVERIFY(QTest::qWaitForWindowExposed(m_window.get()));
+        QCOMPARE(m_window->windowFlags(), WindowChrome::flagsFor(plain, WindowChrome::customMode()));
+        QTRY_COMPARE(m_window->geometry(), before);
+        QCOMPARE(m_window->currentPage(), QStringLiteral("gate"));
+        QVERIFY(railTab(QStringLiteral("Gate"))->isChecked());
+        // The keyboard's place in the window, which it gets back on being activated again.
+        // (Offscreen never activates a window shown again: its focus window never changed.)
+        QCOMPARE(m_window->focusWidget(), railTab(QStringLiteral("Gate")));
+        QVERIFY(custom->isChecked() && !system->isChecked());
+        QCOMPARE(savedWindow().frame, QStringLiteral("Custom"));  // saved at once, not on the way out
+        // The header keeps its height with the chips in it, so the pages stay on AetherRX's
+        // pixels. (Offscreen there is no title bar, so a Mac's inset is 0 here.)
+        QCOMPARE(stack->mapTo(m_window.get(), QPoint()), QPoint(203, 53));
+        QCOMPARE(m_window->minimumSizeHint(), minimum);  // nor do the chips widen it
+        shot(m_window.get(), frameless ? QStringLiteral("frame-frameless-gate") : QStringLiteral("frame-custom-gate"));
+
+        system->trigger();
+        QVERIFY(QTest::qWaitForWindowExposed(m_window.get()));
+        QCOMPARE(m_window->windowFlags(), plain);
+        QTRY_COMPARE(m_window->geometry(), before);
+        QCOMPARE(m_window->currentPage(), QStringLiteral("gate"));
+        QCOMPARE(savedWindow().frame, QStringLiteral("System"));  // chosen, so no longer the default
+        QCOMPARE(stack->mapTo(m_window.get(), QPoint()), QPoint(203, 53));
+        if (QToolButton* close = m_window->findChild<QToolButton*>(QStringLiteral("headerClose"))) {
+            QVERIFY(close->isHidden());
+        }
+
+        // Maximised, it stays maximised, and still returns to the same normal size.
+        m_window->showMaximized();
+        QTRY_VERIFY(m_window->isMaximized());
+        custom->trigger();
+        QVERIFY(QTest::qWaitForWindowExposed(m_window.get()));
+        QTRY_VERIFY(m_window->isMaximized());
+        QCOMPARE(m_window->normalGeometry(), before);
+        system->trigger();
+        QVERIFY(QTest::qWaitForWindowExposed(m_window.get()));
+        QTRY_VERIFY(m_window->isMaximized());
+        m_window->showNormal();
+        QTRY_COMPARE(m_window->geometry(), before);
+        QCOMPARE(m_quits, 0);
+        // One resizer however often the frame changes.
+        QCOMPARE(m_window->findChildren<AetherSDR::FramelessResizer*>().size(), frameless ? 1 : 0);
+    }
+
+    // The frameless Custom of Windows and Linux, on any machine: minimise and close chips at
+    // the end of the header, as tall as its row and off the keyboard's path, the close chip
+    // going out through closeEvent like every other way; and the header's empty part moving
+    // the window, double-clicked maximising it.
+    void aFramelessWindowHasItsOwnChipsAndHandle()
+    {
+        const FramelessCustom asOnWindows(true);
+        Settings::WindowState window;
+        window.frame = QStringLiteral("Custom");
+        make(window);
+        atReferenceSize();
+        QVERIFY(m_window->windowFlags() & Qt::FramelessWindowHint);
+        auto* minimise = m_window->findChild<QToolButton*>(QStringLiteral("headerMinimise"));
+        auto* close = m_window->findChild<QToolButton*>(QStringLiteral("headerClose"));
+        auto* title = m_window->findChild<QLabel*>(QStringLiteral("canonHeaderTitle"));
+        auto* status = m_window->findChild<StatusChip*>();
+        QVERIFY(minimise && close && title && status);
+        for (QToolButton* chip : {minimise, close}) {
+            QVERIFY(chip->isVisible());
+            QCOMPARE(chip->focusPolicy(), Qt::NoFocus);
+            QVERIFY2(chip->height() <= title->height(), qPrintable(QString::number(chip->height())));
+        }
+        QCOMPARE(close->text(), QStringLiteral("✕"));
+        QCOMPARE(close->accessibleName(), QStringLiteral("Close"));
+        QCOMPARE(minimise->accessibleName(), QStringLiteral("Minimise"));
+        // Last in the row, in that order, at the window's right margin.
+        const int statusRight = status->mapTo(m_window.get(), QPoint(status->width(), 0)).x();
+        const int minimiseLeft = minimise->mapTo(m_window.get(), QPoint()).x();
+        const int closeLeft = close->mapTo(m_window.get(), QPoint()).x();
+        QVERIFY2(statusRight < minimiseLeft && minimiseLeft < closeLeft,
+                 qPrintable(QStringLiteral("%1 %2 %3").arg(statusRight).arg(minimiseLeft).arg(closeLeft)));
+        QCOMPARE(closeLeft + close->width(), m_window->width() - 15);
+        QCOMPARE(m_window->findChildren<AetherSDR::FramelessResizer*>().size(), 1);
+        shot(m_window.get(), QStringLiteral("frame-frameless-radio"));
+
+        // Dragging the title moves the window.
+        m_window->move(40, 30);
+        QTRY_COMPARE(m_window->pos(), QPoint(40, 30));
+        QTest::mousePress(title, Qt::LeftButton, Qt::NoModifier, QPoint(4, 4));
+        QTest::mouseMove(title, QPoint(29, 19));
+        QTest::mouseRelease(title, Qt::LeftButton, Qt::NoModifier, QPoint(29, 19));
+        QTRY_COMPARE(m_window->pos(), QPoint(65, 45));
+        QCOMPARE(QWidget::mouseGrabber(), nullptr);
+        // A control keeps its own clicks: the status chip opens its page, nothing moves.
+        QTest::mouseClick(status, Qt::LeftButton);
+        QCOMPARE(m_window->pos(), QPoint(65, 45));
+
+        // Double-clicking the header's empty part maximises, and again restores.
+        QTest::mouseDClick(title, Qt::LeftButton, Qt::NoModifier, QPoint(4, 4));
+        QTRY_VERIFY(m_window->isMaximized());
+        QTest::mouseDClick(title, Qt::LeftButton, Qt::NoModifier, QPoint(4, 4));
+        QTRY_VERIFY(!m_window->isMaximized());
+
+        minimise->click();
+        QTRY_VERIFY(m_window->isMinimized());
+        m_window->showNormal();
+        QTRY_VERIFY(!m_window->isMinimized());
+
+        CloseCounter counter;
+        m_window->installEventFilter(&counter);
+        m_window->showPage(QStringLiteral("eq"));
+        close->click();
+        QTRY_COMPARE(counter.closes, 1);
+        QCOMPARE(m_quits, 1);
+        QVERIFY(!m_window->isVisible());
+        QCOMPARE(savedWindow().page, QStringLiteral("eq"));  // closeEvent saved on the way out
+        QCOMPARE(savedWindow().frame, QStringLiteral("Custom"));
+    }
+
+    // Everything the header can hold at once, in one row on the title's line, left to right:
+    // the title, the profile and its Modified chip, REC's and PLAY's clocks, the status chip,
+    // the exact-values button and, without a system frame, minimise and close. The rail and
+    // the pages start where they do with the system's frame.
+    void theHeaderHoldsEverythingInOneRow()
+    {
+        const FramelessCustom asOnWindows(true);
+        Settings::WindowState window;
+        window.frame = QStringLiteral("Custom");
+        make(window);
+        atReferenceSize();
+        m_window->showPage(QStringLiteral("gate"));
+        control(QStringLiteral("gate.threshold"))->setValue(-30.0);
+        quieten();
+        EngineStatus s;
+        s.recording.active = true;
+        s.recording.seconds = 83.4;
+        s.recording.path = QStringLiteral("rec.wav");
+        s.playback.active = true;
+        s.playback.seconds = 12.2;
+        s.playback.totalSeconds = 83.9;
+        s.lastRecordingAvailable = true;
+        s.lastRecordingPath = QStringLiteral("last.wav");
+        feed(s);
+
+        auto* header = m_window->findChild<HeaderBar*>();
+        QVERIFY(header);
+        QCOMPARE(header->profileState(), QStringLiteral("Modified"));
+        QCOMPARE(header->recordingClock(), QStringLiteral("● REC 01:23"));
+        QCOMPARE(header->playbackClock(), QStringLiteral("▶ 00:12 / 01:23"));
+        // A clock cut short still says which it is, once the row has been laid out again.
+        auto* recordClock = m_window->findChild<QLabel*>(QStringLiteral("recordClock"));
+        auto* playClock = m_window->findChild<QLabel*>(QStringLiteral("playClock"));
+        QVERIFY(recordClock && playClock);
+        QTRY_VERIFY2(recordClock->text().startsWith(QStringLiteral("● ")) && playClock->text().startsWith(QStringLiteral("▶ "))
+                         && !recordClock->text().contains(QStringLiteral("…"))
+                         && !playClock->text().contains(QStringLiteral("…")),
+                     qPrintable(recordClock->text() + QStringLiteral(" | ") + playClock->text()));
+        const QList<QWidget*> row = {
+            m_window->findChild<QLabel*>(QStringLiteral("canonHeaderTitle")),
+            m_window->findChild<QComboBox*>(QStringLiteral("headerProfile")),
+            m_window->findChild<QLabel*>(QStringLiteral("profileState")),
+            m_window->findChild<QLabel*>(QStringLiteral("recordClock")),
+            m_window->findChild<QLabel*>(QStringLiteral("playClock")),
+            m_window->findChild<StatusChip*>(),
+            m_window->findChild<QPushButton*>(QStringLiteral("exactValues")),
+            m_window->findChild<QToolButton*>(QStringLiteral("headerMinimise")),
+            m_window->findChild<QToolButton*>(QStringLiteral("headerClose")),
+        };
+        const QWidget* title = row.first();
+        QVERIFY(title);
+        const QRect line(title->mapTo(m_window.get(), QPoint()), title->size());
+        int right = 0;
+        for (int i = 0; i < row.size(); ++i) {
+            QWidget* w = row.at(i);
+            QVERIFY2(w && w->isVisible(), qPrintable(QString::number(i)));
+            const QRect at(w->mapTo(m_window.get(), QPoint()), w->size());
+            qInfo().noquote() << w->objectName() << at << (qobject_cast<QLabel*>(w) ? qobject_cast<QLabel*>(w)->text() : QString());
+            QVERIFY2(at.width() > 0, qPrintable(w->objectName()));
+            QVERIFY2(at.left() >= right, qPrintable(w->objectName() + QStringLiteral(" overlaps what is before it")));
+            QVERIFY2(at.top() >= line.top() && at.bottom() <= line.bottom(),
+                     qPrintable(w->objectName() + QStringLiteral(" leaves the title's line")));
+            right = at.right() + 1;
+        }
+        QCOMPARE(right, m_window->width() - 15);  // the close chip ends at the window's margin
+        shot(m_window.get(), QStringLiteral("frame-frameless-everything"));
+
+        auto* stack = m_window->findChild<QStackedWidget*>();
+        QVERIFY(stack);
+        QCOMPARE(stack->mapTo(m_window.get(), QPoint()), QPoint(203, 53));
+        QCOMPARE(rail()->mapTo(m_window.get(), QPoint()), QPoint(15, 53));
+    }
+
+    // The header's chips on their own: the row keeps the title's height with them in it.
+    void theHeadersChipsKeepItsHeight()
+    {
+        QWidget host;
+        auto* layout = new QVBoxLayout(&host);
+        auto* header = new HeaderBar(QStringLiteral("ExpertSDR3 Audio"));
+        layout->addWidget(header);
+        Appearance::apply(&host);
+        host.show();
+        QVERIFY(QTest::qWaitForWindowExposed(&host));
+        const int height = header->sizeHint().height();
+        header->setWindowButtons(false);  // never wanted: never made
+        QVERIFY(!header->findChild<QToolButton*>());
+        header->setWindowButtons(true);
+        QCOMPARE(header->findChildren<QToolButton*>().size(), 2);
+        QCoreApplication::processEvents();
+        QCOMPARE(header->sizeHint().height(), height);
+        header->setWindowButtons(false);
+        for (QToolButton* chip : header->findChildren<QToolButton*>()) QVERIFY(chip->isHidden());
+        header->setWindowButtons(true);
+        QCOMPARE(header->findChildren<QToolButton*>().size(), 2);  // the same two, shown again
+        // Round when the pointer is over them, as upstream's are. Qt draws a sheet's corners
+        // square once two radii add up to more than the side, so the radius follows the side.
+        for (QToolButton* chip : header->findChildren<QToolButton*>()) {
+            chip->setAttribute(Qt::WA_UnderMouse, true);
+            const QImage image = chip->grab().toImage();
+            chip->setAttribute(Qt::WA_UnderMouse, false);
+            const qreal dpr = image.devicePixelRatio();
+            const QColor corner = image.pixelColor(QPoint(1, 1) * dpr);
+            const QColor middle = image.pixelColor(QPoint(chip->width() / 2, chip->height() / 4) * dpr);
+            QVERIFY2(middle.alpha() == 255, qPrintable(chip->objectName() + QStringLiteral(" has no hover fill")));
+            QVERIFY2(corner.alpha() == 0, qPrintable(chip->objectName() + QStringLiteral(" is square: ")
+                                                     + corner.name(QColor::HexArgb)));
+        }
+        CloseCounter counter;
+        host.installEventFilter(&counter);
+        header->findChild<QToolButton*>(QStringLiteral("headerClose"))->click();
+        QCOMPARE(counter.closes, 1);  // the window it is in, through close()
+        QVERIFY(!host.isVisible());
     }
 
     // ── Menus ─────────────────────────────────────────────────────────────────
@@ -630,6 +1229,38 @@ private slots:
                 const auto actions = actionsIn(menu->menu());
                 for (QAction* action : actions) QVERIFY2(m_window->actions().contains(action), qPrintable(action->text()));
             }
+        }
+    }
+
+    // The gear's own rows, top to bottom: the profiles and the radio first, then the page's,
+    // the recordings and the window's, then About and the way out.
+    void theGearMenuIsInItsOrder()
+    {
+        make();
+        auto* gear = m_window->findChild<QMenu*>(QStringLiteral("gearMenu"));
+        QVERIFY(gear);
+        QStringList rows;
+        const auto actions = gear->actions();
+        for (QAction* action : actions) {
+            if (!action->isSeparator()) rows << action->text();
+        }
+        QStringList want = {QStringLiteral("Profiles"),
+                            QStringLiteral("Find Radios..."),
+                            QStringLiteral("Exact values..."),
+                            QStringLiteral("Reset stage order"),
+                            QStringLiteral("Recordings"),
+                            QStringLiteral("Window frame"),
+                            QStringLiteral("About %1").arg(QString::fromUtf8(kAppDisplayName)),
+                            QStringLiteral("Project Website")};
+#ifndef Q_OS_MACOS
+        want << QStringLiteral("Quit");  // a Mac has it in the application menu
+#endif
+        QCOMPARE(rows, want);
+        auto* settings = m_window->findChild<QPushButton*>(QStringLiteral("aetherRxSettingsButton"));
+        QVERIFY(settings);
+        for (const char* word : {"Profiles", "Find Radios", "exact values", "stage order", "recordings", "window frame",
+                                 "About"}) {
+            QVERIFY2(settings->toolTip().contains(QLatin1String(word)), word);
         }
     }
 
@@ -713,7 +1344,7 @@ private slots:
 
     // ── The rail ──────────────────────────────────────────────────────────────
 
-    void theRailHasItsRowsAndOnlyTheGearBelowThem()
+    void theRailHasItsRowsAndTheFooterBelowThem()
     {
         make();
         QCOMPARE(railRows(), (QStringList{QStringLiteral("Radio"), QStringLiteral("AetherNR"), QStringLiteral("Gate"),
@@ -732,11 +1363,30 @@ private slots:
         QVERIFY(!rail()->findChild<QCheckBox*>(QStringLiteral("aetherRxEnableRadio")));
         QVERIFY(!rail()->findChild<QCheckBox*>(QStringLiteral("aetherRxEnableFinalOutput")));
 
-        // The footer: only what works. REC, PLAY and BYPASS come with what they do.
-        QVERIFY(rail()->findChild<QPushButton*>(QStringLiteral("aetherRxSettingsButton")));
-        for (const char* absent : {"aetherRxRecord", "aetherRxPlay", "aetherRxBypass"}) {
-            QVERIFY2(!m_window->findChild<QWidget*>(QString::fromLatin1(absent)), absent);
-        }
+        // The footer, as in AetherRX: REC and PLAY on a row of their own, then the gear and
+        // BYPASS sharing the last row.
+        auto* gear = rail()->findChild<QPushButton*>(QStringLiteral("aetherRxSettingsButton"));
+        auto* bypass = rail()->findChild<QPushButton*>(QStringLiteral("aetherRxBypass"));
+        QVERIFY(gear && bypass);
+        QCOMPARE(bypass->text(), QStringLiteral("BYPASS"));
+        QVERIFY(bypass->isCheckable() && !bypass->isChecked());
+        QCOMPARE(gear->parentWidget(), bypass->parentWidget());
+        auto* record = rail()->findChild<QPushButton*>(QStringLiteral("aetherRxRecord"));
+        auto* play = rail()->findChild<QPushButton*>(QStringLiteral("aetherRxPlay"));
+        QVERIFY(record && play);
+        QCOMPARE(record->text(), QStringLiteral("REC"));
+        QCOMPARE(play->text(), QStringLiteral("PLAY"));
+        QCOMPARE(record->parentWidget(), play->parentWidget());
+        QVERIFY(record->parentWidget() != bypass->parentWidget());
+        const auto at = [this](QWidget* w) { return w->mapTo(m_window.get(), QPoint()); };
+        QCOMPARE(at(record).y(), at(play).y());
+        QVERIFY(at(record).x() < at(play).x());
+        QVERIFY(at(gear).x() < at(bypass).x());
+        QCOMPARE(at(gear).y(), at(bypass).y());
+        QVERIFY2(at(record).y() + record->height() <= at(bypass).y(),
+                 qPrintable(QStringLiteral("REC at %1, BYPASS at %2").arg(at(record).y()).arg(at(bypass).y())));
+        // Below the last stage row.
+        QVERIFY(at(railTab(QStringLiteral("Final Output"))).y() < at(record).y());
     }
 
     void aTabOpensItsPage()
@@ -1002,9 +1652,9 @@ private slots:
         QCOMPARE(m_window->currentPage(), QStringLiteral("radio"));
     }
 
-    // A recording that stopped early is red until the next REC, above everything from the
-    // connection down; one losing audio to a slow disk is amber while it lasts. Neither has a
-    // page to open. A REC that was turned down is neither.
+    // A recording that stopped early is red, above everything from the connection down, until
+    // its warning is answered; one losing audio to a slow disk is amber while it lasts. Neither
+    // has a page to open. A REC that was turned down is neither.
     void theStatusChipShowsRecordingTrouble()
     {
         using Chip = StatusChip;
@@ -1032,6 +1682,9 @@ private slots:
         QVERIFY(Chip::summarize(s).page.isEmpty());
         s.connection = TciClient::State::Disconnected;  // still the more serious
         QCOMPARE(Chip::summarize(s).text.left(18), QStringLiteral("Recording stopped:"));
+        // Once its warning is answered, it is the connection's again.
+        QCOMPARE(Chip::summarize(s, true).text, QStringLiteral("Not connected"));
+        QCOMPARE(Chip::summarize(s, true).page, QStringLiteral("radio"));
         s.nrFailed = true;
         QCOMPARE(Chip::summarize(s).text, QStringLiteral("NR failed: running dry"));
         s.nrFailed = false;
@@ -1116,6 +1769,863 @@ private slots:
         QCOMPARE(state->text(), QStringLiteral("Modified"));
     }
 
+    // ── REC and PLAY ──────────────────────────────────────────────────────────
+
+    void theHeaderClocksReadAsClocks()
+    {
+        QCOMPARE(HeaderBar::clockText(0.0), QStringLiteral("00:00"));
+        QCOMPARE(HeaderBar::clockText(12.9), QStringLiteral("00:12"));  // whole seconds, as a clock counts them
+        QCOMPARE(HeaderBar::clockText(83.4), QStringLiteral("01:23"));
+        QCOMPARE(HeaderBar::clockText(599.0), QStringLiteral("09:59"));
+        QCOMPARE(HeaderBar::clockText(60.0 - 1e-9), QStringLiteral("01:00"));  // summed from frames, a hair short
+        QCOMPARE(HeaderBar::clockText(3599.0), QStringLiteral("59:59"));
+        QCOMPARE(HeaderBar::clockText(3600.0), QStringLiteral("1:00:00"));
+        QCOMPARE(HeaderBar::clockText(2.7 * 3600.0 + 5.0), QStringLiteral("2:42:05"));
+        QCOMPARE(HeaderBar::clockText(-1.0), QStringLiteral("00:00"));
+        QCOMPARE(HeaderBar::clockText(std::nan("")), QStringLiteral("00:00"));
+
+        EngineStatus s;
+        QVERIFY(HeaderBar::recordingText(s).isEmpty());
+        QVERIFY(HeaderBar::playbackText(s).isEmpty());
+        s.recording.active = true;
+        s.recording.seconds = 83.4;
+        QCOMPARE(HeaderBar::recordingText(s), QStringLiteral("● REC 01:23"));
+        s.playback.active = true;
+        s.playback.seconds = 12.7;
+        QCOMPARE(HeaderBar::playbackText(s), QStringLiteral("▶ 00:12"));  // its length, once the file is read
+        s.playback.totalSeconds = 83.9;
+        QCOMPARE(HeaderBar::playbackText(s), QStringLiteral("▶ 00:12 / 01:23"));
+
+        // In the header: in its one row and as tall as it, between the profile and the status
+        // chip, and never widening the window however full the row is.
+        make();
+        atReferenceSize();
+        control(QStringLiteral("tube.drive"))->setValue(3);  // "Modified" shows too
+        QCoreApplication::processEvents();
+        const int minimumWidth = m_window->minimumSizeHint().width();
+        quieten();
+        s.connection = TciClient::State::Ready;
+        s.audioFlowing = true;
+        s.frequencyHz = 14200000;
+        s.modulation = QStringLiteral("USB");
+        s.recording.path = m_dir.filePath(QStringLiteral("a.wav"));
+        s.lastRecordingAvailable = true;
+        s.playback.path = m_dir.filePath(QStringLiteral("b.wav"));
+        // Finished while b plays: the next PLAY's.
+        s.lastRecordingPath = m_dir.filePath(QStringLiteral("c.wav"));
+        auto* header = m_window->findChild<HeaderBar*>();
+        QVERIFY(header);
+        auto* recordClock = header->findChild<QLabel*>(QStringLiteral("recordClock"));
+        auto* playClock = header->findChild<QLabel*>(QStringLiteral("playClock"));
+        auto* title = header->findChild<QLabel*>(QStringLiteral("canonHeaderTitle"));
+        auto* state = header->findChild<QLabel*>(QStringLiteral("profileState"));
+        auto* chip = header->statusChip();
+        QComboBox* profiles = header->profileList();
+        QVERIFY(recordClock && playClock && title && state && chip && profiles);
+
+        // Recording, at the references' size, with a long status and Modified: the profile
+        // combo gives up the room its name does not need before the chip is shortened, so the
+        // name, the clock and the chip are all whole.
+        EngineStatus recording = s;
+        recording.playback.active = false;
+        feed(recording);
+        QTRY_COMPARE(recordClock->text(), QStringLiteral("● REC 01:23"));
+        QVERIFY(playClock->isHidden());
+        QTRY_COMPARE(chip->text(), chip->summary().text);
+        QVERIFY2(profiles->width() < profiles->sizeHint().width(), qPrintable(QString::number(profiles->width())));
+        QVERIFY(showsItsTextWhole(profiles));
+        shot(header, QStringLiteral("header-recording"));
+        // A name that needs all of the combo leaves nothing there to give: the chip makes way,
+        // and the clock is still whole.
+        profiles->addItem(QStringLiteral("Contest weekend, 40 metres"));
+        profiles->setCurrentIndex(profiles->count() - 1);
+        QTRY_VERIFY2(chip->text() != chip->summary().text, qPrintable(chip->text()));  // shortened
+        QVERIFY(chip->text().endsWith(QStringLiteral("…")));
+        QCOMPARE(recordClock->text(), QStringLiteral("● REC 01:23"));
+        shot(header, QStringLiteral("header-recording-long-name"));
+        profiles->setCurrentIndex(0);
+        profiles->removeItem(profiles->count() - 1);
+        QTRY_COMPARE(chip->text(), chip->summary().text);
+
+        // Recording and playing: each clock shown whole or as its time alone, never cut short.
+        feed(s);
+        QCOMPARE(header->recordingClock(), QStringLiteral("● REC 01:23"));
+        QCOMPARE(header->playbackClock(), QStringLiteral("▶ 00:12 / 01:23"));
+        QVERIFY(recordClock->isVisible() && playClock->isVisible() && state->isVisible());
+        QTRY_VERIFY2(!recordClock->text().contains(QStringLiteral("…")) && !playClock->text().contains(QStringLiteral("…")),
+                     qPrintable(recordClock->text() + QStringLiteral(" | ") + playClock->text()));
+        QVERIFY2(recordClock->text() == QStringLiteral("● REC 01:23") || recordClock->text() == QStringLiteral("● 01:23"),
+                 qPrintable(recordClock->text()));
+        QVERIFY2(playClock->text() == QStringLiteral("▶ 00:12 / 01:23") || playClock->text() == QStringLiteral("▶ 00:12"),
+                 qPrintable(playClock->text()));
+        QVERIFY(recordClock->toolTip().contains(QDir::toNativeSeparators(s.recording.path)));
+        QVERIFY(playClock->toolTip().contains(QDir::toNativeSeparators(s.playback.path)));
+        QVERIFY(!playClock->toolTip().contains(QStringLiteral("c.wav")));
+        shot(header, QStringLiteral("header-recording-playing"));
+
+        QCOMPARE(m_window->size(), QSize(722, 746));
+        QCOMPARE(m_window->minimumSizeHint().width(), minimumWidth);
+        auto* stack = m_window->findChild<QStackedWidget*>();
+        QCOMPARE(stack->mapTo(m_window.get(), QPoint()), QPoint(203, 53));
+        const auto at = [header](QWidget* w) { return w->mapTo(header, QPoint()); };
+        QWidget* exact = header->exactValuesButton();
+        for (QWidget* w : {static_cast<QWidget*>(recordClock), static_cast<QWidget*>(playClock),
+                           static_cast<QWidget*>(chip), exact}) {
+            QCOMPARE(w->height(), title->height());
+            QCOMPARE(at(w).y(), at(title).y());
+        }
+        QVERIFY(at(state).x() + state->width() <= at(recordClock).x());
+        QVERIFY(at(recordClock).x() + recordClock->width() <= at(playClock).x());
+        QVERIFY(at(playClock).x() + playClock->width() <= at(chip).x());
+        QVERIFY(at(chip).x() + chip->width() <= at(exact).x());
+
+        // At the window's narrowest, the clocks are shortened rather than pushing it wider.
+        m_window->resize(m_window->minimumWidth(), 746);
+        QTRY_COMPARE(m_window->width(), minimumWidth);
+        QCoreApplication::processEvents();
+        QCOMPARE(m_window->minimumSizeHint().width(), minimumWidth);
+        QCOMPARE(m_window->width(), minimumWidth);
+        QVERIFY(at(exact).x() + exact->width() <= header->width());
+        QCOMPARE(chip->width(), chip->minimumSizeHint().width());  // the chip gave all it could first
+        shot(header, QStringLiteral("header-recording-playing-narrow"));
+        // Back to the references' size: the chip takes back what the clocks do not need.
+        m_window->resize(722, 746);
+        QTRY_COMPARE(m_window->width(), 722);
+        feed(recording);
+        QTRY_COMPARE(recordClock->text(), QStringLiteral("● REC 01:23"));
+
+        // A recording losing audio to a slow disk: amber, as on the chip.
+        QCOMPARE(recordClock->property("tone").toString(), QString());
+        s.recording.droppedFrames = 480;
+        feed(s);
+        QCOMPARE(recordClock->property("tone").toString(), QStringLiteral("warning"));
+        QVERIFY(recordClock->toolTip().contains(QStringLiteral("could not keep up")));
+
+        s.recording.active = false;
+        s.playback.active = false;
+        feed(s);
+        QVERIFY(recordClock->isHidden() && playClock->isHidden());
+        QVERIFY(header->recordingClock().isEmpty() && header->playbackClock().isEmpty());
+        // Nothing to make way for: the chip has its whole width again.
+        QTRY_COMPARE(chip->text(), chip->summary().text);
+    }
+
+    // Dragged narrower a step at a time with both clocks up, as a drag does it, the window
+    // goes exactly as far as it does without them, in either frame. On the way the row gives
+    // way in its order: PLAY's clock to its time alone before REC's, and both of them before
+    // the combo goes below half.
+    void aDragNarrowsTheWindowAsFarAsWithoutTheClocks_data()
+    {
+        QTest::addColumn<bool>("frameless");
+        QTest::newRow("system frame") << false;
+        QTest::newRow("frameless custom frame") << true;
+    }
+
+    void aDragNarrowsTheWindowAsFarAsWithoutTheClocks()
+    {
+        QFETCH(bool, frameless);
+        const FramelessCustom asOnWindows(frameless);
+        Settings::WindowState window;
+        window.frame = frameless ? QStringLiteral("Custom") : QStringLiteral("System");
+        make(window);
+        atReferenceSize();
+        QCOMPARE(bool(m_window->windowFlags() & Qt::FramelessWindowHint), frameless);
+        control(QStringLiteral("tube.drive"))->setValue(3);  // "Modified" shows too
+        quieten();
+        EngineStatus s;
+        s.connection = TciClient::State::Ready;
+        s.audioFlowing = true;
+        s.frequencyHz = 14200000;
+        s.modulation = QStringLiteral("USB");
+        feed(s);
+        const int least = m_window->minimumWidth();
+
+        s.recording.active = true;
+        s.recording.seconds = 83.4;
+        s.recording.path = m_dir.filePath(QStringLiteral("a.wav"));
+        s.playback.active = true;
+        s.playback.seconds = 12.7;
+        s.playback.totalSeconds = 83.9;
+        s.lastRecordingAvailable = true;
+        s.lastRecordingPath = s.recording.path;
+        feed(s);
+        auto* header = m_window->findChild<HeaderBar*>();
+        QVERIFY(header);
+        auto* recordClock = header->findChild<QLabel*>(QStringLiteral("recordClock"));
+        auto* playClock = header->findChild<QLabel*>(QStringLiteral("playClock"));
+        QComboBox* profiles = header->profileList();
+        QVERIFY(recordClock && playClock && profiles);
+        QCOMPARE(m_window->minimumWidth(), least);  // showing the clocks widened nothing
+        const QString recordWhole = QStringLiteral("● REC 01:23");
+        const QString recordShort = QStringLiteral("● 01:23");
+        const QString playWhole = QStringLiteral("▶ 00:12 / 01:23");
+        const QString playShort = QStringLiteral("▶ 00:12");
+        const int comboHalf = profiles->sizeHint().width() - profiles->sizeHint().width() / 2;
+
+        bool recordGaveWay = false;
+        for (int width = m_window->width(); width >= least; width -= 2) {
+            m_window->resize(width, 746);
+            QCoreApplication::processEvents();
+            const QString at = QStringLiteral("at %1: %2 | %3 | combo %4 | minimum %5")
+                                   .arg(width)
+                                   .arg(recordClock->text(), playClock->text())
+                                   .arg(profiles->width())
+                                   .arg(m_window->minimumWidth());
+            QVERIFY2(m_window->width() == width, qPrintable(at));  // the drag never stops short
+            QVERIFY2(m_window->minimumWidth() == least, qPrintable(at));
+            QVERIFY2(recordClock->text() == recordWhole || recordClock->text() == recordShort, qPrintable(at));
+            QVERIFY2(playClock->text() == playWhole || playClock->text() == playShort, qPrintable(at));
+            if (recordClock->text() == recordShort) {
+                recordGaveWay = true;
+                QVERIFY2(playClock->text() == playShort, qPrintable(at));
+            }
+            if (profiles->width() < comboHalf) QVERIFY2(recordClock->text() == recordShort, qPrintable(at));
+        }
+        m_window->resize(least, 746);
+        QCoreApplication::processEvents();
+        QCOMPARE(m_window->width(), least);
+        QVERIFY(recordGaveWay);
+        QCOMPARE(recordClock->text(), recordShort);
+        QCOMPARE(playClock->text(), playShort);
+        shot(header, frameless ? QStringLiteral("header-narrowest-frameless") : QStringLiteral("header-narrowest"));
+
+        // Recording and playing over: the window is no narrower than it may be without them.
+        s.recording.active = false;
+        s.playback.active = false;
+        feed(s);
+        QCOMPARE(m_window->minimumWidth(), least);
+        QCOMPARE(m_window->width(), least);
+    }
+
+    // The buttons show what the engine reports, and showing it asks the engine for nothing.
+    void theButtonsFollowTheEngineNotTheClick()
+    {
+        make();
+        QPushButton* record = recordButton();
+        QPushButton* play = playButton();
+        QVERIFY(record && play);
+        QVERIFY(!record->isChecked() && record->isEnabled());
+        QVERIFY(!play->isChecked() && !play->isEnabled());
+        QCOMPARE(play->accessibleDescription(),
+                 QStringLiteral("Unavailable until something has been recorded. Use REC first."));
+        quieten();
+        QSignalSpy recordToggles(record, &QPushButton::toggled);
+        QSignalSpy playToggles(play, &QPushButton::toggled);
+        // With no radio, any REC asked of the engine now would be turned down, and say so.
+        QSignalSpy asked(m_engine.get(), &Engine::recordingFailed);
+
+        EngineStatus s;
+        s.recording.active = true;
+        feed(s);
+        QVERIFY(record->isChecked());
+        QVERIFY(!play->isEnabled());  // nothing finished yet to play
+        s.recording.active = false;
+        s.lastRecordingAvailable = true;
+        s.lastRecordingPath = m_dir.filePath(QStringLiteral("a.wav"));
+        feed(s);
+        QVERIFY(!record->isChecked());
+        QVERIFY(play->isEnabled() && !play->isChecked());
+        QCOMPARE(play->accessibleDescription(), QStringLiteral("Play back the last recording. Click again to stop."));
+        s.playback.active = true;
+        feed(s);
+        QVERIFY(play->isChecked());
+        s.playback.active = false;
+        feed(s);
+        QVERIFY(!play->isChecked());
+
+        QCOMPARE(recordToggles.count(), 0);
+        QCOMPARE(playToggles.count(), 0);
+        QCoreApplication::processEvents();
+        QCOMPARE(asked.count(), 0);
+    }
+
+    // With no radio, REC is turned down: the button flips straight back, and nothing failed,
+    // so no warning and no red chip. The chip's tooltip and the button's say why.
+    void aRefusedRecFlipsBackAndLeavesTheChipAlone()
+    {
+        make();
+        QPushButton* record = recordButton();
+        auto* chip = m_window->findChild<StatusChip*>();
+        QVERIFY(record && chip);
+        QTRY_COMPARE(chip->summary().text, QStringLiteral("Not connected"));
+        const StatusChip::Summary before = chip->summary();
+        QSignalSpy failed(m_engine.get(), &Engine::recordingFailed);
+
+        QElapsedTimer timer;
+        timer.start();
+        record->click();
+        QVERIFY(record->isChecked());  // the click's own, until the engine answers
+        while (record->isChecked() && timer.elapsed() < 2000) QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
+        qInfo() << "REC flipped back after" << timer.elapsed() << "ms";
+        QVERIFY(!record->isChecked());
+        QVERIFY2(timer.elapsed() < 500, qPrintable(QString::number(timer.elapsed())));
+        QCOMPARE(failed.count(), 1);
+        QCOMPARE(failed.at(0).at(0).toString(), QStringLiteral("Connect to a radio first"));
+        QVERIFY(m_status.recording.refused);
+
+        QTest::qWait(300);  // several statuses: a warning would be up by now
+        QVERIFY(notices().isEmpty());
+        QVERIFY(!record->isChecked());
+        QCOMPARE(chip->summary().text, before.text);
+        QCOMPARE(chip->summary().tone, before.tone);
+        QVERIFY2(chip->toolTip().contains(QStringLiteral("Not recording: Connect to a radio first")),
+                 qPrintable(chip->toolTip()));
+        QVERIFY2(record->toolTip().contains(QStringLiteral("Not recording: Connect to a radio first")),
+                 qPrintable(record->toolTip()));
+        QVERIFY(!QFileInfo::exists(recordingsFolder()));  // nothing was made for it
+    }
+
+    // A refusal is told from a failure by the status sent just before its signal. Connecting
+    // straight after the press answers the refusal, so the status after the signal no longer
+    // says there was one; read from that, the refusal would warn as a recording that stopped.
+    void aRefusalAnsweredAtOnceWarnsNothing()
+    {
+        MockExpert radio;
+        QVERIFY(radio.listen());
+        AppConfig config;
+        config.host = QStringLiteral("127.0.0.1");
+        config.port = radio.port();
+        // Never the defaults: one of them is where a real ExpertSDR3 may be listening.
+        config.fallbackPorts.clear();
+        m_withSink = true;  // and never this computer's speakers
+        make({}, config);
+        QPushButton* record = recordButton();
+        QVERIFY(record);
+        QSignalSpy failed(m_engine.get(), &Engine::recordingFailed);
+
+        // Both reach the engine before the window hears back from either.
+        record->click();
+        DiscoveredRadio picked;
+        picked.host = QStringLiteral("127.0.0.1");
+        picked.port = radio.port();
+        m_window->connectToRadio(picked);
+        QTRY_COMPARE(failed.count(), 1);
+        QCOMPARE(failed.at(0).at(0).toString(), QStringLiteral("Connect to a radio first"));
+        QVERIFY(!m_status.recording.refused);  // answered by the connect
+        QTRY_VERIFY_WITH_TIMEOUT(m_status.audioFlowing, 6000);
+
+        QTest::qWait(300);  // several statuses: a warning would be up by now
+        QVERIFY(notices().isEmpty());
+        QVERIFY(!record->isChecked());
+        QVERIFY(!m_status.recording.active);
+    }
+
+    // A refusal is told from a failure by its status, which comes first, and by its reason. A
+    // failure of the recording before it (its last write lost to a full disk, say) can arrive
+    // while that refusal is still the last status seen, after its own signal and before its
+    // own status: it still warns.
+    void aFailureAfterARefusalStillWarns()
+    {
+        make();
+        quieten();
+        EngineStatus refused;
+        refused.recording.error = QStringLiteral("Connect to a radio first");
+        refused.recording.refused = true;
+        feed(refused);
+        emit m_engine->recordingFailed(refused.recording.error);  // the refusal's own signal
+        QCoreApplication::processEvents();
+        QVERIFY(notices().isEmpty());
+
+        const QString full = QStringLiteral("The disk is full");
+        emit m_engine->recordingFailed(full);
+        EngineStatus failed;
+        failed.recording.error = full;
+        failed.recording.path = m_dir.filePath(QStringLiteral("kept.wav"));
+        feed(failed);
+        QTRY_COMPARE(notices().size(), 1);
+        QCOMPARE(notices().constFirst()->text(), QStringLiteral("Recording stopped"));
+        QVERIFY(notices().constFirst()->informativeText().startsWith(full));
+    }
+
+    // A recording that stops early warns once and turns the chip red. The same failure again
+    // brings that warning forward rather than adding a second; once it has been answered, the
+    // next one is news again.
+    void aRecordingFailureWarnsOnceAndTurnsTheChipRed()
+    {
+        // A folder that cannot be made, because a file has its parent's name: the same failure
+        // at every REC, on any system.
+        recordingsFolder();
+        const QString blocker = m_recordings->filePath(QStringLiteral("not-a-folder"));
+        {
+            QFile file(blocker);
+            QVERIFY(file.open(QIODevice::WriteOnly));
+        }
+        m_recordingFolder = blocker + QStringLiteral("/Recordings");
+        MockExpert radio;
+        QVERIFY(radio.listen());
+        makeOnRadio(radio);
+        if (QTest::currentTestFailed()) return;
+        QPushButton* record = recordButton();
+        auto* chip = m_window->findChild<StatusChip*>();
+        QTRY_COMPARE(chip->summary().tone, QStringLiteral("success"));
+        QSignalSpy failed(m_engine.get(), &Engine::recordingFailed);
+
+        record->click();
+        QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 5000);
+        const QString reason = failed.at(0).at(0).toString();
+        QVERIFY2(reason.contains(QStringLiteral("Could not create the folder")), qPrintable(reason));
+        QTRY_COMPARE(notices().size(), 1);
+        QPointer<QMessageBox> notice = notices().constFirst();
+        QCOMPARE(notice->text(), QStringLiteral("Recording stopped"));
+        QVERIFY2(notice->informativeText().contains(reason), qPrintable(notice->informativeText()));
+        QCOMPARE(notice->windowModality(), Qt::NonModal);  // the window goes on working beneath it
+        // It says how to record elsewhere, and offers to choose the folder at once.
+        QVERIFY2(notice->informativeText().contains(QStringLiteral("choose another folder")),
+                 qPrintable(notice->informativeText()));
+        QVERIFY(notice->findChild<QPushButton*>(QStringLiteral("noticeChooseFolder")));
+        QVERIFY(!m_status.recording.refused);
+        QVERIFY(!record->isChecked());
+        QTRY_COMPARE(chip->summary().tone, QStringLiteral("danger"));
+        QCOMPARE(chip->summary().text, QStringLiteral("Recording stopped: ") + reason);
+        shot(m_window.get(), QStringLiteral("window-recording-failed"));
+
+        record->click();
+        QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 2, 5000);
+        QCOMPARE(failed.at(1).at(0).toString(), reason);
+        QTest::qWait(300);  // the status after it, and any warning it brings
+        QCOMPARE(notices().size(), 1);
+        QCOMPARE(notices().constFirst(), notice.data());
+        QCOMPARE(chip->summary().tone, QStringLiteral("danger"));
+
+        notice->button(QMessageBox::Ok)->click();
+        QTRY_VERIFY(notices().isEmpty());
+        QTRY_VERIFY(notice.isNull());  // gone, not just hidden
+        record->click();
+        QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 3, 5000);
+        QTRY_COMPARE(notices().size(), 1);
+        QVERIFY(!QFileInfo::exists(m_recordingFolder));
+
+        // Choose Folder... answers the warning and asks for a folder, through the window's
+        // replaceable chooser; the next REC records there.
+        notice = notices().constFirst();
+        auto* choose = notice->findChild<QPushButton*>(QStringLiteral("noticeChooseFolder"));
+        QVERIFY(choose);
+        const QString chosen = QDir::cleanPath(m_recordings->filePath(QStringLiteral("Chosen")));
+        m_folderChoice = chosen;
+        const int asksBefore = m_folderAsks;
+        choose->click();
+        QCOMPARE(m_folderAsks, asksBefore + 1);
+        QCOMPARE(Settings(iniPath()).recordingFolder(), chosen);
+        QTRY_VERIFY(notices().isEmpty());
+        record->click();
+        QTRY_VERIFY_WITH_TIMEOUT(m_status.recording.active && m_status.recording.seconds >= 0.3, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(m_status.recording.path.startsWith(chosen), 5000);
+        record->click();
+        QTRY_VERIFY_WITH_TIMEOUT(!m_status.recording.active, 5000);
+        QCOMPARE(failed.count(), 3);
+        QVERIFY(notices().isEmpty());
+    }
+
+    // A recording that stopped early is news, not a state: red on the chip until its warning
+    // is answered, and red again only for the next failure. After that the chip shows the
+    // connection again and opens Radio, and a new connection starts with no failure at all.
+    void aRecordingFailureIsNewsNotAState()
+    {
+        recordingsFolder();
+        const QString blocker = m_recordings->filePath(QStringLiteral("not-a-folder"));
+        {
+            QFile file(blocker);
+            QVERIFY(file.open(QIODevice::WriteOnly));
+        }
+        m_recordingFolder = blocker + QStringLiteral("/Recordings");
+        MockExpert radio;
+        QVERIFY(radio.listen());
+        makeOnRadio(radio);
+        if (QTest::currentTestFailed()) return;
+        QPushButton* record = recordButton();
+        auto* chip = m_window->findChild<StatusChip*>();
+        auto* connectButton = m_window->findChild<QPushButton*>(QStringLiteral("connect"));
+        QVERIFY(chip && connectButton && connectButton->isChecked());
+        QTRY_COMPARE(chip->summary().tone, QStringLiteral("success"));
+        QSignalSpy failed(m_engine.get(), &Engine::recordingFailed);
+
+        record->click();
+        QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 5000);
+        QTRY_COMPARE(notices().size(), 1);
+        QTRY_COMPARE(chip->summary().tone, QStringLiteral("danger"));
+        notices().constFirst()->button(QMessageBox::Ok)->click();
+        QTRY_VERIFY(notices().isEmpty());
+        // Answered: the chip is the radio's again, and its tooltip still says what happened.
+        QTRY_COMPARE(chip->summary().tone, QStringLiteral("success"));
+        QCOMPARE(chip->summary().page, QStringLiteral("radio"));
+        QVERIFY2(chip->toolTip().contains(QStringLiteral("Recording stopped")), qPrintable(chip->toolTip()));
+        QTest::qWait(300);  // and stays so, status after status
+        QCOMPARE(chip->summary().tone, QStringLiteral("success"));
+
+        // The next failure is news again, until its own warning is answered.
+        record->click();
+        QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 2, 5000);
+        QTRY_COMPARE(notices().size(), 1);
+        QTRY_COMPARE(chip->summary().tone, QStringLiteral("danger"));
+        notices().constFirst()->button(QMessageBox::Ok)->click();
+        QTRY_COMPARE(chip->summary().tone, QStringLiteral("success"));
+
+        // Disconnected: the chip says so, and a click on it opens Radio.
+        connectButton->click();
+        QTRY_COMPARE_WITH_TIMEOUT(m_status.connection, TciClient::State::Disconnected, 5000);
+        QTRY_COMPARE(chip->summary().text, QStringLiteral("Not connected"));
+        m_window->showPage(QStringLiteral("nr"));
+        chip->click();
+        QCOMPARE(m_window->currentPage(), QStringLiteral("radio"));
+
+        // Connected again: a new session, with no recording failure in it.
+        connectButton->click();
+        QTRY_VERIFY_WITH_TIMEOUT(m_status.connection == TciClient::State::Ready && m_status.audioFlowing, 6000);
+        QVERIFY2(m_status.recording.error.isEmpty(), qPrintable(m_status.recording.error));
+        QTRY_COMPARE(chip->summary().tone, QStringLiteral("success"));
+        QVERIFY2(!chip->toolTip().contains(QStringLiteral("Recording stopped")), qPrintable(chip->toolTip()));
+        QCOMPARE(failed.count(), 2);
+    }
+
+    // A failure already on its way as the warning for the same one is answered: the box is
+    // hidden at once but deleted only later, and the failure must still be said rather than
+    // handed to the box on its way out.
+    void aFailureArrivingAsItsWarningIsAnsweredIsStillShown()
+    {
+        make();
+        quieten();
+        EngineStatus playing;
+        playing.lastRecordingAvailable = true;
+        playing.playback.active = true;
+        feed(playing);
+        const QString reason = QStringLiteral("Output device stopped");
+        emit m_engine->playbackFailed(reason);
+        QCoreApplication::processEvents();
+        QTRY_COMPARE(notices().size(), 1);
+        QPointer<QMessageBox> first = notices().constFirst();
+
+        // The window takes the engine's reports queued, so this one waits until after the OK.
+        emit m_engine->playbackFailed(reason);
+        first->button(QMessageBox::Ok)->click();
+        QCoreApplication::processEvents();
+        QTRY_VERIFY(first.isNull());
+        QCOMPARE(notices().size(), 1);
+        QCOMPARE(notices().constFirst()->informativeText(), reason);
+    }
+
+    // PLAY pressed as a recording stops waits for its file: it is on, but nothing plays yet.
+    // The clock says it is waiting, not that it plays the recording before, and a refusal
+    // then says it could not play rather than that playback stopped.
+    void aPlayWaitingForItsRecordingIsNotPlaying()
+    {
+        make();
+        quieten();
+        auto* playClock = m_window->findChild<QLabel*>(QStringLiteral("playClock"));
+        QVERIFY(playClock);
+        EngineStatus s;
+        s.lastRecordingAvailable = true;
+        s.lastRecordingPath = m_dir.filePath(QStringLiteral("older.wav"));
+        s.playback.active = true;
+        s.playback.waiting = true;
+        feed(s);
+        QVERIFY(playButton()->isChecked());
+        QVERIFY(!playClock->isHidden());
+        QCOMPARE(playClock->toolTip(), QStringLiteral("Waiting for the recording to finish, then playing it"));
+
+        emit m_engine->playbackFailed(QStringLiteral("No output device"));
+        QCoreApplication::processEvents();
+        QTRY_COMPARE(notices().size(), 1);
+        QCOMPARE(notices().constFirst()->text(), QStringLiteral("Could not play the recording"));
+        notices().constFirst()->button(QMessageBox::Ok)->click();
+        QTRY_VERIFY(notices().isEmpty());
+
+        // Once it plays, the clock names what it plays, and a failure is one that cut it short.
+        s.playback.waiting = false;
+        s.lastRecordingPath = m_dir.filePath(QStringLiteral("newer.wav"));
+        s.playback.path = s.lastRecordingPath;
+        feed(s);
+        QCOMPARE(playClock->toolTip(), QStringLiteral("Playing %1").arg(QDir::toNativeSeparators(s.playback.path)));
+        emit m_engine->playbackFailed(QStringLiteral("Output device stopped"));
+        QCoreApplication::processEvents();
+        QTRY_COMPARE(notices().size(), 1);
+        QCOMPARE(notices().constFirst()->text(), QStringLiteral("Playback stopped"));
+    }
+
+    // PLAY turned down says why, in a warning, and the button flips back. The same cause again
+    // brings that warning forward; a different one takes its place.
+    void playWarnsWhenItCannotPlay()
+    {
+        MockExpert radio;
+        QVERIFY(radio.listen());
+        makeOnRadio(radio);
+        if (QTest::currentTestFailed()) return;
+        QPushButton* record = recordButton();
+        QPushButton* play = playButton();
+        record->click();
+        QTRY_VERIFY_WITH_TIMEOUT(m_status.recording.active && m_status.recording.seconds >= 0.3, 5000);
+        record->click();
+        QTRY_VERIFY_WITH_TIMEOUT(play->isEnabled(), 5000);
+
+        // The radio changes rate, and the output with it: a 48 kHz recording cannot play now.
+        radio.operatorSetStreamRate(24000);
+        QTRY_COMPARE_WITH_TIMEOUT(m_status.chainRate, 24000, 5000);
+        QSignalSpy failed(m_engine.get(), &Engine::playbackFailed);
+        play->click();
+        QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 5000);
+        QTRY_VERIFY(!play->isChecked());
+        QTRY_COMPARE(notices().size(), 1);
+        QPointer<QMessageBox> notice = notices().constFirst();
+        QCOMPARE(notice->text(), QStringLiteral("Could not play the recording"));
+        QVERIFY2(notice->informativeText().contains(QStringLiteral("48000"))
+                     && notice->informativeText().contains(QStringLiteral("24000")),
+                 qPrintable(notice->informativeText()));
+        play->click();
+        QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 2, 5000);
+        QTest::qWait(200);
+        QCOMPARE(notices().size(), 1);
+        QCOMPARE(notices().constFirst(), notice.data());
+        QVERIFY(!play->isChecked());
+
+        // Cut short while playing: said as such, in place of the warning before.
+        quieten();
+        EngineStatus playing;
+        playing.lastRecordingAvailable = true;
+        playing.playback.active = true;
+        feed(playing);
+        emit m_engine->playbackFailed(QStringLiteral("Output device stopped"));
+        QCoreApplication::processEvents();
+        QTRY_VERIFY(notice.isNull());
+        QCOMPARE(notices().size(), 1);
+        QCOMPARE(notices().constFirst()->text(), QStringLiteral("Playback stopped"));
+        QCOMPARE(notices().constFirst()->informativeText(), QStringLiteral("Output device stopped"));
+    }
+
+    // gear › Recordings: where REC saves, the last recording, and a way there, which only
+    // ever goes through the window's replaceable reveal. Looking makes no folder.
+    void theRecordingsMenuShowsTheFolderAndRevealsIt()
+    {
+#if defined(Q_OS_MACOS)
+        QCOMPARE(MainWindow::revealCommandText(), QStringLiteral("Show in Finder"));
+#elif defined(Q_OS_WIN)
+        QCOMPARE(MainWindow::revealCommandText(), QStringLiteral("Show in Explorer"));
+#else
+        QCOMPARE(MainWindow::revealCommandText(), QStringLiteral("Show in Files"));
+#endif
+        make();
+        const QString folder = recordingsFolder();
+        auto* gear = m_window->findChild<QMenu*>(QStringLiteral("gearMenu"));
+        QVERIFY(actionNamed(gear, QStringLiteral("Folder...")));
+        QVERIFY(actionNamed(gear, MainWindow::revealCommandText()));
+        auto* reveal = m_window->findChild<QAction*>(QStringLiteral("recordingsReveal"));
+        auto* folderShown = m_window->findChild<QAction*>(QStringLiteral("recordingsFolderShown"));
+        auto* lastShown = m_window->findChild<QAction*>(QStringLiteral("recordingsLastShown"));
+        QVERIFY(reveal && folderShown && lastShown);
+
+        QMenu* menu = openRecordingsMenu();
+        QVERIFY(menu);
+        shot(menu, QStringLiteral("recordings-menu"));
+        QCOMPARE(folderShown->toolTip(), QDir::toNativeSeparators(folder));
+        QVERIFY(!folderShown->isEnabled() && !lastShown->isEnabled());  // they say, they do nothing
+        QCOMPARE(lastShown->text(), QStringLiteral("No recording yet this session"));
+        QVERIFY(!reveal->isEnabled());  // nothing there yet
+        reveal->trigger();
+        QVERIFY(m_revealed.isEmpty());
+        menu->close();
+        QVERIFY(!QFileInfo::exists(folder));
+
+        QVERIFY(QDir().mkpath(folder));
+        menu = openRecordingsMenu();
+        QVERIFY(menu);
+        QVERIFY(reveal->isEnabled());
+        reveal->trigger();
+        QCOMPARE(m_revealed, QStringList{folder});
+        menu->close();
+
+        // The last recording, once there is one: shown by name, revealed itself.
+        quieten();
+        const QString last = QDir(folder).filePath(QStringLiteral("2026-11-07_141503Z_14.200MHz_USB.wav"));
+        {
+            QFile file(last);
+            QVERIFY(file.open(QIODevice::WriteOnly));
+        }
+        EngineStatus s;
+        s.recording.path = last;
+        s.lastRecordingAvailable = true;
+        s.lastRecordingPath = last;
+        feed(s);
+        menu = openRecordingsMenu();
+        QVERIFY(menu);
+        QCOMPARE(lastShown->text(), QStringLiteral("Last: 2026-11-07_141503Z_14.200MHz_USB.wav"));
+        QCOMPARE(lastShown->toolTip(), QDir::toNativeSeparators(last));
+        shot(menu, QStringLiteral("recordings-menu-last"));
+        reveal->trigger();
+        QCOMPARE(m_revealed.last(), last);
+        menu->close();
+
+        // Moved away since: said so, and Show in… shows the folder instead.
+        QVERIFY(QFile::rename(last, QDir(folder).filePath(QStringLiteral("moved.wav"))));
+        menu = openRecordingsMenu();
+        QVERIFY(menu);
+        QVERIFY2(lastShown->text().startsWith(QStringLiteral("Last: 2026-11-07"))
+                     && lastShown->text().endsWith(QStringLiteral(" (not found)")),
+                 qPrintable(lastShown->text()));
+        QVERIFY2(lastShown->toolTip().contains(QStringLiteral("No longer there")), qPrintable(lastShown->toolTip()));
+        reveal->trigger();
+        QCOMPARE(m_revealed.last(), folder);
+        menu->close();
+
+        // Folder... asks, and keeps the answer as recording/folder, without making it.
+        const QString elsewhere = QDir::cleanPath(m_recordings->filePath(QStringLiteral("Elsewhere")));
+        m_folderChoice = elsewhere;
+        m_window->findChild<QAction*>(QStringLiteral("recordingsFolder"))->trigger();
+        QCOMPARE(m_folderAsks, 1);
+        QCOMPARE(Settings(iniPath()).recordingFolder(), elsewhere);
+        QVERIFY(!QFileInfo::exists(elsewhere));
+        menu = openRecordingsMenu();
+        QVERIFY(menu);
+        QCOMPARE(folderShown->toolTip(), QDir::toNativeSeparators(elsewhere));
+        menu->close();
+        // Asked and cancelled: as it was.
+        m_folderChoice.clear();
+        m_window->findChild<QAction*>(QStringLiteral("recordingsFolder"))->trigger();
+        QCOMPARE(m_folderAsks, 2);
+        QCOMPARE(Settings(iniPath()).recordingFolder(), elsewhere);
+    }
+
+    // From the window to the disk and back, through MockExpert: REC makes a file in the folder
+    // set for it, PLAY sends that file to the speakers, and neither says anything to the radio.
+    void recAndPlayFromTheWindowEndToEnd()
+    {
+        MockExpert radio;
+        QVERIFY(radio.listen());
+        makeOnRadio(radio);
+        if (QTest::currentTestFailed()) return;
+        const QString folder = recordingsFolder();
+        // Starting, connecting and listening make no folder: only a recording does.
+        QVERIFY(!QFileInfo::exists(folder));
+        QTRY_COMPARE_WITH_TIMEOUT(m_status.mutePhase, MuteController::Phase::Holding, 5000);
+        QTest::qWait(300);  // nothing more is due from the mute policy
+        const qsizetype commandsBefore = radio.commands.size();
+
+        QPushButton* record = recordButton();
+        QPushButton* play = playButton();
+        auto* header = m_window->findChild<HeaderBar*>();
+        QVERIFY(!play->isEnabled());  // nothing recorded yet
+
+        record->click();
+        QTRY_VERIFY(m_status.recording.active);
+        QTRY_VERIFY(record->isChecked());
+        QTRY_VERIFY_WITH_TIMEOUT(m_status.recording.active && m_status.recording.seconds >= 1.0, 5000);
+        QTRY_VERIFY(header->recordingClock() == QStringLiteral("● REC 00:01"));
+        QVERIFY(!play->isEnabled());  // what is still being written cannot be played
+        record->click();
+        QTRY_VERIFY(!record->isChecked());
+        QTRY_VERIFY_WITH_TIMEOUT(play->isEnabled(), 5000);
+        QVERIFY(header->recordingClock().isEmpty());
+
+        // One file, named from the time and the radio, in the folder set for it.
+        const QStringList files = QDir(folder).entryList({QStringLiteral("*.wav")}, QDir::Files);
+        QCOMPARE(files.size(), 1);
+        static const QRegularExpression named(QStringLiteral(R"(^\d{4}-\d\d-\d\d_\d{6}Z_\d+\.\d{3}MHz_[A-Z0-9]+\.wav$)"));
+        QVERIFY2(named.match(files.first()).hasMatch(), qPrintable(files.first()));
+        const QString path = QDir(folder).filePath(files.first());
+        QCOMPARE(QFileInfo(m_status.lastRecordingPath).canonicalFilePath(), QFileInfo(path).canonicalFilePath());
+        const std::optional<std::vector<float>> recorded = framesOf(path);
+        QVERIFY(recorded && recorded->size() >= size_t(48000) * 2);
+
+        // PLAY: exactly the file's frames reach the speakers, in place of the radio's.
+        std::optional<size_t> from;
+        std::optional<size_t> to;
+        bool wasPlaying = false;
+        const auto watch = connect(m_engine.get(), &Engine::statusChanged, this, [&](const EngineStatus& s) {
+            if (s.playback.active && !wasPlaying) from = m_sink->samples.size();
+            if (!s.playback.active && wasPlaying) to = m_sink->samples.size();
+            wasPlaying = s.playback.active;
+        });
+        play->click();
+        QTRY_VERIFY(play->isChecked());
+        const QString length = HeaderBar::clockText(double(recorded->size() / 2) / 48000.0);
+        QTRY_VERIFY2(header->playbackClock().startsWith(QStringLiteral("▶ 00:0"))
+                         && header->playbackClock().endsWith(QStringLiteral(" / ") + length),
+                     qPrintable(header->playbackClock()));
+        QTRY_VERIFY_WITH_TIMEOUT(to.has_value(), 10000);
+        disconnect(watch);
+        QTRY_VERIFY(!play->isChecked());
+        QVERIFY(header->playbackClock().isEmpty());
+        QVERIFY(from.has_value());
+        QCOMPARE(*to - *from, recorded->size());
+        QVERIFY2(std::memcmp(m_sink->samples.data() + *from, recorded->data(), recorded->size() * sizeof(float)) == 0,
+                 "the speakers did not get the file's frames");
+        QVERIFY(play->isEnabled());  // to play again
+
+        // gear › Recordings names it and reveals it.
+        QMenu* menu = openRecordingsMenu();
+        QVERIFY(menu);
+        QCOMPARE(m_window->findChild<QAction*>(QStringLiteral("recordingsLastShown"))->text(),
+                 QStringLiteral("Last: ") + files.first());
+        m_window->findChild<QAction*>(QStringLiteral("recordingsReveal"))->trigger();
+        QCOMPARE(m_revealed.size(), 1);
+        QCOMPARE(QFileInfo(m_revealed.first()).canonicalFilePath(), QFileInfo(path).canonicalFilePath());
+        menu->close();
+
+        // Each REC goes where the folder setting says at the press.
+        const QString elsewhere = m_recordings->filePath(QStringLiteral("Elsewhere"));
+        m_folderChoice = elsewhere;
+        m_window->findChild<QAction*>(QStringLiteral("recordingsFolder"))->trigger();
+        record->click();
+        // The status keeps the last recording's length until the next one starts, so wait for
+        // this one's own file.
+        QTRY_VERIFY_WITH_TIMEOUT(m_status.recording.active && m_status.recording.path.startsWith(elsewhere)
+                                     && m_status.recording.seconds >= 0.3,
+                                 5000);
+        record->click();
+        QTRY_VERIFY2_WITH_TIMEOUT(!m_status.recording.active && m_status.lastRecordingPath.startsWith(elsewhere),
+                                  qPrintable(QStringLiteral("active %1, last %2, path %3, error %4, wanted %5")
+                                                 .arg(m_status.recording.active)
+                                                 .arg(m_status.lastRecordingPath, m_status.recording.path,
+                                                      m_status.recording.error, elsewhere)),
+                                  5000);
+        QCOMPARE(QDir(elsewhere).entryList({QStringLiteral("*.wav")}, QDir::Files).size(), 1);
+        QCOMPARE(QDir(folder).entryList({QStringLiteral("*.wav")}, QDir::Files).size(), 1);
+
+        QVERIFY(notices().isEmpty());
+        // Neither REC nor PLAY said anything to the radio.
+        QTest::qWait(300);
+        const QStringList sent = radio.commands.mid(commandsBefore);
+        QVERIFY2(radioChangingCommands(sent).isEmpty(), qPrintable(sent.join(u' ')));
+        QVERIFY2(sent.isEmpty(), qPrintable(sent.join(u' ')));
+        QVERIFY(radio.muted);  // still this app's audio
+    }
+
+    // The PLAY clock's tooltip names the file that is playing, also once a newer recording
+    // has finished while it plays: that one is for the next PLAY.
+    void thePlayClockNamesTheFileItPlays()
+    {
+        MockExpert radio;
+        QVERIFY(radio.listen());
+        makeOnRadio(radio);
+        if (QTest::currentTestFailed()) return;
+        QPushButton* record = recordButton();
+        QPushButton* play = playButton();
+        auto* playClock = m_window->findChild<QLabel*>(QStringLiteral("playClock"));
+        QVERIFY(playClock);
+
+        record->click();
+        QTRY_VERIFY_WITH_TIMEOUT(m_status.recording.active && m_status.recording.seconds >= 4.0, 10000);
+        record->click();
+        QTRY_VERIFY_WITH_TIMEOUT(!m_status.recording.active && play->isEnabled(), 5000);
+        const QString first = m_status.lastRecordingPath;
+        QVERIFY(!first.isEmpty());
+        play->click();
+        QTRY_VERIFY(m_status.playback.active && !m_status.playback.waiting);
+        QTRY_VERIFY2(playClock->toolTip().contains(QDir::toNativeSeparators(first)), qPrintable(playClock->toolTip()));
+
+        // Another recording, made and finished while the first plays.
+        record->click();
+        QTRY_VERIFY_WITH_TIMEOUT(m_status.recording.active && !m_status.recording.path.isEmpty()
+                                     && m_status.recording.path != first && m_status.recording.seconds >= 0.3,
+                                 5000);
+        const QString second = m_status.recording.path;
+        record->click();
+        QTRY_COMPARE_WITH_TIMEOUT(m_status.lastRecordingPath, second, 5000);
+        QVERIFY2(m_status.playback.active, "the first recording should still be playing");
+        QCoreApplication::processEvents();
+        QVERIFY2(playClock->toolTip().contains(QDir::toNativeSeparators(first)), qPrintable(playClock->toolTip()));
+        QVERIFY2(!playClock->toolTip().contains(QFileInfo(second).fileName()), qPrintable(playClock->toolTip()));
+        play->click();
+        QTRY_VERIFY(!m_status.playback.active);
+    }
+
     // ── Pieces ────────────────────────────────────────────────────────────────
 
     // The window is drawn in the built-in Inter, whose licence asks for credit wherever it
@@ -1160,6 +2670,92 @@ private slots:
                          qPrintable(QStringLiteral("%1: %2").arg(spec.key).arg(v)));
             }
         }
+    }
+
+    // A stage page's exact values are one click from the header, the gear or the stage's
+    // tab. Pages with none (Radio, AetherNR, Final Output, and the stages still on today's
+    // grids, which show every value themselves) leave the button and the entries off.
+    void theExactValuesOpenFromTheHeaderTheGearAndTheTab()
+    {
+        make();
+        activate();
+        auto* button = m_window->findChild<QPushButton*>(QStringLiteral("exactValues"));
+        QVERIFY(button);
+        QCOMPARE(button->focusPolicy(), Qt::NoFocus);
+        auto* gear = m_window->findChild<QMenu*>(QStringLiteral("gearMenu"));
+        QAction* gearEntry = actionNamed(gear, QStringLiteral("Exact values..."));
+        QVERIFY(gearEntry);
+        for (const char* id : {"radio", "nr", "output", "eq", "comp", "tube", "exciter"}) {
+            m_window->showPage(QLatin1String(id));
+            QVERIFY2(!button->isEnabled(), id);
+            QVERIFY2(!gearEntry->isEnabled(), id);
+            // On a stage page that has every value on it, the button says so, rather than send
+            // the operator to the stage pages.
+            const bool stagePage = !findPage(QLatin1String(id))->stage.isEmpty();
+            QCOMPARE(button->toolTip(), stagePage ? QStringLiteral("All of this stage's values are on its page.")
+                                                  : QStringLiteral("Exact values are for the stage pages."));
+        }
+        auto* details = m_window->findChild<DetailsWindow*>(QStringLiteral("details_gate"));
+        QVERIFY(details && !details->isVisible());
+
+        m_window->showPage(QStringLiteral("gate"));
+        QVERIFY(button->isEnabled());
+        shot(m_window->findChild<QWidget*>(QStringLiteral("headerBar")), QStringLiteral("header-gate"));
+        button->click();
+        QTRY_VERIFY(details->isVisible());
+        shot(details, QStringLiteral("details-gate"));
+        details->close();
+
+        QVERIFY(gearEntry->isEnabled());
+        gearEntry->trigger();
+        QTRY_VERIFY(details->isVisible());
+        details->close();
+
+        // From the tab's menu, whichever page is showing.
+        m_window->showPage(QStringLiteral("radio"));
+        activate();
+        emit railTab(QStringLiteral("Gate"))->customContextMenuRequested(QPoint(10, 10));
+        QMenu* menu = openPopup();
+        QVERIFY(menu);
+        QAction* tabEntry = actionNamed(menu, QStringLiteral("Exact values..."));
+        QVERIFY(tabEntry && tabEntry->isEnabled());
+        tabEntry->trigger();
+        menu->close();
+        QTRY_VERIFY(details->isVisible());
+        details->close();
+        activate();
+        emit railTab(QStringLiteral("Compressor"))->customContextMenuRequested(QPoint(10, 10));
+        menu = openPopup();
+        QVERIFY(menu);
+        QVERIFY(!actionNamed(menu, QStringLiteral("Exact values..."))->isEnabled());
+        menu->close();
+    }
+
+    // The header's button marks a page that leaves out a value moved from its default:
+    // the gate's attack, or a look-ahead between the Peek slider's stops.
+    void theExactValuesButtonMarksWhatThePageDoesNotShow()
+    {
+        make();
+        auto* header = m_window->findChild<HeaderBar*>();
+        QVERIFY(header);
+        m_window->showPage(QStringLiteral("gate"));
+        QVERIFY(!header->exactValuesFlagged());
+        control(QStringLiteral("gate.attack"))->setValue(5.0);
+        QVERIFY(header->exactValuesFlagged());
+        control(QStringLiteral("gate.attack"))->setValue(control(QStringLiteral("gate.attack"))->spec().def);
+        QVERIFY(!header->exactValuesFlagged());
+        control(QStringLiteral("gate.lookahead"))->setValue(1.5);  // a stop: shown as it is
+        QVERIFY(!header->exactValuesFlagged());
+        control(QStringLiteral("gate.lookahead"))->setValue(2.3);  // shown as the nearest stop
+        QVERIFY(header->exactValuesFlagged());
+        // Only for the page that hides it.
+        m_window->showPage(QStringLiteral("radio"));
+        QVERIFY(!header->exactValuesFlagged());
+        m_window->showPage(QStringLiteral("gate"));
+        QVERIFY(header->exactValuesFlagged());
+        // A profile load is a change too.
+        m_window->loadProfile(QString());
+        QVERIFY(!header->exactValuesFlagged());
     }
 
     void aDetailsWindowIsASecondaryWindow()

@@ -5,6 +5,7 @@
 #include "gui/pages/NrPage.h"
 #include "gui/pages/OutputPage.h"
 #include "gui/pages/RadioPage.h"
+#include "gui/pages/StageHost.h"
 
 #include <QFrame>
 #include <QLabel>
@@ -22,6 +23,8 @@ Page::Page(PageContext& context, QWidget* parent)
 void Page::showStatus(const EngineStatus&) {}
 
 void Page::showChain() {}
+
+void Page::attach() {}
 
 AppConfig& Page::config() const
 {
@@ -42,7 +45,8 @@ const QList<PageEntry>& pageTable()
              [](PageContext& c) -> Page* { return new RadioPage(c); }},
             {QStringLiteral("nr"), kRailNr, QStringLiteral("AetherNR"), QString(), true,
              [](PageContext& c) -> Page* { return new NrPage(c); }},
-            stageRow(QStringLiteral("gate"), kRailGate, QStringLiteral("gate")),
+            {QStringLiteral("gate"), kRailGate, RxChain::stageLabel(QStringLiteral("gate")), QStringLiteral("gate"), true,
+             makeGatePage},
             stageRow(QStringLiteral("eq"), kRailEq, QStringLiteral("eq")),
             stageRow(QStringLiteral("comp"), kRailComp, QStringLiteral("comp")),
             stageRow(QStringLiteral("tube"), kRailTube, QStringLiteral("tube")),

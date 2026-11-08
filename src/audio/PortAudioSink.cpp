@@ -1,5 +1,7 @@
 #include "audio/PortAudioSink.h"
 
+#include "app/TestSandbox.h"
+
 #include <portaudio.h>
 
 #include <QLoggingCategory>
@@ -87,6 +89,13 @@ QList<AudioDeviceInfo> listOutputDevices()
     return devices;
 }
 
+QString realOutputRefusal()
+{
+    if (!testSandbox()) return QString();
+    return QStringLiteral("Real audio outputs are off in tests (ESA_TEST_SANDBOX): "
+                          "use the null device or a test sink");
+}
+
 } // namespace audio
 
 std::unique_ptr<PortAudioSink> PortAudioSink::open(const QString& deviceKey, int chainRate,
@@ -96,6 +105,11 @@ std::unique_ptr<PortAudioSink> PortAudioSink::open(const QString& deviceKey, int
         if (error) *error = message;
         return nullptr;
     };
+
+    if (const QString refusal = audio::realOutputRefusal(); !refusal.isEmpty()) {
+        qCWarning(lcSink) << "Test sandbox: refused to open a real output" << deviceKey;
+        return fail(refusal);
+    }
 
     const PaError initError = Pa_Initialize();
     if (initError != paNoError) {

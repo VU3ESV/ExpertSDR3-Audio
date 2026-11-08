@@ -92,6 +92,8 @@ jobs:
         timeout-minutes: 15
         env:
           QT_QPA_PLATFORM: offscreen
+          # The settings tests that write this user's own store: a runner's user is throwaway.
+          ESA_TEST_NATIVE_SETTINGS: '1'
         run: ctest --test-dir build --output-on-failure --test-output-size-failed 100000 --stop-on-failure --timeout 240
 
       - name: Package, sign and notarize
@@ -175,6 +177,8 @@ jobs:
           # Otherwise Qt sends its messages, including why it is aborting, to the Windows debug
           # log, and a failing test shows no output at all.
           QT_LOGGING_TO_CONSOLE: '1'
+          # The settings tests that write this user's own store: a runner's user is throwaway.
+          ESA_TEST_NATIVE_SETTINGS: '1'
         run: ctest --test-dir build -C Release --output-on-failure --test-output-size-failed 100000 --stop-on-failure --timeout 240
 
       - name: Package
@@ -255,6 +259,8 @@ jobs:
         timeout-minutes: 15
         env:
           QT_QPA_PLATFORM: offscreen
+          # The settings tests that write this user's own store: a runner's user is throwaway.
+          ESA_TEST_NATIVE_SETTINGS: '1'
         run: ctest --test-dir build --output-on-failure --test-output-size-failed 100000 --stop-on-failure --timeout 240
 
       - name: Package
@@ -272,8 +278,11 @@ jobs:
   # The tests where threads share data without locks: the engine's thread, the window's
   # timers, the NR pool and the recorder's disk thread, plus the app itself, which
   # test_recorder runs headless as a child. Qt itself is not built with ThreadSanitizer, so
-  # the handoffs it orders are suppressed by tests/tsan.supp, or stated where it can see
-  # them (Recorder::post).
+  # the ordering its event queue and thread pool give a handoff is invisible to it. Our code
+  # states that ordering where it can see it (Recorder::post, Engine::startNrBuild), and
+  # tests/tsan.supp names only the frames that build a queued call or pool job on the posting
+  # thread, not the code that runs in one: a race inside a slot or a pool job still fails.
+  # The one gap, a lambda invokeMethod runs at once on its own thread, is described there.
   tsan:
     name: Linux ThreadSanitizer
     if: contains(inputs.platforms, 'linux')
