@@ -22,6 +22,9 @@ class ParamControl : public QObject {
 public:
     // Adds its widgets to `grid` at `row`.
     ParamControl(const ParamSpec& spec, double value, QGridLayout* grid, int row, QObject* parent);
+    // The compact form, for one cell of a table: the checkbox (with its label), the combo
+    // box or the spin box alone, at `row`, `column`. No slider and no separate label.
+    ParamControl(const ParamSpec& spec, double value, QGridLayout* grid, int row, int column, QObject* parent);
 
     const ParamSpec& spec() const { return m_spec; }
     double value() const { return m_value; }
@@ -29,14 +32,19 @@ public:
     void setValue(double value);
     // Updates the display only, for when the value is already applied elsewhere.
     void setValueSilently(double value);
+    // Enables or greys out every widget it is drawn with.
+    void setEnabled(bool enabled);
 
 signals:
     void valueChanged(const QString& key, double value);
 
 private:
     void apply(double value, bool notify);
+    // To the spec's decimals, so float noise from a drag never reaches the settings.
+    double rounded(double value) const;
     int toSlider(double value) const;
     double fromSlider(int position) const;
+    void makeSpin(double value);
 
     ParamSpec m_spec;
     double m_value{0.0};

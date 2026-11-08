@@ -1,21 +1,31 @@
 #include "MockExpert.h"
 
 #include "app/Engine.h"
+#include "app/WavFile.h"
 #include "audio/AudioSink.h"
 
+#include <QDir>
 #include <QElapsedTimer>
+#include <QFile>
+#include <QFileInfo>
 #include <QHostAddress>
 #include <QRegularExpression>
 #include <QSettings>
+#include <QStandardPaths>
 #include <QTcpServer>
 #include <QTemporaryDir>
+#include <QThread>
+#include <QTimer>
 #include <QtEndian>
 #include <QtTest>
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 
 using namespace esa;
@@ -26,6 +36,10 @@ namespace {
 // device, which no real test machine offers on demand.
 class RecordingSink final : public AudioSink {
 public:
+    ~RecordingSink() override
+    {
+        if (onClose) onClose(*this);
+    }
     QString deviceName() const override { return QStringLiteral("recording"); }
     void write(const float* stereo, int frames) override
     {
@@ -47,7 +61,84 @@ public:
     std::vector<float> samples;
     quint64 framesWritten{0};
     bool isAlive{true};
+    std::function<void(const RecordingSink&)> onClose;  // the engine let go of it
 };
+
+// Counts frames from whichever thread writes them, for tests where the engine has its own.
+class CountingSink final : public AudioSink {
+public:
+    explicit CountingSink(std::shared_ptr<std::atomic<quint64>> frames) : m_frames(std::move(frames)) {}
+    QString deviceName() const override { return QStringLiteral("counting"); }
+    void write(const float*, int frames) override { m_frames->fetch_add(quint64(frames)); }
+    bool alive() const override { return true; }
+    SinkStats stats() override { return {}; }
+    void setGainDb(double) override {}
+    void setBoost(bool) override {}
+    void setMuted(bool) override {}
+    void setTargetLatencyMs(int) override {}
+
+private:
+    std::shared_ptr<std::atomic<quint64>> m_frames;
+};
+
+float peakOf(const std::vector<float>& samples)
+{
+    float peak = 0.0f;
+    for (float v : samples) peak = std::max(peak, std::fabs(v));
+    return peak;
+}
+
+std::vector<float> drain(SpscStereoRing& ring)
+{
+    std::vector<float> stereo(ring.size() * 2);
+    stereo.resize(ring.read(stereo.data(), stereo.size() / 2) * 2);
+    return stereo;
+}
+
+// The strongest bin of the left channel, Hann-windowed, by Goertzel: the same question
+// the EQ's analyser asks of these samples.
+int strongestBin(const std::vector<float>& stereo, int points)
+{
+    constexpr double kPi = 3.14159265358979323846;
+    std::vector<double> windowed(static_cast<size_t>(points));
+    for (int i = 0; i < points; ++i) {
+        windowed[size_t(i)] = stereo[size_t(i) * 2] * 0.5 * (1.0 - std::cos(2.0 * kPi * i / (points - 1)));
+    }
+    int best = 0;
+    double bestPower = -1.0;
+    for (int bin = 1; bin < points / 2; ++bin) {
+        const double coeff = 2.0 * std::cos(2.0 * kPi * bin / points);
+        double s1 = 0.0;
+        double s2 = 0.0;
+        for (double x : windowed) {
+            const double s0 = x + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        const double power = s1 * s1 + s2 * s2 - coeff * s1 * s2;
+        if (power > bestPower) {
+            bestPower = power;
+            best = bin;
+        }
+    }
+    return best;
+}
+
+// Every stage meter at rest: what a stage that did not run shows.
+bool metersAtRest(const StageSet& view)
+{
+    return view.gate.inputPeakDb() == -120.0f && view.gate.outputPeakDb() == -120.0f
+           && view.gate.gainReductionDb() == 0.0f && view.comp.inputPeakDb() == -120.0f
+           && view.comp.outputPeakDb() == -120.0f && view.comp.gainReductionDb() == 0.0f
+           && view.tube.inputPeakDb() == -120.0f && view.tube.outputPeakDb() == -120.0f
+           && view.pudu.inputPeakDb() == -120.0f && view.pudu.outputPeakDb() == -120.0f;
+}
+
+bool metersLive(const StageSet& view)
+{
+    return view.gate.inputPeakDb() > -40.0f && view.comp.inputPeakDb() > -40.0f
+           && view.tube.inputPeakDb() > -40.0f && view.pudu.inputPeakDb() > -40.0f;
+}
 
 // Runs Engine on the test thread, so the test can inspect state without a thread hop:
 // the event loop still drives everything.
@@ -70,9 +161,14 @@ public:
                         return nullptr;
                     }
                     auto created = std::make_unique<RecordingSink>();
+                    created->onClose = [this](const RecordingSink& closed) {
+                        ++sinkCloseCount;
+                        closedSamples = closed.samples;
+                    };
                     sink = created.get();
                     return created;
-                });
+                },
+                nullptr, recorderOptions);
             QObject::connect(m_engine.get(), &Engine::statusChanged, &mock,
                              [this](const EngineStatus& s) { status = s; });
         }
@@ -105,6 +201,9 @@ public:
     RecordingSink* sink{nullptr};
     bool failSinkOpen{false};
     int sinkOpenCount{0};
+    int sinkCloseCount{0};
+    std::vector<float> closedSamples;  // what the last sink closed had received
+    Recorder::Options recorderOptions;  // set before the first engine() call
     EngineStatus status;
     std::unique_ptr<Engine> m_engine;
 };
@@ -163,6 +262,111 @@ void addEachStore()
     QTest::addColumn<bool>("native");
     QTest::newRow("ini file") << false;
     QTest::newRow("native store") << true;
+}
+
+// A disk that takes its time over every write, as a busy or network one can.
+class SlowFile : public QFile {
+public:
+    SlowFile(const QString& path, int delayMs) : QFile(path), m_delayMs(delayMs) {}
+
+protected:
+    qint64 writeData(const char* data, qint64 len) override
+    {
+        QThread::msleep(static_cast<unsigned long>(m_delayMs));
+        return QFile::writeData(data, len);
+    }
+
+private:
+    const int m_delayMs;
+};
+
+// A disk that fills up at `capacity` bytes, the first write past it stopping short.
+class FullDiskFile : public QFile {
+public:
+    FullDiskFile(const QString& path, qint64 capacity) : QFile(path), m_capacity(capacity) {}
+
+protected:
+    qint64 writeData(const char* data, qint64 len) override
+    {
+        const qint64 allowed = std::clamp<qint64>(m_capacity - pos(), 0, len);
+        if (allowed == 0) {
+            setErrorString(QStringLiteral("No space left on device"));
+            return -1;
+        }
+        return QFile::writeData(data, allowed);
+    }
+
+private:
+    const qint64 m_capacity;
+};
+
+// A disk that refuses the audio once `failing` is set; the header, at the start, still goes in.
+class FailingFile : public QFile {
+public:
+    FailingFile(const QString& path, std::shared_ptr<std::atomic<bool>> failing)
+        : QFile(path), m_failing(std::move(failing))
+    {
+    }
+
+protected:
+    qint64 writeData(const char* data, qint64 len) override
+    {
+        if (m_failing->load() && pos() >= WavFile::kHeaderBytes) {
+            setErrorString(QStringLiteral("injected failure"));
+            return -1;
+        }
+        return QFile::writeData(data, len);
+    }
+
+private:
+    const std::shared_ptr<std::atomic<bool>> m_failing;
+};
+
+// A recording as a player sees it: its header, and the frames it declares.
+struct Recorded {
+    WavFile::Info info;
+    std::vector<float> frames;
+};
+
+std::optional<Recorded> readRecording(const QString& path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) return std::nullopt;
+    const std::optional<WavFile::Info> info = WavFile::parse(file);
+    if (!info) return std::nullopt;
+    Recorded r{*info, std::vector<float>(size_t(info->frames) * 2)};
+    const qint64 bytes = qint64(r.frames.size() * sizeof(float));
+    if (file.read(reinterpret_cast<char*>(r.frames.data()), bytes) != bytes) return std::nullopt;
+    return r;
+}
+
+bool sameBits(const float* a, const float* b, size_t count)
+{
+    return std::memcmp(a, b, count * sizeof(float)) == 0;
+}
+
+// Commands that would change what the radio does or how it sounds. VOLUME also clears MUTE on
+// ExpertSDR3 (docs/TCI-NOTES.md), which is why REC and PLAY must never send one.
+QStringList radioChangingCommands(const QStringList& commands)
+{
+    QStringList found;
+    for (const QString& c : commands) {
+        if (c.startsWith(QLatin1String("trx")) || c.startsWith(QLatin1String("volume"))
+            || c.startsWith(QLatin1String("mute"))) {
+            found << c;
+        }
+    }
+    return found;
+}
+
+// Records `seconds` of the mock's audio into `path` and waits until PLAY has it.
+bool recordFor(Fixture& f, const QString& path, double seconds)
+{
+    f.engine().startRecordingToFile(path);
+    if (!f.status.recording.active) return false;
+    if (!QTest::qWaitFor([&] { return f.status.recording.seconds >= seconds; }, kTimeout)) return false;
+    f.engine().stopRecording();
+    return QTest::qWaitFor([&] { return f.status.lastRecordingPath == path; }, kTimeout);
 }
 
 } // namespace
@@ -899,6 +1103,1098 @@ private slots:
         f.engine().shutdown();
     }
 
+    // ── Live data for the window ─────────────────────────────────────────────
+
+    void theTapsAreOneObjectForTheEnginesLife()
+    {
+        Fixture f;
+        const std::shared_ptr<LiveTaps> taps = f.engine().taps();
+        QVERIFY(taps);
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink && f.sink->framesWritten > 0, kTimeout);
+        f.engine().configure(f.baseConfig());
+        QCOMPARE(f.engine().taps(), taps);
+        f.engine().shutdown();
+        f.m_engine.reset();
+        // The window can outlive the engine, and what it holds is still there.
+        QCOMPARE(taps.use_count(), 1);
+        QCOMPARE(taps->view.gate.inputPeakDb(), -120.0f);
+    }
+
+    void stageMetersFollowTheAudioAndFallWhenItStops()
+    {
+        Fixture f;
+        AppConfig config = f.baseConfig();
+        for (const char* stage : {"gate", "comp", "tube", "pudu"}) {
+            config.params.insert(QString::fromLatin1(stage) + QStringLiteral(".enabled"), 1);
+        }
+        config.params.insert(QStringLiteral("gate.threshold"), -60);  // the -14 dBFS tone keeps it open
+        config.params.insert(QStringLiteral("comp.threshold"), -40);
+        f.start(config);
+        const std::shared_ptr<LiveTaps> taps = f.engine().taps();
+        const StageSet& view = taps->view;
+        QTRY_VERIFY_WITH_TIMEOUT(metersLive(view), kTimeout);
+        QTRY_VERIFY_WITH_TIMEOUT(view.comp.gainReductionDb() < -1.0f, kTimeout);
+        QTRY_VERIFY_WITH_TIMEOUT(taps->blocks.load() > 10, kTimeout);
+        QVERIFY(taps->inputPeak.exchange(0.0f) > 0.1f);  // the mock's tone peaks at 0.2
+
+        QElapsedTimer timer;
+        timer.start();
+        f.engine().setParam(QStringLiteral("gate.enabled"), 0);  // unticked
+        QTRY_VERIFY_WITH_TIMEOUT(view.gate.inputPeakDb() == -120.0f, kTimeout);
+        qInfo() << "gate meter at rest" << timer.elapsed() << "ms after unticking";
+        QVERIFY2(timer.elapsed() < 300, qPrintable(QString::number(timer.elapsed())));
+        QVERIFY(view.comp.inputPeakDb() > -40.0f);  // the others play on
+        QCOMPARE(view.gate.gainReductionDb(), 0.0f);
+
+        timer.restart();
+        f.mock.operatorSetTransmit(true);
+        QTRY_VERIFY_WITH_TIMEOUT(metersAtRest(view), kTimeout);
+        qInfo() << "meters at rest" << timer.elapsed() << "ms after transmitting";
+        QVERIFY2(timer.elapsed() < 300, qPrintable(QString::number(timer.elapsed())));
+        f.mock.operatorSetTransmit(false);
+        f.engine().setParam(QStringLiteral("gate.enabled"), 1);
+        QTRY_VERIFY_WITH_TIMEOUT(metersLive(view), kTimeout);
+
+        // Nothing arrives at all: the engine notices 250 ms after the last block. Polled
+        // finely here, because QTRY's own 50 ms steps would blur the measurement.
+        f.mock.sendAudio = false;
+        f.mock.operatorRestartDsp();
+        timer.restart();
+        while (!metersAtRest(view) && timer.elapsed() < kTimeout) QTest::qWait(2);
+        qInfo() << "meters at rest" << timer.elapsed() << "ms after the stream stopped";
+        QVERIFY(metersAtRest(view));
+        QVERIFY2(timer.elapsed() < 300, qPrintable(QString::number(timer.elapsed())));
+        QVERIFY(!taps->nrActive.load());
+        f.engine().shutdown();
+    }
+
+    void theEqTapCarriesTheToneOnlyWhenWanted()
+    {
+        Fixture f;
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink && f.sink->framesWritten > 9600, kTimeout);
+        const std::shared_ptr<LiveTaps> taps = f.engine().taps();
+        QCOMPARE(taps->eqTap.size(), size_t(0));  // a hidden page costs nothing
+        QCOMPARE(taps->outTap.size(), size_t(0));
+
+        taps->eqTap.skip(taps->eqTap.size());
+        taps->eqWanted = true;
+        QTRY_VERIFY_WITH_TIMEOUT(taps->eqTap.size() >= 4096, kTimeout);
+        const std::vector<float> samples = drain(taps->eqTap);
+        // The mock plays 600 Hz: bin 51 of 4096 at 48 kHz.
+        QCOMPARE(strongestBin(samples, 4096), int(std::lround(600.0 * 4096 / 48000.0)));
+
+        // A new chain is handed the tap too.
+        f.engine().configure(f.baseConfig());
+        drain(taps->eqTap);
+        QTRY_VERIFY_WITH_TIMEOUT(taps->eqTap.size() >= 1024, kTimeout);
+
+        taps->eqWanted = false;
+        drain(taps->eqTap);
+        const quint64 before = f.sink->framesWritten;
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink->framesWritten > before + 4800, kTimeout);
+        QCOMPARE(taps->eqTap.size(), size_t(0));
+        f.engine().shutdown();
+    }
+
+    void theOutputTapHoldsExactlyWhatTheSpeakersGot()
+    {
+        Fixture f;
+        AppConfig config = f.baseConfig();
+        config.params.insert(QStringLiteral("tube.enabled"), 1);
+        config.params.insert(QStringLiteral("tube.drive"), 12);
+        f.start(config);
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink && f.sink->framesWritten > 4800, kTimeout);
+        const std::shared_ptr<LiveTaps> taps = f.engine().taps();
+        QCOMPARE(taps->outTap.size(), size_t(0));
+
+        // The engine runs on this thread, so no block lands between these two lines.
+        f.sink->samples.clear();
+        taps->outWanted = true;
+        QTRY_VERIFY_WITH_TIMEOUT(taps->outTap.size() >= 9600, kTimeout);
+        taps->outWanted = false;
+        const std::vector<float> tapped = drain(taps->outTap);
+        QVERIFY(f.sink->samples.size() >= tapped.size());
+        QVERIFY2(std::memcmp(tapped.data(), f.sink->samples.data(), tapped.size() * sizeof(float)) == 0,
+                 "the tap and the speakers got different samples");
+        QVERIFY(peakOf(tapped) > 0.25f);  // the chain's output, not the radio's 0.2
+        f.engine().shutdown();
+    }
+
+    // With no output device, the meter and scope still have the audio to show.
+    void theOutputTapRunsWithoutAnOutputDevice()
+    {
+        Fixture f;
+        f.failSinkOpen = true;
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.mock.blocksSent > 10, kTimeout);
+        const std::shared_ptr<LiveTaps> taps = f.engine().taps();
+        taps->outWanted = true;
+        QTRY_VERIFY_WITH_TIMEOUT(taps->outTap.size() >= 4800, kTimeout);
+        f.engine().shutdown();
+    }
+
+    void bypassPlaysTheRadioDryUntilReleased()
+    {
+        Fixture f;
+        AppConfig config = f.baseConfig();
+        config.params.insert(QStringLiteral("tube.enabled"), 1);
+        config.params.insert(QStringLiteral("tube.drive"), 24);
+        f.start(config);
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink && f.sink->framesWritten > 4800, kTimeout);
+        const auto measure = [&] {
+            f.sink->samples.clear();
+            QTest::qWait(150);
+            return peakOf(f.sink->samples);
+        };
+        QVERIFY(measure() > 0.5f);
+        QVERIFY(!f.status.rxBypassed);
+
+        f.engine().setRxBypassed(true);
+        QVERIFY(f.status.rxBypassed);  // reported at once, not at the next tick
+        QVERIFY2(measure() <= 0.2001f, "BYPASS still drove the tube");
+
+        // A new chain, as on a new configuration, a connect or a rate change, keeps it.
+        f.engine().configure(config);
+        QVERIFY2(measure() <= 0.2001f, "BYPASS was lost by a rebuild");
+        QVERIFY(f.status.rxBypassed);
+
+        // It is the session's, never the settings': a crash cannot leave the chain off.
+        const QStringList saved = QSettings(f.settingsPath, QSettings::IniFormat).allKeys();
+        QVERIFY2(saved.filter(QStringLiteral("bypass"), Qt::CaseInsensitive).isEmpty(), qPrintable(saved.join(u',')));
+
+        f.engine().setRxBypassed(false);
+        QVERIFY(!f.status.rxBypassed);
+        QVERIFY(measure() > 0.5f);
+        f.engine().shutdown();
+    }
+
+    // The radio sends a rate other than the chain's: the chain is rebuilt at that rate,
+    // and the window's taps and the operator's BYPASS come along.
+    void aStreamRateChangeKeepsTheTapsAndBypass()
+    {
+        Fixture f;
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink && f.sink->framesWritten > 4800, kTimeout);
+        const std::shared_ptr<LiveTaps> taps = f.engine().taps();
+        QCOMPARE(taps->chainRate.load(), 48000);
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.chainRate, 48000, kTimeout);
+        f.engine().setRxBypassed(true);
+
+        AppConfig slow = f.baseConfig();
+        slow.chainRate = 24000;
+        f.engine().configure(slow);  // the stream was asked for at 48 kHz and stays so
+        QCOMPARE(taps->chainRate.load(), 24000);
+        QTRY_COMPARE_WITH_TIMEOUT(taps->chainRate.load(), 48000, kTimeout);
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.chainRate, 48000, kTimeout);
+        QVERIFY(f.status.rxBypassed);
+
+        f.engine().setRxBypassed(false);
+        drain(taps->eqTap);
+        taps->eqWanted = true;
+        QTRY_VERIFY_WITH_TIMEOUT(taps->eqTap.size() >= 1024, kTimeout);
+        f.engine().shutdown();
+    }
+
+    // The window's timers read the display mirror and drain the taps while the engine,
+    // on its own thread as in the app, replaces its chain again and again: on each new
+    // configuration, and each time the stream's rate disagrees with it. Under the
+    // sanitizers this is what finds a lifetime or ordering mistake in the shared data.
+    void rebuildingTheChainWhileTheWindowPollsIsSafe()
+    {
+        MockExpert mock;
+        QVERIFY(mock.listen());
+        QTemporaryDir dir;
+        auto frames = std::make_shared<std::atomic<quint64>>(0);
+        auto* engine = new Engine(dir.filePath(QStringLiteral("s.ini")),
+                                  [frames](const AppConfig&, QString*) -> std::unique_ptr<AudioSink> {
+                                      return std::make_unique<CountingSink>(frames);
+                                  });
+        const std::shared_ptr<LiveTaps> taps = engine->taps();
+        QThread thread;
+        engine->moveToThread(&thread);
+        thread.start();
+
+        AppConfig config;
+        config.host = QStringLiteral("127.0.0.1");
+        config.port = mock.port();
+        config.fallbackPorts = {};  // never the real radio's ports
+        config.muteExpert = false;
+        config.nrMethod = QStringLiteral("nr2");
+        for (const QString& stage : RxChain::stageIds()) config.params.insert(stage + QStringLiteral(".enabled"), 1);
+        QMetaObject::invokeMethod(engine, [engine, config] {
+            engine->configure(config);
+            engine->connectRadio();
+        });
+
+        // What the pages' 16 ms ticks do, faster.
+        std::vector<float> scratch(24000 * 2);
+        int polls = 0;
+        volatile float readings = 0.0f;
+        QTimer window;
+        window.setInterval(4);
+        QObject::connect(&window, &QTimer::timeout, &mock, [&] {
+            const StageSet& view = taps->view;
+            float sum = view.gate.inputPeakDb() + view.gate.gainReductionDb() + view.comp.outputPeakDb()
+                        + view.comp.gainReductionDb() + view.tube.inputPeakDb() + view.pudu.outputPeakDb();
+            double value = 0.0;
+            for (const ParamSpec& spec : RxChain::stageParams()) {
+                RxChain::readStageParam(view, spec.key, &value);
+                sum += float(value);
+            }
+            RxChain::applyStageParam(taps->view, QStringLiteral("gate.threshold"), -40.0 - polls % 10);
+            taps->eqTap.read(scratch.data(), 24000);
+            taps->outTap.read(scratch.data(), 24000);
+            sum += taps->inputPeak.exchange(0.0f) + taps->nrGain.load() + float(taps->blocks.load() % 2);
+            readings = sum;  // so the reads cannot be optimised away
+            ++polls;
+        });
+        taps->eqWanted = true;
+        taps->outWanted = true;
+        window.start();
+
+        QTRY_VERIFY_WITH_TIMEOUT(frames->load() > 4800, kTimeout);
+        for (int i = 0; i < 100; ++i) {
+            AppConfig next = config;
+            next.chainRate = i % 2 ? 24000 : 48000;
+            next.nrMethod = i % 3 ? QStringLiteral("nr2") : QString();
+            QMetaObject::invokeMethod(engine, [engine, next] { engine->configure(next); });
+            QTest::qWait(8);
+        }
+        const quint64 before = frames->load();
+        QTRY_VERIFY_WITH_TIMEOUT(frames->load() > before + 4800, kTimeout);  // still playing
+        QVERIFY(polls > 50);
+        window.stop();
+        taps->eqWanted = false;
+        taps->outWanted = false;
+
+        QMetaObject::invokeMethod(engine, &Engine::shutdown, Qt::BlockingQueuedConnection);
+        QMetaObject::invokeMethod(engine, [engine] { delete engine; }, Qt::BlockingQueuedConnection);
+        thread.quit();
+        QVERIFY(thread.wait(kTimeout));
+        QCOMPARE(taps.use_count(), 1);
+    }
+
+    // REC and PLAY as the app runs them: the engine on its own thread handing frames to the disk
+    // thread and taking them back from it, while the window polls the taps and turns them on and
+    // off. The CI's ThreadSanitizer job runs this.
+    void recordingAndPlayingWhileTheWindowPollsIsSafe()
+    {
+        MockExpert mock;
+        QVERIFY(mock.listen());
+        QTemporaryDir dir;
+        auto frames = std::make_shared<std::atomic<quint64>>(0);
+        Recorder::Options recorder;
+        // Many more hand-offs to and from the disk thread than the defaults make.
+        recorder.drainIntervalMs = 20;
+        recorder.headerIntervalMs = 50;
+        recorder.playRefillMs = 20;
+        auto* engine = new Engine(dir.filePath(QStringLiteral("s.ini")),
+                                  [frames](const AppConfig&, QString*) -> std::unique_ptr<AudioSink> {
+                                      return std::make_unique<CountingSink>(frames);
+                                  },
+                                  nullptr, recorder);
+        const std::shared_ptr<LiveTaps> taps = engine->taps();
+        QThread thread;
+        engine->moveToThread(&thread);
+        thread.start();
+
+        // Delivered queued, on this thread, as the window gets them.
+        EngineStatus status;
+        QStringList failures;
+        QObject::connect(engine, &Engine::statusChanged, &mock, [&](const EngineStatus& s) { status = s; });
+        QObject::connect(engine, &Engine::recordingFailed, &mock, [&](const QString& r) { failures << r; });
+        QObject::connect(engine, &Engine::playbackFailed, &mock, [&](const QString& r) { failures << r; });
+        const auto call = [engine](std::function<void(Engine*)> fn) {
+            QMetaObject::invokeMethod(engine, [engine, fn] { fn(engine); });
+        };
+
+        AppConfig config;
+        config.host = QStringLiteral("127.0.0.1");
+        config.port = mock.port();
+        config.fallbackPorts = {};  // never the real radio's ports
+        config.muteExpert = false;
+        config.nrMethod = QStringLiteral("nr2");
+        for (const QString& stage : RxChain::stageIds()) config.params.insert(stage + QStringLiteral(".enabled"), 1);
+        call([config](Engine* e) {
+            e->configure(config);
+            e->connectRadio();
+        });
+
+        // The pages' 16 ms ticks, faster, with a page change every so often.
+        std::vector<float> scratch(24000 * 2);
+        int polls = 0;
+        volatile float readings = 0.0f;
+        QTimer window;
+        window.setInterval(4);
+        QObject::connect(&window, &QTimer::timeout, &mock, [&] {
+            const StageSet& view = taps->view;
+            float sum = view.gate.inputPeakDb() + view.comp.gainReductionDb() + view.tube.outputPeakDb()
+                        + view.pudu.inputPeakDb();
+            taps->eqTap.read(scratch.data(), 24000);
+            taps->outTap.read(scratch.data(), 24000);
+            sum += taps->inputPeak.exchange(0.0f) + taps->nrGain.load() + float(taps->chainRate.load() % 2);
+            if (++polls % 25 == 0) {
+                const bool show = !taps->outWanted.load();
+                if (show) taps->outTap.skip(taps->outTap.size());
+                taps->outWanted = show;
+                if (show) taps->eqTap.skip(taps->eqTap.size());
+                taps->eqWanted = show;
+            }
+            readings = sum;  // so the reads cannot be optimised away
+        });
+        window.start();
+        QTRY_VERIFY_WITH_TIMEOUT(status.audioFlowing, kTimeout);
+
+        // A recording, then PLAY of it to its end while the next one records.
+        const QString first = dir.filePath(QStringLiteral("first.wav"));
+        call([first](Engine* e) { e->startRecordingToFile(first); });
+        QTRY_VERIFY_WITH_TIMEOUT(status.recording.seconds > 0.5, kTimeout);
+        call([](Engine* e) { e->stopRecording(); });
+        QTRY_COMPARE_WITH_TIMEOUT(status.lastRecordingPath, first, kTimeout);
+        const QString during = dir.filePath(QStringLiteral("during.wav"));
+        call([during](Engine* e) {
+            e->startRecordingToFile(during);
+            e->startPlayback();
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(status.playback.active, kTimeout);
+        QTRY_VERIFY_WITH_TIMEOUT(!status.playback.active, kTimeout);
+        call([](Engine* e) { e->stopRecording(); });
+        QTRY_COMPARE_WITH_TIMEOUT(status.lastRecordingPath, during, kTimeout);
+
+        // PLAY stopped half-way, a second click.
+        call([](Engine* e) { e->startPlayback(); });
+        QTRY_VERIFY_WITH_TIMEOUT(status.playback.seconds > 0.2, kTimeout);
+        call([](Engine* e) { e->stopPlayback(); });
+        QTRY_VERIFY_WITH_TIMEOUT(!status.playback.active, kTimeout);
+
+        // With no radio: PLAY opens the output for itself and closes it after.
+        call([](Engine* e) { e->disconnectRadio(); });
+        QTRY_COMPARE_WITH_TIMEOUT(status.connection, TciClient::State::Disconnected, kTimeout);
+        QTRY_VERIFY_WITH_TIMEOUT(!status.outputOpen, kTimeout);
+        call([](Engine* e) { e->startPlayback(); });
+        QTRY_VERIFY_WITH_TIMEOUT(status.playback.active, kTimeout);
+        QTRY_VERIFY_WITH_TIMEOUT(!status.playback.active && !status.outputOpen, kTimeout);
+
+        // And PLAY cut short by connecting, with a REC straight after.
+        call([](Engine* e) { e->startPlayback(); });
+        QTRY_VERIFY_WITH_TIMEOUT(status.playback.seconds > 0.1, kTimeout);
+        const QString last = dir.filePath(QStringLiteral("last.wav"));
+        call([last](Engine* e) {
+            e->connectRadio();
+            e->startRecordingToFile(last);
+        });
+        QTRY_VERIFY_WITH_TIMEOUT(status.audioFlowing && status.recording.seconds > 0.3, kTimeout);
+        QVERIFY(!status.playback.active);
+        QVERIFY(polls > 50);
+        window.stop();
+        taps->eqWanted = false;
+        taps->outWanted = false;
+
+        // Quitting finishes the recording in progress.
+        QMetaObject::invokeMethod(engine, &Engine::shutdown, Qt::BlockingQueuedConnection);
+        QMetaObject::invokeMethod(engine, [engine] { delete engine; }, Qt::BlockingQueuedConnection);
+        thread.quit();
+        QVERIFY(thread.wait(kTimeout));
+        QCOMPARE(taps.use_count(), 1);
+        QVERIFY2(failures.isEmpty(), qPrintable(failures.join(u'\n')));
+        for (const QString& path : {first, during, last}) {
+            const std::optional<WavFile::Info> info = WavFile::parseFile(path);
+            QVERIFY2(info, qPrintable(path));
+            QVERIFY2(info->frames > 0, qPrintable(path));
+            QCOMPARE(info->declaredFrames, info->framesInFile);
+        }
+    }
+
+    // ── Recording and playback ───────────────────────────────────────────────
+
+    // REC holds the chain's output, before the volume: exactly what the speakers were handed.
+    void aRecordingHoldsExactlyWhatTheSpeakersGot()
+    {
+        Fixture f;
+        AppConfig config = f.baseConfig();
+        config.params.insert(QStringLiteral("tube.enabled"), 1);
+        config.params.insert(QStringLiteral("tube.drive"), 12);  // so it is the chain's output, not the radio's
+        config.outputGainDb = 0.0;
+        f.start(config);
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink && f.sink->framesWritten > 4800, kTimeout);
+        const QString folder = f.dir.filePath(QStringLiteral("Recordings"));
+
+        // The engine runs on this thread, so no block lands between these two lines.
+        f.sink->samples.clear();
+        f.engine().startRecording(folder);
+        QVERIFY(f.status.recording.active);
+        QVERIFY(f.status.recording.error.isEmpty());
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink->samples.size() >= size_t(2 * 48000 * 2), kTimeout);  // 2 s of tone
+        f.engine().stopRecording();
+        const std::vector<float> heard = f.sink->samples;
+        QVERIFY(!f.status.recording.active);
+
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.lastRecordingAvailable, kTimeout);
+        const QString path = f.status.lastRecordingPath;
+        QCOMPARE(QFileInfo(path).absolutePath(), QDir(folder).absolutePath());
+        QCOMPARE(f.status.recording.path, path);
+        // Named from the time and the radio: the mock's receiver 0 is on 7.160 MHz LSB.
+        const QString name = QFileInfo(path).fileName();
+        QVERIFY2(QRegularExpression(QStringLiteral("^\\d{4}-\\d{2}-\\d{2}_\\d{6}Z_7\\.160MHz_LSB\\.wav$"))
+                     .match(name)
+                     .hasMatch(),
+                 qPrintable(name));
+
+        const std::optional<Recorded> file = readRecording(path);
+        QVERIFY(file);
+        QCOMPARE(file->info.sampleRate, 48000);
+        QCOMPARE(file->info.declaredFrames, file->info.framesInFile);  // finished, header and all
+        QCOMPARE(file->frames.size(), heard.size());
+        QVERIFY2(sameBits(file->frames.data(), heard.data(), heard.size()),
+                 "the recording and the speakers got different samples");
+        QVERIFY(peakOf(file->frames) > 0.25f);  // the chain's output, not the radio's 0.2
+        QCOMPARE(f.status.recording.seconds, double(heard.size() / 2) / 48000.0);
+        QCOMPARE(f.status.recording.droppedFrames, quint64(0));
+        QVERIFY(f.status.recording.error.isEmpty());
+        f.engine().shutdown();
+    }
+
+    void recIsRefusedUntilARadioIsConnected()
+    {
+        Fixture f;
+        f.engine().configure(f.baseConfig());
+        QStringList failures;
+        QObject::connect(&f.engine(), &Engine::recordingFailed, &f.mock,
+                         [&](const QString& reason) { failures << reason; });
+        const QString folder = f.dir.filePath(QStringLiteral("Recordings"));
+
+        f.engine().startRecording(folder);
+        QVERIFY(!f.status.recording.active);  // reported at once, so the button flips back
+        QCOMPARE(f.status.recording.error, QStringLiteral("Connect to a radio first"));
+        // A press turned down, not a recording that stopped: the window says so differently.
+        QVERIFY(f.status.recording.refused);
+        QCOMPARE(failures, QStringList{QStringLiteral("Connect to a radio first")});
+        QVERIFY(!QFileInfo::exists(folder));
+
+        // Connecting answers it. REC is taken even before the link is up, and waits for audio.
+        f.engine().connectRadio();
+        QVERIFY(f.status.recording.error.isEmpty());
+        QVERIFY(!f.status.recording.refused);
+        f.engine().startRecording(folder);
+        QVERIFY(f.status.recording.active);
+        QVERIFY(f.status.connection != TciClient::State::Ready);
+
+        // Stopped before any audio arrived: nothing is left behind, not even the folder.
+        f.engine().stopRecording();
+        QVERIFY(!f.status.recording.active);
+        QTRY_VERIFY_WITH_TIMEOUT(f.audioFlowing(), kTimeout);
+        QTest::qWait(400);  // longer than the disk thread's drain interval
+        f.engine().shutdown();
+        QVERIFY(!QFileInfo::exists(folder));
+        QVERIFY(f.status.recording.path.isEmpty());
+        QVERIFY(!f.status.lastRecordingAvailable);
+        QCOMPARE(failures.size(), 1);
+    }
+
+    // Connected, but the receiver sends nothing: a REC there leaves no file, and its status
+    // names none.
+    void aRecordingThatGotNoAudioNamesNoFile()
+    {
+        Fixture f;
+        f.mock.sendAudio = false;
+        f.start();
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.connection, TciClient::State::Ready, kTimeout);
+        const QString path = f.dir.filePath(QStringLiteral("take.wav"));
+        f.engine().startRecordingToFile(path);
+        QVERIFY(f.status.recording.active);
+        QVERIFY(f.status.recording.path.isEmpty());  // no file yet, so none named
+        QTest::qWait(400);  // longer than the disk thread's drain interval
+        f.engine().stopRecording();
+        QTest::qWait(400);
+        QVERIFY(!f.status.recording.active);
+        QVERIFY2(f.status.recording.path.isEmpty(), qPrintable(f.status.recording.path));
+        QVERIFY(!QFileInfo::exists(path));
+        QVERIFY(!f.status.lastRecordingAvailable);
+        QCOMPARE(f.status.recording.seconds, 0.0);
+        QVERIFY(f.status.recording.error.isEmpty());
+
+        // Nor does it take over a name the last recording left: the status is about this one.
+        // The mock decides whether to stream when the stream is asked for, so each change of
+        // mind takes a reconnect.
+        const auto reconnect = [&f] {
+            f.engine().disconnectRadio();
+            QTRY_COMPARE_WITH_TIMEOUT(f.status.connection, TciClient::State::Disconnected, kTimeout);
+            f.engine().connectRadio();
+            QTRY_COMPARE_WITH_TIMEOUT(f.status.connection, TciClient::State::Ready, kTimeout);
+        };
+        f.mock.sendAudio = true;
+        reconnect();
+        QTRY_VERIFY_WITH_TIMEOUT(f.audioFlowing(), kTimeout);
+        QVERIFY(recordFor(f, path, 0.2));
+        QCOMPARE(f.status.recording.path, path);
+        f.mock.sendAudio = false;
+        reconnect();
+        f.engine().startRecordingToFile(f.dir.filePath(QStringLiteral("silent.wav")));
+        QVERIFY(f.status.recording.path.isEmpty());
+        f.engine().stopRecording();
+        f.engine().shutdown();
+        QVERIFY2(f.status.recording.path.isEmpty(), qPrintable(f.status.recording.path));
+        QVERIFY(!QFileInfo::exists(f.dir.filePath(QStringLiteral("silent.wav"))));
+        QCOMPARE(f.status.lastRecordingPath, path);  // PLAY still has the last real one
+    }
+
+    // REC pressed while the link comes up takes its name from the radio once it is there.
+    void aRecordingStartedWhileConnectingIsNamedFromTheRadio()
+    {
+        Fixture f;
+        AppConfig config = f.baseConfig();
+        config.receiver = 1;  // the mock's receiver 1 is on 14.017 MHz CW
+        f.engine().configure(config);
+        f.engine().connectRadio();
+        const QString folder = f.dir.filePath(QStringLiteral("Recordings"));
+        f.engine().startRecording(folder);
+        QVERIFY(f.status.recording.active);
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.recording.seconds > 0.3, kTimeout);
+        f.engine().stopRecording();
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.lastRecordingAvailable, kTimeout);
+        const QString name = QFileInfo(f.status.lastRecordingPath).fileName();
+        QVERIFY2(QRegularExpression(QStringLiteral("^\\d{4}-\\d{2}-\\d{2}_\\d{6}Z_14\\.017MHz_CW_RX1\\.wav$"))
+                     .match(name)
+                     .hasMatch(),
+                 qPrintable(name));
+
+        // A name already taken gets _1: nothing is ever overwritten.
+        const QString path = f.dir.filePath(QStringLiteral("take.wav"));
+        QVERIFY(recordFor(f, path, 0.2));
+        const qint64 firstSize = QFileInfo(path).size();
+        f.engine().startRecordingToFile(path);
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.recording.seconds > 0.2, kTimeout);
+        f.engine().stopRecording();
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.lastRecordingPath, f.dir.filePath(QStringLiteral("take_1.wav")), kTimeout);
+        QCOMPARE(QFileInfo(path).size(), firstSize);
+        f.engine().shutdown();
+    }
+
+    // Frames at two rates never share a file: a rate change goes on in _part2.
+    void aStreamRateChangeContinuesTheRecordingInPart2()
+    {
+        Fixture f;
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink && f.sink->framesWritten > 4800, kTimeout);
+        const QString path = f.dir.filePath(QStringLiteral("take.wav"));
+        f.engine().startRecordingToFile(path);
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.recording.seconds > 0.5, kTimeout);
+
+        f.mock.operatorSetStreamRate(24000);
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.chainRate, 24000, kTimeout);
+        const double atChange = f.status.recording.seconds;
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.recording.seconds > atChange + 0.3, kTimeout);
+        QVERIFY(f.status.recording.active);
+        f.engine().stopRecording();
+
+        const QString part2 = f.dir.filePath(QStringLiteral("take_part2.wav"));
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.lastRecordingPath, part2, kTimeout);
+        QCOMPARE(f.status.recording.path, part2);
+        const std::optional<Recorded> first = readRecording(path);
+        const std::optional<Recorded> second = readRecording(part2);
+        QVERIFY(first && second);
+        QCOMPARE(first->info.sampleRate, 48000);
+        QCOMPARE(second->info.sampleRate, 24000);
+        QVERIFY(first->info.frames >= 24000);
+        QVERIFY(second->info.frames > 0);
+        QCOMPARE(first->info.declaredFrames, first->info.framesInFile);
+        QCOMPARE(second->info.declaredFrames, second->info.framesInFile);
+        // Nothing was lost across the roll: the status counted what the files hold.
+        QCOMPARE(f.status.recording.seconds,
+                 double(first->info.frames) / 48000.0 + double(second->info.frames) / 24000.0);
+        QCOMPARE(QDir(f.dir.path()).entryList({QStringLiteral("take*")}, QDir::Files).size(), 2);
+        f.engine().shutdown();
+    }
+
+    void disconnectAndQuitFinishTheRecording()
+    {
+        Fixture f;
+        // Every write takes a while, so a disconnect that did not wait for the disk would report
+        // before the file was finished.
+        f.recorderOptions.openDevice = [](const QString& path) { return std::make_unique<SlowFile>(path, 60); };
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.audioFlowing(), kTimeout);
+        const QString a = f.dir.filePath(QStringLiteral("a.wav"));
+        f.engine().startRecordingToFile(a);
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.recording.seconds > 0.5, kTimeout);
+
+        // Whole the moment the engine reports it is disconnected, not some time after: it waited
+        // for the disk. Looked at from inside that report, before anything else can run here.
+        std::optional<WavFile::Info> atDisconnect;
+        double secondsAtDisconnect = 0.0;
+        const QMetaObject::Connection watch = QObject::connect(&f.engine(), &Engine::statusChanged, &f.mock,
+                                                               [&](const EngineStatus& s) {
+            if (!atDisconnect && s.connection == TciClient::State::Disconnected && !s.recording.active) {
+                atDisconnect = WavFile::parseFile(a);
+                secondsAtDisconnect = s.recording.seconds;
+            }
+        });
+        f.engine().disconnectRadio();
+        QTRY_VERIFY_WITH_TIMEOUT(atDisconnect.has_value(), kTimeout);
+        QObject::disconnect(watch);
+        QVERIFY(atDisconnect->declaredFrames > 0);
+        QCOMPARE(atDisconnect->declaredFrames, atDisconnect->framesInFile);
+        QCOMPARE(double(atDisconnect->declaredFrames) / 48000.0, secondsAtDisconnect);  // every frame recorded
+        QCOMPARE(QFileInfo(a).size(), qint64(WavFile::kHeaderBytes) + qint64(atDisconnect->declaredFrames) * 8);
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.lastRecordingPath, a, kTimeout);
+        std::optional<WavFile::Info> info;
+
+        f.engine().connectRadio();
+        QTRY_VERIFY_WITH_TIMEOUT(f.audioFlowing(), kTimeout);
+        const QString b = f.dir.filePath(QStringLiteral("b.wav"));
+        f.engine().startRecordingToFile(b);
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.recording.seconds > 0.5, kTimeout);
+        f.engine().shutdown();  // quitting asks nothing, and loses nothing
+        info = WavFile::parseFile(b);
+        QVERIFY(info);
+        QCOMPARE(info->declaredFrames, info->framesInFile);
+        // The last status, which a headless run prints, has the finished file.
+        QVERIFY(!f.status.recording.active);
+        QCOMPARE(f.status.recording.path, b);
+        QCOMPARE(f.status.recording.seconds, double(info->declaredFrames) / 48000.0);
+        QCOMPARE(f.status.lastRecordingPath, b);
+    }
+
+    // A recording can fail in its last write, after the stop. The failure is reported once.
+    // If REC has been pressed again by then, the new recording's status stays its own.
+    void aLateFailureIsReportedWithoutTakingOverTheNextRecording()
+    {
+        Fixture f;
+        auto failing = std::make_shared<std::atomic<bool>>(false);
+        // Only the drain at the stop writes, so that is where a failure comes.
+        f.recorderOptions.drainIntervalMs = 5000;
+        f.recorderOptions.openDevice = [failing](const QString& path) -> std::unique_ptr<QFileDevice> {
+            if (QFileInfo(path).fileName().startsWith(QLatin1String("doomed"))) {
+                return std::make_unique<FailingFile>(path, failing);
+            }
+            return std::make_unique<QFile>(path);
+        };
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.audioFlowing(), kTimeout);
+        QStringList failures;
+        QObject::connect(&f.engine(), &Engine::recordingFailed, &f.mock,
+                         [&](const QString& reason) { failures << reason; });
+
+        // Nothing else running: the status says why it stopped.
+        f.engine().startRecordingToFile(f.dir.filePath(QStringLiteral("doomed-a.wav")));
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.recording.seconds > 0.3, kTimeout);
+        failing->store(true);
+        f.engine().stopRecording();
+        QTRY_COMPARE_WITH_TIMEOUT(failures.size(), 1, kTimeout);
+        QVERIFY2(failures.last().contains(QStringLiteral("doomed-a.wav"))
+                     && failures.last().contains(QStringLiteral("injected failure")),
+                 qPrintable(failures.last()));
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.recording.error, failures.last(), kTimeout);
+        QVERIFY(!f.status.recording.refused);
+        QVERIFY(!f.status.recording.active);
+        // No audio reached the disk, so no file is left and none is named.
+        QVERIFY(f.status.recording.path.isEmpty());
+        QVERIFY(!QFileInfo::exists(f.dir.filePath(QStringLiteral("doomed-a.wav"))));
+
+        // REC pressed again at once, before the last write has failed.
+        f.engine().startRecordingToFile(f.dir.filePath(QStringLiteral("doomed-b.wav")));
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.recording.seconds > 0.3, kTimeout);
+        const QString c = f.dir.filePath(QStringLiteral("c.wav"));
+        f.engine().stopRecording();
+        f.engine().startRecordingToFile(c);
+        QVERIFY(f.status.recording.error.isEmpty());
+        QTRY_COMPARE_WITH_TIMEOUT(failures.size(), 2, kTimeout);
+        QVERIFY2(failures.last().contains(QStringLiteral("doomed-b.wav")), qPrintable(failures.last()));
+        QTest::qWait(100);  // the status that followed the failure
+        QVERIFY(f.status.recording.active);
+        QVERIFY2(f.status.recording.error.isEmpty(), qPrintable(f.status.recording.error));
+        f.engine().stopRecording();
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.lastRecordingPath, c, kTimeout);
+        QCOMPARE(f.status.recording.path, c);
+        QVERIFY(f.status.recording.error.isEmpty());
+        QCOMPARE(failures.size(), 2);
+        f.engine().shutdown();
+    }
+
+    // A recording that cannot be written is reported once, keeps nothing broken, and the
+    // audio goes on.
+    void aRecordingThatCannotBeWrittenIsReportedAndTheAudioGoesOn()
+    {
+        Fixture f;
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink && f.sink->framesWritten > 4800, kTimeout);
+        QStringList failures;
+        QObject::connect(&f.engine(), &Engine::recordingFailed, &f.mock,
+                         [&](const QString& reason) { failures << reason; });
+        // A file where the folder should be, so the folder cannot be made.
+        QFile blocker(f.dir.filePath(QStringLiteral("blocked")));
+        QVERIFY(blocker.open(QIODevice::WriteOnly));
+        blocker.close();
+
+        f.engine().startRecording(f.dir.filePath(QStringLiteral("blocked/Recordings")));
+        QVERIFY(f.status.recording.active);
+        QTRY_COMPARE_WITH_TIMEOUT(failures.size(), 1, kTimeout);
+        QVERIFY(!f.status.recording.active);
+        QCOMPARE(f.status.recording.error, failures.first());
+        QVERIFY(!f.status.recording.refused);  // it was taken, then stopped
+        QVERIFY(f.status.recording.path.isEmpty());  // nothing could be created
+        QVERIFY2(failures.first().contains(QStringLiteral("blocked")), qPrintable(failures.first()));
+        const quint64 before = f.sink->framesWritten;
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink->framesWritten > before + 4800, kTimeout);  // still playing
+        QTest::qWait(300);
+        QCOMPARE(failures.size(), 1);
+        QVERIFY(!f.status.lastRecordingAvailable);
+
+        // The next REC starts clean.
+        f.engine().startRecordingToFile(f.dir.filePath(QStringLiteral("ok.wav")));
+        QVERIFY(f.status.recording.active);
+        QVERIFY(f.status.recording.error.isEmpty());
+        f.engine().shutdown();
+    }
+
+    // The disk fills up mid-recording: the file keeps every whole frame that fitted, the
+    // failure is reported once, PLAY can have what was kept, and the live audio never stopped.
+    void aFullDiskStopsTheRecordingButNotTheAudio()
+    {
+        Fixture f;
+        const qint64 capacity = WavFile::kHeaderBytes + 24000 * 8 + 3;  // half a second, and a part frame
+        f.recorderOptions.openDevice = [capacity](const QString& path) {
+            return std::make_unique<FullDiskFile>(path, capacity);
+        };
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink && f.sink->framesWritten > 4800, kTimeout);
+        QStringList failures;
+        QObject::connect(&f.engine(), &Engine::recordingFailed, &f.mock,
+                         [&](const QString& reason) { failures << reason; });
+        const QString path = f.dir.filePath(QStringLiteral("full.wav"));
+        f.engine().startRecordingToFile(path);
+        QTRY_COMPARE_WITH_TIMEOUT(failures.size(), 1, kTimeout);
+        QVERIFY(!f.status.recording.active);
+        QCOMPARE(f.status.recording.error, failures.first());
+        QVERIFY2(failures.first().contains(QStringLiteral("No space left on device"))
+                     && failures.first().contains(QStringLiteral("full.wav")),
+                 qPrintable(failures.first()));
+        const quint64 before = f.sink->framesWritten;
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink->framesWritten > before + 9600, kTimeout);  // the audio went on
+
+        const std::optional<Recorded> file = readRecording(path);
+        QVERIFY(file);
+        QCOMPARE(file->info.declaredFrames, quint64(24000));
+        QCOMPARE(file->info.framesInFile, quint64(24000));
+        QCOMPARE(QFileInfo(path).size(), qint64(WavFile::kHeaderBytes) + 24000 * 8);
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.lastRecordingPath, path, kTimeout);
+        QTest::qWait(300);
+        QCOMPARE(failures.size(), 1);
+        f.engine().shutdown();
+    }
+
+    // PLAY sends the speakers exactly the file's frames, at the pace of the file, in place of
+    // the live audio, which goes on being processed. Afterwards the live audio is back.
+    void playSendsExactlyTheFilesFramesPacedInPlaceOfTheLiveAudio()
+    {
+        Fixture f;
+        AppConfig config = f.baseConfig();
+        config.params.insert(QStringLiteral("tube.enabled"), 1);
+        config.params.insert(QStringLiteral("tube.drive"), 12);
+        f.start(config);
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink && f.sink->framesWritten > 4800, kTimeout);
+        const QString path = f.dir.filePath(QStringLiteral("take.wav"));
+        QVERIFY(recordFor(f, path, 1.0));
+        const std::optional<Recorded> file = readRecording(path);
+        QVERIFY(file);
+        const size_t fileFrames = file->frames.size() / 2;
+        const qint64 fileMs = qint64(fileFrames) * 1000 / 48000;
+        // The live audio turned well down, so a live block among the playback would show.
+        f.engine().setParam(QStringLiteral("tube.enabled"), 0);
+        f.engine().setParam(QStringLiteral("eq.enabled"), 1);
+        f.engine().setParam(QStringLiteral("eq.master"), -24);
+
+        // What the scope would have drawn, drained as the window does.
+        const std::shared_ptr<LiveTaps> taps = f.engine().taps();
+        taps->outTap.skip(taps->outTap.size());
+        std::vector<float> scoped;
+        QTimer window;
+        window.setInterval(5);
+        QObject::connect(&window, &QTimer::timeout, &f.mock, [&] {
+            const std::vector<float> got = drain(taps->outTap);
+            scoped.insert(scoped.end(), got.begin(), got.end());
+        });
+        // The engine reports the end straight away, so the sink then holds the playback alone.
+        bool wasPlaying = false;
+        std::optional<size_t> heardAtEnd;
+        QObject::connect(&f.engine(), &Engine::statusChanged, &f.mock, [&](const EngineStatus& s) {
+            if (wasPlaying && !s.playback.active && !heardAtEnd) {
+                heardAtEnd = f.sink->samples.size();
+                const std::vector<float> got = drain(taps->outTap);
+                scoped.insert(scoped.end(), got.begin(), got.end());
+                taps->outWanted = false;
+            }
+            wasPlaying = s.playback.active;
+        });
+        QStringList failures;
+        QObject::connect(&f.engine(), &Engine::playbackFailed, &f.mock,
+                         [&](const QString& reason) { failures << reason; });
+
+        // A recording made meanwhile holds the live chain, not what was played.
+        const QString during = f.dir.filePath(QStringLiteral("during.wav"));
+        f.engine().startRecordingToFile(during);
+        QVERIFY(f.status.recording.active);
+
+        const quint64 blocksBefore = taps->blocks.load();
+        f.sink->samples.clear();
+        taps->outWanted = true;
+        window.start();
+        QElapsedTimer timer;
+        timer.start();
+        f.engine().startPlayback();
+        QVERIFY(f.status.playback.active);
+
+        // Paced: half-way through, about half has gone out, not all of it.
+        QTest::qWait(int(fileMs / 2));
+        const double midway = double(f.sink->samples.size() / 2) / double(fileFrames);
+        qInfo() << "played" << midway * 100 << "% of the file after" << timer.elapsed() << "ms of" << fileMs;
+        QVERIFY2(midway > 0.2 && midway < 0.8, qPrintable(QString::number(midway)));
+        QTRY_VERIFY_WITH_TIMEOUT(heardAtEnd.has_value(), kTimeout);
+        const qint64 took = timer.elapsed();
+        qInfo() << "played" << fileMs << "ms of audio in" << took << "ms";
+        // Never faster than the file, and not much slower.
+        QVERIFY2(took >= fileMs - 20 && took < fileMs + 1000, qPrintable(QString::number(took)));
+        window.stop();
+
+        QCOMPARE(*heardAtEnd, file->frames.size());
+        QVERIFY2(sameBits(f.sink->samples.data(), file->frames.data(), file->frames.size()),
+                 "the speakers did not get the file's frames");
+        QCOMPARE(scoped.size(), file->frames.size());
+        QVERIFY2(sameBits(scoped.data(), file->frames.data(), file->frames.size()), "the scope missed the playback");
+        QVERIFY(failures.isEmpty());
+        // The chain, its meters and the recording kept running meanwhile.
+        QVERIFY(taps->blocks.load() > blocksBefore + 50);
+        QVERIFY(f.status.recording.active);
+        QVERIFY2(f.status.recording.seconds >= double(took) / 1000.0 - 0.3,
+                 qPrintable(QString::number(f.status.recording.seconds)));
+        f.engine().stopRecording();
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.lastRecordingPath, during, kTimeout);
+        const std::optional<Recorded> live = readRecording(during);
+        QVERIFY(live);
+        QVERIFY(peakOf(live->frames) > 0.005f && peakOf(live->frames) < 0.05f);  // the live chain, turned down
+
+        // And the live audio is back.
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink->samples.size() > *heardAtEnd + 4800, kTimeout);
+        const std::vector<float> after(f.sink->samples.begin() + qsizetype(*heardAtEnd), f.sink->samples.end());
+        QVERIFY(peakOf(after) < 0.05f);  // the live chain, turned down
+        QVERIFY(!f.status.playback.active);
+        f.engine().shutdown();
+    }
+
+    // Disconnected, PLAY opens the output for itself and closes it after, leaving ExpertSDR3's
+    // mute alone: there is no session, so the mute policy wants nothing.
+    void playWhileDisconnectedOpensAndClosesTheOutput()
+    {
+        Fixture f;
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.mock.muted, kTimeout);
+        const QString path = f.dir.filePath(QStringLiteral("take.wav"));
+        QVERIFY(recordFor(f, path, 0.5));
+        const std::optional<Recorded> file = readRecording(path);
+        QVERIFY(file);
+        f.engine().disconnectRadio();
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.connection, TciClient::State::Disconnected, kTimeout);
+        QTRY_VERIFY_WITH_TIMEOUT(!f.mock.muted, kTimeout);
+        // The mock has seen the whole disconnect, its audio_stop included, once the socket has
+        // closed at its end: anything it hears after that came from the playback.
+        QTRY_VERIFY_WITH_TIMEOUT(!f.mock.hasClient(), kTimeout);
+        QVERIFY(!f.status.outputOpen);
+        const MuteController::Phase phase = f.status.mutePhase;
+        const qsizetype commandsBefore = f.mock.commands.size();
+        const int opens = f.sinkOpenCount;
+        const int closes = f.sinkCloseCount;
+
+        // At the end of the file the playback is over, but the output stays open for as long as
+        // its buffer takes to play out: closing it at once would cut off the end.
+        std::optional<EngineStatus> atEnd;
+        std::optional<int> closesAtEnd;
+        QElapsedTimer sinceEnd;
+        qint64 closedAfterMs = -1;
+        QObject::connect(&f.engine(), &Engine::statusChanged, &f.mock, [&](const EngineStatus& s) {
+            if (!atEnd && !s.playback.active) {
+                atEnd = s;
+                closesAtEnd = f.sinkCloseCount;
+                sinceEnd.start();
+            }
+            if (atEnd && closedAfterMs < 0 && !s.outputOpen) closedAfterMs = sinceEnd.elapsed();
+        });
+        f.engine().startPlayback();
+        QVERIFY(f.status.playback.active);
+        QCOMPARE(f.sinkOpenCount, opens + 1);
+        QVERIFY(f.status.outputOpen);
+        QTRY_VERIFY_WITH_TIMEOUT(atEnd.has_value(), kTimeout);
+        QVERIFY(atEnd->outputOpen);
+        QCOMPARE(*closesAtEnd, closes);
+        QTRY_VERIFY_WITH_TIMEOUT(!f.status.outputOpen, kTimeout);
+        QCOMPARE(f.sinkCloseCount, closes + 1);
+        QVERIFY2(closedAfterMs >= f.baseConfig().bufferMs, qPrintable(QString::number(closedAfterMs)));
+        QCOMPARE(f.closedSamples.size(), file->frames.size());
+        QVERIFY(sameBits(f.closedSamples.data(), file->frames.data(), file->frames.size()));
+
+        QTest::qWait(200);
+        QVERIFY2(f.mock.commands.size() == commandsBefore, qPrintable(f.mock.commands.mid(commandsBefore).join(u' ')));
+        QVERIFY(!f.mock.hasClient());
+        QCOMPARE(f.status.mutePhase, phase);
+        QVERIFY(!f.mock.muted);
+        f.engine().shutdown();
+    }
+
+    void playStopsOnASecondClickOnConnectAndWhenTheOutputFails()
+    {
+        Fixture f;
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink && f.sink->framesWritten > 4800, kTimeout);
+        QVERIFY(recordFor(f, f.dir.filePath(QStringLiteral("take.wav")), 1.0));
+        QStringList failures;
+        QObject::connect(&f.engine(), &Engine::playbackFailed, &f.mock,
+                         [&](const QString& reason) { failures << reason; });
+
+        // A second click.
+        f.engine().startPlayback();
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.playback.seconds > 0.1, kTimeout);
+        f.engine().stopPlayback();
+        QVERIFY(!f.status.playback.active);
+        QVERIFY(failures.isEmpty());
+
+        // The output failing.
+        f.engine().startPlayback();
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.playback.seconds > 0.1, kTimeout);
+        f.sink->isAlive = false;
+        QTRY_VERIFY_WITH_TIMEOUT(!f.status.playback.active, kTimeout);
+        QCOMPARE(failures, QStringList{QStringLiteral("Output device stopped")});
+        QTRY_VERIFY_WITH_TIMEOUT(!f.status.outputOpen, kTimeout);
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.outputOpen, 8000);  // the session's output comes back
+
+        // Disconnecting.
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.outputOpen && f.audioFlowing(), kTimeout);
+        f.engine().startPlayback();
+        QVERIFY(f.status.playback.active);
+        f.engine().disconnectRadio();
+        QVERIFY(!f.status.playback.active);
+
+        // Connecting, here from a playback with no radio.
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.connection, TciClient::State::Disconnected, kTimeout);
+        f.engine().startPlayback();
+        QVERIFY(f.status.playback.active);
+        f.engine().connectRadio();
+        QVERIFY(!f.status.playback.active);
+        QTRY_VERIFY_WITH_TIMEOUT(f.audioFlowing(), kTimeout);
+        QVERIFY(f.status.outputOpen);
+        QCOMPARE(failures.size(), 1);
+        f.engine().shutdown();
+    }
+
+    void playRefusesWhatItCannotPlay()
+    {
+        Fixture f;
+        QStringList failures;
+        QObject::connect(&f.engine(), &Engine::playbackFailed, &f.mock,
+                         [&](const QString& reason) { failures << reason; });
+        f.engine().configure(f.baseConfig());
+        f.engine().startPlayback();
+        QVERIFY(!f.status.playback.active);
+        QVERIFY(!f.status.lastRecordingAvailable);
+        QCOMPARE(failures, QStringList{QStringLiteral("Nothing has been recorded yet")});
+        QCOMPARE(f.sinkOpenCount, 0);
+
+        // A recording at 48 kHz, then the stream changes to 24 kHz and the output with it.
+        f.engine().connectRadio();
+        QTRY_VERIFY_WITH_TIMEOUT(f.audioFlowing(), kTimeout);
+        QVERIFY(recordFor(f, f.dir.filePath(QStringLiteral("take.wav")), 0.3));
+        f.mock.operatorSetStreamRate(24000);
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.chainRate, 24000, kTimeout);
+        const int opens = f.sinkOpenCount;
+        f.engine().startPlayback();
+        QVERIFY(!f.status.playback.active);
+        QCOMPARE(failures.size(), 2);
+        QVERIFY2(failures.last().contains(QStringLiteral("48000")) && failures.last().contains(QStringLiteral("24000")),
+                 qPrintable(failures.last()));
+        QCOMPARE(f.sinkOpenCount, opens);
+        f.engine().shutdown();
+    }
+
+    // Neither REC nor PLAY says anything to the radio.
+    void recAndPlaySendNothingToTheRadio()
+    {
+        Fixture f;
+        f.start();
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.mutePhase, MuteController::Phase::Holding, kTimeout);
+        QTest::qWait(300);  // nothing more is due from the mute policy
+        const qsizetype before = f.mock.commands.size();
+
+        const QString path = f.dir.filePath(QStringLiteral("take.wav"));
+        QVERIFY(recordFor(f, path, 0.5));
+        f.engine().startPlayback();
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.playback.active, kTimeout);
+        QTRY_VERIFY_WITH_TIMEOUT(!f.status.playback.active, kTimeout);
+        f.engine().startPlayback();
+        QTest::qWait(100);
+        f.engine().stopPlayback();
+        f.engine().startRecording(f.dir.filePath(QStringLiteral("Recordings")));
+        QTest::qWait(300);
+        f.engine().stopRecording();
+        QTest::qWait(300);
+
+        const QStringList sent = f.mock.commands.mid(before);
+        QVERIFY2(radioChangingCommands(sent).isEmpty(), qPrintable(sent.join(u' ')));
+        QVERIFY2(sent.isEmpty(), qPrintable(sent.join(u' ')));
+        QVERIFY(f.mock.muted);  // still this app's audio
+        f.engine().shutdown();
+    }
+
+    // --capture: the radio's audio and the chain's output, each from the first block, and a
+    // rate change goes on in _part2 rather than starting the files again.
+    void captureWritesBothSidesAndSurvivesARateChange()
+    {
+        Fixture f;
+        AppConfig config = f.baseConfig();
+        config.params.insert(QStringLiteral("tube.enabled"), 1);
+        config.params.insert(QStringLiteral("tube.drive"), 12);
+        f.engine().configure(config);
+        const QString base = f.dir.filePath(QStringLiteral("cap"));
+        f.engine().setCapture(base);
+        f.engine().connectRadio();
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink && f.sink->framesWritten > 24000, kTimeout);
+        f.mock.operatorSetStreamRate(24000);
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.chainRate, 24000, kTimeout);
+        QTRY_VERIFY_WITH_TIMEOUT(f.sink && f.sink->framesWritten > 12000, kTimeout);  // the 24 kHz output
+        f.engine().shutdown();
+
+        const QStringList names = {QStringLiteral("cap.before.wav"), QStringLiteral("cap.after.wav"),
+                                   QStringLiteral("cap.before_part2.wav"), QStringLiteral("cap.after_part2.wav")};
+        QStringList expected;
+        for (const QString& n : names) expected << f.dir.filePath(n);
+        QStringList reported = f.status.capture.files;
+        reported.sort();
+        expected.sort();
+        QCOMPARE(reported, expected);
+        QVERIFY(f.status.capture.error.isEmpty());
+
+        std::vector<Recorded> files;
+        for (const QString& n : names) {
+            std::optional<Recorded> r = readRecording(f.dir.filePath(n));
+            QVERIFY2(r, qPrintable(n));
+            QVERIFY2(r->info.frames > 0, qPrintable(n));
+            QCOMPARE(r->info.declaredFrames, r->info.framesInFile);
+            files.push_back(std::move(*r));
+        }
+        QCOMPARE(files[0].info.sampleRate, 48000);
+        QCOMPARE(files[1].info.sampleRate, 48000);
+        QCOMPARE(files[2].info.sampleRate, 24000);
+        QCOMPARE(files[3].info.sampleRate, 24000);
+        // Before and after hold the same blocks: no NR changes their length here.
+        QCOMPARE(files[0].info.frames, files[1].info.frames);
+        QCOMPARE(files[2].info.frames, files[3].info.frames);
+        // Before is the radio, from its very first sample (the mock's tone starts at sin 0, cos 1);
+        // after is the chain.
+        QCOMPARE(files[0].frames[0], 0.0f);
+        QCOMPARE(files[0].frames[1], 0.2f);
+        QVERIFY(peakOf(files[0].frames) <= 0.2001f);
+        QVERIFY(peakOf(files[1].frames) > 0.25f);
+    }
+
     void settingsRoundTrip()
     {
         QTemporaryDir dir;
@@ -929,6 +2225,33 @@ private slots:
         QCOMPARE(loaded.stageOrder, config.stageOrder);
         QCOMPARE(loaded.params.value(QStringLiteral("comp.threshold")), -33.5);
         QCOMPARE(loaded.params.value(QStringLiteral("eq.b4.gain")), 7.0);
+    }
+
+    // recording/folder: Documents/<display name>/Recordings until the operator picks one, and
+    // kept apart from the audio settings, which a save rewrites.
+    void theRecordingFolderDefaultsToDocumentsAndSurvivesASave()
+    {
+        QTemporaryDir dir;
+        const QString path = dir.filePath(QStringLiteral("s.ini"));
+        const QString documents = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+        const QString fallback = Settings::defaultRecordingFolder();
+        QCOMPARE(fallback, QDir(documents.isEmpty() ? QDir::homePath() : documents)
+                               .filePath(QStringLiteral("ExpertSDR3 Audio/Recordings")));
+        QCOMPARE(Settings(path).recordingFolder(), fallback);
+
+        const QString chosen = dir.filePath(QStringLiteral("My recordings"));
+        Settings(path).setRecordingFolder(chosen);
+        QCOMPARE(Settings(path).recordingFolder(), chosen);
+        {
+            Settings settings(path);
+            settings.save(settings.load());  // what the window does on every change
+        }
+        QCOMPARE(Settings(path).recordingFolder(), chosen);
+        QCOMPARE(QSettings(path, QSettings::IniFormat).value(QStringLiteral("recording/folder")).toString(), chosen);
+
+        Settings(path).setRecordingFolder(QString());
+        QCOMPARE(Settings(path).recordingFolder(), fallback);
+        QVERIFY(!QSettings(path, QSettings::IniFormat).contains(QStringLiteral("recording/folder")));
     }
 
     void settingsRejectValuesOutOfRangeAndMethodsFromOtherBuilds()

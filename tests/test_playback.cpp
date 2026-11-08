@@ -1,10 +1,13 @@
+#include "audio/OutputShape.h"
 #include "audio/PlaybackBuffer.h"
 
 #include <QtTest>
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <functional>
+#include <limits>
 #include <vector>
 
 using esa::PlaybackBuffer;
@@ -364,6 +367,39 @@ private slots:
         QCOMPARE(stats.overruns, quint64(0));
         QVERIFY2(std::abs(stats.driftPpm - ppm) < 30.0, qPrintable(QString::number(stats.driftPpm)));
         QVERIFY2(std::abs(stats.bufferedMs - 60.0) < 15.0, qPrintable(QString::number(stats.bufferedMs)));
+    }
+
+    // shapeOutput() took over the per-sample code in render(), and anything that shows
+    // the output level uses it too. It must be that code exactly: volume, boost, clamp,
+    // in that order and in float, bit for bit, including at and past the edges.
+    void theOutputShapeIsExactlyTheCodeItReplaced()
+    {
+        const auto before = [](float x, float gain, bool boost) {  // render() in v0.1.1
+            float v = x * gain;
+            if (boost) v = std::tanh(v * 2.0f);
+            return std::clamp(v, -1.0f, 1.0f);
+        };
+        std::vector<float> inputs = {0.0f, -0.0f, 1e-40f, -1e-40f, 1e-8f, 0.25f, 0.5f, 0.999f, 1.0f, -1.0f,
+                                     1.0001f, 2.0f, 10.0f, 1e30f, -1e30f,
+                                     std::numeric_limits<float>::infinity(),
+                                     -std::numeric_limits<float>::infinity(),
+                                     std::numeric_limits<float>::quiet_NaN()};
+        for (int i = -4096; i <= 4096; ++i) inputs.push_back(float(i) / 1024.0f);
+        const float gains[] = {0.0f, 1e-6f, 0.001f, 0.0631f, 0.5f, 0.99f, 1.0f, 1.0116f, 2.0f, 31.62f};
+        int checked = 0;
+        for (float x : inputs) {
+            for (float gain : gains) {
+                for (bool boost : {false, true}) {
+                    const float got = esa::shapeOutput(x, gain, boost);
+                    const float want = before(x, gain, boost);
+                    QVERIFY2(std::memcmp(&got, &want, sizeof(float)) == 0,
+                             qPrintable(QStringLiteral("x %1, gain %2, boost %3: %4 against %5")
+                                            .arg(x).arg(gain).arg(boost).arg(got).arg(want)));
+                    ++checked;
+                }
+            }
+        }
+        QVERIFY(checked > 100000);
     }
 };
 

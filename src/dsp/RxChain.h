@@ -2,21 +2,19 @@
 
 #include "dsp/NrProcessor.h"
 #include "dsp/ParamSpec.h"
-
-#include "ClientComp.h"
-#include "ClientEq.h"
-#include "ClientGate.h"
-#include "ClientPudu.h"
-#include "ClientTube.h"
+#include "dsp/StageSet.h"
 
 #include <QByteArray>
 #include <QList>
 #include <QString>
 #include <QStringList>
 
+#include <atomic>
 #include <memory>
 
 namespace esa {
+
+class SpscStereoRing;
 
 // The AetherRX receive chain: at most one noise-reduction method, then Gate, EQ,
 // Comp, Tube and Pudu in an operator-chosen order. This mirrors
@@ -47,6 +45,17 @@ public:
     // TX gap. Leaving it clears transients but keeps the noise estimate.
     void setTransmitBypass(bool bypassed);
 
+    // The operator's BYPASS: the input passes through untouched, NR included, exactly
+    // as while transmitting, and leaving it clears transients the same way.
+    void setOperatorBypass(bool bypassed);
+    bool operatorBypassed() const { return m_operatorBypassed; }
+
+    // Post-EQ samples for the EQ's analyser, written straight after the EQ's place in
+    // the order whether or not the EQ is enabled, as upstream does. Only while
+    // `*wanted` is true, and never for an empty or bypassed block. A full ring drops
+    // the excess. Both must outlive the chain, or be replaced first; null detaches.
+    void setPostEqTap(SpscStereoRing* ring, const std::atomic<bool>* wanted);
+
     // Discontinuity: a different receiver or a reconnect.
     void reset();
 
@@ -57,9 +66,27 @@ public:
 
     bool setStageParam(const QString& key, double value);
 
+    // The parameter table on any set of stages, such as a display mirror that is never
+    // processed. False for a key that is not a stage parameter. read returns what the
+    // stages hold, which can differ from what was applied by float precision.
+    static bool applyStageParam(StageSet& stages, const QString& key, double value);
+    static bool readStageParam(const StageSet& stages, const QString& key, double* value);
+
     // Post-NR / pre-NR RMS ratio of the latest block; 1 when NR is idle.
     float nrGain() const { return m_nrGain; }
     bool nrActive() const { return m_nrActive; }
+
+    // Bits of lastRun(), one per stage.
+    enum StageBit : unsigned {
+        GateBit = 1u << 0,
+        EqBit = 1u << 1,
+        CompBit = 1u << 2,
+        TubeBit = 1u << 3,
+        PuduBit = 1u << 4,
+    };
+    // The stages that processed the latest block. 0 when it passed through untouched:
+    // every stage off, bypassed, or empty while a method's first block fills.
+    unsigned lastRun() const { return m_lastRun; }
 
     // Stage ids in upstream's default order.
     static QStringList stageIds();
@@ -69,25 +96,27 @@ public:
     // Gate, EQ, Comp, Tube and Pudu parameters.
     static const QList<ParamSpec>& stageParams();
 
-    AetherSDR::ClientGate& gate() { return m_gate; }
-    AetherSDR::ClientEq& eq() { return m_eq; }
-    AetherSDR::ClientComp& comp() { return m_comp; }
-    AetherSDR::ClientTube& tube() { return m_tube; }
-    AetherSDR::ClientPudu& pudu() { return m_pudu; }
+    StageSet& stages() { return m_stages; }
+    const StageSet& stages() const { return m_stages; }
+    AetherSDR::ClientGate& gate() { return m_stages.gate; }
+    AetherSDR::ClientEq& eq() { return m_stages.eq; }
+    AetherSDR::ClientComp& comp() { return m_stages.comp; }
+    AetherSDR::ClientTube& tube() { return m_stages.tube; }
+    AetherSDR::ClientPudu& pudu() { return m_stages.pudu; }
 
 private:
     const int m_sampleRate;
-    AetherSDR::ClientGate m_gate;
-    AetherSDR::ClientEq m_eq;
-    AetherSDR::ClientComp m_comp;
-    AetherSDR::ClientTube m_tube;
-    AetherSDR::ClientPudu m_pudu;
+    StageSet m_stages;
     std::shared_ptr<NrProcessor> m_nr;
     QStringList m_order;
     bool m_nrBypassed{false};
     bool m_txBypassed{false};
+    bool m_operatorBypassed{false};
     bool m_nrActive{false};
     float m_nrGain{1.0f};
+    unsigned m_lastRun{0};
+    SpscStereoRing* m_eqTap{nullptr};
+    const std::atomic<bool>* m_eqTapWanted{nullptr};
     QByteArray m_output;
 };
 

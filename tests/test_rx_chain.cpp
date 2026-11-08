@@ -1,10 +1,15 @@
+#include "ReferenceChain.h"
+
+#include "audio/SpscRing.h"
 #include "dsp/NrProcessor.h"
 #include "dsp/RxChain.h"
 
 #include <QtTest>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstring>
 #include <memory>
 #include <random>
 #include <vector>
@@ -226,6 +231,68 @@ std::shared_ptr<NrProcessor> makeMethod(const NrMethod& method, int rate)
         for (const ParamSpec& spec : method.params) processor->setParam(spec.key, spec.def);
     }
     return processor;
+}
+
+// Counts what the chain asks of its method. Halves the level, so whether it ran shows.
+class CountingNr final : public NrProcessor {
+public:
+    void process(const QByteArray& in, QByteArray& out) override
+    {
+        ++processed;
+        if (swallow) {  // a method still filling its first block
+            out.clear();
+            return;
+        }
+        out = in;
+        auto* samples = reinterpret_cast<float*>(out.data());
+        for (qsizetype i = 0; i < out.size() / qsizetype(sizeof(float)); ++i) samples[i] *= 0.5f;
+    }
+    void reset() override { ++resets; }
+    void resetTransient() override { ++transientResets; }
+    void setParam(const QString&, double) override {}
+
+    bool swallow{false};
+    int processed{0};
+    int resets{0};
+    int transientResets{0};
+};
+
+double rounded(double value, int decimals)
+{
+    const double scale = std::pow(10.0, decimals);
+    return std::round(value * scale) / scale;
+}
+
+double rmsOf(const QByteArray& pcm)
+{
+    const auto* samples = reinterpret_cast<const float*>(pcm.constData());
+    const qsizetype count = pcm.size() / qsizetype(sizeof(float));
+    double sum = 0.0;
+    for (qsizetype i = 0; i < count; ++i) sum += double(samples[i]) * samples[i];
+    return count ? std::sqrt(sum / double(count)) : 0.0;
+}
+
+QByteArray drain(SpscStereoRing& ring)
+{
+    QByteArray bytes(qsizetype(ring.size()) * 2 * qsizetype(sizeof(float)), Qt::Uninitialized);
+    const size_t read = ring.read(reinterpret_cast<float*>(bytes.data()), ring.size());
+    bytes.truncate(qsizetype(read) * 2 * qsizetype(sizeof(float)));
+    return bytes;
+}
+
+// v0.1.1's chain, through RxChain, the way the engine builds it from a configuration:
+// every key in this table's order, with the default for any the settings lack.
+void applyLikeTheEngine(RxChain& chain, const QHash<QString, double>& settings)
+{
+    for (const ParamSpec& spec : RxChain::stageParams()) chain.setStageParam(spec.key, settings.value(spec.key, spec.def));
+}
+
+const ParamSpec* stageSpec(const QString& key)
+{
+    for (const ParamSpec& spec : RxChain::stageParams()) {
+        if (spec.key == key) return &spec;
+    }
+    return nullptr;
 }
 
 } // namespace
@@ -461,6 +528,71 @@ private slots:
         }
     }
 
+    // The NR page shows all seven of upstream's methods, and a missing one must say why.
+    void everyUpstreamMethodIsAvailableOrSaysWhyNot()
+    {
+        for (const char* id : {"nr2", "nr4", "mnr", "dfnr", "rn2", "bnr", "nnr"}) {
+            const QString method = QString::fromLatin1(id);
+            const QString reason = nrMethodUnavailableReason(method);
+            QVERIFY2(reason.isEmpty() == (findNrMethod(method) != nullptr), id);
+        }
+        QVERIFY(nrMethodUnavailableReason(QStringLiteral("nr2")).isEmpty());
+        QVERIFY(nrMethodUnavailableReason(QStringLiteral("rn2")).isEmpty());
+        QCOMPARE(nrMethodUnavailableReason(QStringLiteral("bnr")), QStringLiteral("Not available in this build"));
+#ifndef __APPLE__
+        QCOMPARE(nrMethodUnavailableReason(QStringLiteral("mnr")), QStringLiteral("Needs macOS"));
+#endif
+#ifndef HAVE_DFNR
+        QCOMPARE(nrMethodUnavailableReason(QStringLiteral("dfnr")), QStringLiteral("Not built into this version"));
+#endif
+    }
+
+    // Display hints for the NR page. They must never change a value or a range.
+    void nrParamsCarryThePagesHints()
+    {
+        for (const NrMethod& method : nrMethods()) {
+            for (const ParamSpec& spec : method.params) QVERIFY2(!spec.section.isEmpty(), qPrintable(spec.key));
+        }
+        const NrMethod* nr2 = findNrMethod(QStringLiteral("nr2"));
+        QVERIFY(nr2);
+        int fills = 0;
+        for (const ParamSpec& spec : nr2->params) {
+            if (!spec.enabledByKey.isEmpty()) {
+                QCOMPARE(spec.enabledByKey, QStringLiteral("nr2.post2"));
+                QCOMPARE(spec.enabledByValue, 1.0);
+                ++fills;
+            }
+        }
+        QCOMPARE(fills, 3);  // level, character and band
+        if (const NrMethod* mnr = findNrMethod(QStringLiteral("mnr"))) QVERIFY(mnr->params.first().percent);
+    }
+
+    // The fill character reaches the filter: with the fill on, it changes what is heard.
+    void nr2FillCharacterChangesTheFill()
+    {
+        const NrMethod* nr2 = findNrMethod(QStringLiteral("nr2"));
+        QVERIFY(nr2);
+        const QByteArray in = makeNoisyBursts(48000, 2.0);
+        const auto run = [&](double factor) {
+            std::shared_ptr<NrProcessor> processor(nr2->create(48000).release());
+            for (const ParamSpec& spec : nr2->params) processor->setParam(spec.key, spec.def);
+            processor->setParam(QStringLiteral("nr2.post2"), 1);
+            processor->setParam(QStringLiteral("nr2.post2Level"), 1);
+            processor->setParam(QStringLiteral("nr2.post2Factor"), factor);
+            RxChain chain(48000);
+            chain.setNrProcessor(processor);
+            return runThrough(chain, in);
+        };
+        // The fill's noise is seeded per filter, so two runs never match sample for
+        // sample. Compare levels instead, against how far two identical runs differ:
+        // all synthetic white noise (1) against all of the noise actually removed (0).
+        const double removed = rmsOf(run(0.0));
+        const double white = rmsOf(run(1.0));
+        const double seedSpread = std::fabs(rmsOf(run(0.15)) - rmsOf(run(0.15)));
+        qInfo() << "fill rms: removed noise" << removed << "white" << white << "seed spread" << seedSpread;
+        QVERIFY(std::fabs(white - removed) > 10.0 * seedSpread + 1e-4);
+    }
+
     void stageParamsHaveSaneRangesAndAllApply()
     {
         RxChain chain(48000);
@@ -487,6 +619,281 @@ private slots:
             else if (spec.key.startsWith(QLatin1String("gate."))) chain.setStageParam(spec.key, spec.def);
         }
         QCOMPARE(chain.gate().ratio(), 3.5f);
+    }
+
+    // ── The table and StageSet ───────────────────────────────────────────────
+
+    // Every stage key through the table and back, on a set of stages that is never
+    // processed, as the window's display mirror is used. A read that drifts from its
+    // apply shows here.
+    void everyStageParamReadsBackWhatWasApplied()
+    {
+        for (const ParamSpec& spec : RxChain::stageParams()) {
+            QList<double> values;
+            if (spec.toggle || !spec.choices.isEmpty()) {
+                for (int i = int(spec.min); i <= int(spec.max); ++i) values << double(i);
+            } else {
+                const double step = std::pow(10.0, -spec.decimals);
+                values << spec.min << spec.max << spec.def
+                       << rounded(spec.min + 0.37 * (spec.max - spec.min), spec.decimals)
+                       << rounded(spec.max - step, spec.decimals);  // the finest step the table keeps
+            }
+            for (double value : values) {
+                StageSet stages;
+                stages.prepare(48000);
+                stages.initialiseBands();
+                QVERIFY2(RxChain::applyStageParam(stages, spec.key, value), qPrintable(spec.key));
+                double read = 0.0;
+                QVERIFY2(RxChain::readStageParam(stages, spec.key, &read), qPrintable(spec.key));
+                QVERIFY2(rounded(read, spec.decimals) == rounded(value, spec.decimals),
+                         qPrintable(QStringLiteral("%1: applied %2, read %3").arg(spec.key).arg(value).arg(read)));
+            }
+        }
+        StageSet stages;
+        double read = 0.0;
+        QVERIFY(!RxChain::applyStageParam(stages, QStringLiteral("no.such"), 1.0));
+        QVERIFY(!RxChain::readStageParam(stages, QStringLiteral("no.such"), &read));
+    }
+
+    // A profile names keys; renaming or dropping one would silently lose it on load.
+    void everyKeyAnOlderVersionSavedIsStillInTheTable()
+    {
+        for (const QString& key : reference::OldChain::keys()) QVERIFY2(stageSpec(key), qPrintable(key));
+    }
+
+    // The refactor moved the stages into StageSet and the table onto it. The same
+    // settings must still give the same samples, bit for bit, as v0.1.1's chain.
+    void theChainSoundsExactlyAsBeforeStageSet_data()
+    {
+        QTest::addColumn<int>("rate");
+        QTest::newRow("48 kHz") << 48000;
+        QTest::newRow("24 kHz") << 24000;
+    }
+
+    void theChainSoundsExactlyAsBeforeStageSet()
+    {
+        QFETCH(int, rate);
+        const QHash<QString, double> settings = reference::OldChain::v011Settings();
+        const QStringList order = {QStringLiteral("tube"), QStringLiteral("gate"), QStringLiteral("pudu"),
+                                   QStringLiteral("eq"), QStringLiteral("comp")};
+
+        RxChain chain(rate);
+        chain.setStageOrder(order);
+        applyLikeTheEngine(chain, settings);
+
+        reference::OldChain old(rate);
+        old.setOrder(order);
+        for (const QString& key : reference::OldChain::keys()) QVERIFY(old.set(key, settings.value(key, stageSpec(key)->def)));
+
+        const QByteArray in = makeNoisyBursts(rate, 3.0);
+        QByteArray expected;
+        const int blockBytes = 512 * 2 * int(sizeof(float));
+        for (qsizetype offset = 0; offset + blockBytes <= in.size(); offset += blockBytes) {
+            expected += old.process(in.mid(offset, blockBytes));
+        }
+        const QByteArray out = runThrough(chain, in);
+        QVERIFY(out != in.left(out.size()));  // the stages did something
+        QCOMPARE(out.size(), expected.size());
+        QVERIFY2(std::memcmp(out.constData(), expected.constData(), size_t(out.size())) == 0,
+                 "a sample differs from v0.1.1's chain");
+        QCOMPARE(chain.lastRun(), unsigned(RxChain::GateBit | RxChain::EqBit | RxChain::CompBit | RxChain::TubeBit
+                                           | RxChain::PuduBit));
+    }
+
+    void theTableNamesWhatThePagesShow()
+    {
+        QCOMPARE(stageSpec(QStringLiteral("tube.model"))->choices,
+                 (QStringList{QStringLiteral("A"), QStringLiteral("B"), QStringLiteral("C")}));
+        QCOMPARE(stageSpec(QStringLiteral("pudu.mode"))->choices, (QStringList{QStringLiteral("Even"), QStringLiteral("Odd")}));
+        // The DSP stops at +12 dB, so a larger value would only have been a dead stretch of knob.
+        QCOMPARE(stageSpec(QStringLiteral("tube.output"))->max, 12.0);
+        for (int band = 0; band < AetherSDR::ClientEq::kDefaultBandCount; ++band) {
+            const ParamSpec* type = stageSpec(QStringLiteral("eq.b%1.type").arg(band));
+            const ParamSpec* slope = stageSpec(QStringLiteral("eq.b%1.slope").arg(band));
+            QVERIFY(type && slope);
+            QCOMPARE(type->choices.size(), 5);
+            QCOMPARE(slope->choices.size(), 4);
+            QCOMPARE(slope->def, 0.0);  // 12 dB/oct, what every band had
+        }
+    }
+
+    // Each key keeps at least the precision its vendored page shows (the label formats
+    // in Strip*Panel.cpp at the vendored commit), so a value read off a knob saves as
+    // shown: 2.55:1 must not come back as 2.6:1.
+    void decimalsMatchWhatThePagesShow_data()
+    {
+        QTest::addColumn<QString>("key");
+        QTest::addColumn<int>("decimals");
+        const QList<QPair<const char*, int>> shown = {
+            {"gate.threshold", 1}, {"gate.return", 2}, {"gate.hold", 1}, {"gate.release", 1},
+            {"gate.floor", 1}, {"gate.ratio", 1}, {"gate.lookahead", 1},
+            {"comp.threshold", 1}, {"comp.ratio", 2}, {"comp.attack", 1}, {"comp.release", 0},
+            {"comp.knee", 1}, {"comp.makeup", 1}, {"comp.ceiling", 1},
+            {"tube.drive", 2}, {"tube.tone", 2}, {"tube.bias", 2}, {"tube.envelope", 2},
+            {"tube.release", 1}, {"tube.output", 2}, {"tube.mix", 2},
+            {"pudu.pooDrive", 1}, {"pudu.pooTune", 0}, {"pudu.pooMix", 2}, {"pudu.dooTune", 0},
+            {"pudu.dooHarmonics", 1}, {"pudu.dooMix", 2},
+            {"eq.b4.freq", 0}, {"eq.b4.gain", 1}, {"eq.b4.q", 2},
+        };
+        for (const auto& [key, decimals] : shown) QTest::newRow(key) << QString::fromLatin1(key) << decimals;
+    }
+
+    void decimalsMatchWhatThePagesShow()
+    {
+        QFETCH(QString, key);
+        QFETCH(int, decimals);
+        QVERIFY(stageSpec(key));
+        QCOMPARE(stageSpec(key)->decimals, decimals);
+    }
+
+    // ── EQ band type and slope ───────────────────────────────────────────────
+
+    void bandTypeAndSlopeChangeTheSound()
+    {
+        const QByteArray in = makeNoisyBursts(48000, 1.0);
+        const auto run = [&](const QList<QPair<const char*, double>>& settings) {
+            RxChain chain(48000);
+            chain.setStageParam(QStringLiteral("eq.enabled"), 1);
+            for (const auto& [key, value] : settings) chain.setStageParam(QString::fromLatin1(key), value);
+            return runThrough(chain, in);
+        };
+
+        // Band 5, a peak by default, raised 12 dB.
+        const QByteArray peak = run({{"eq.b4.on", 1}, {"eq.b4.gain", 12}});
+        QCOMPARE(run({{"eq.b4.on", 1}, {"eq.b4.gain", 12}, {"eq.b4.type", 2}}), peak);  // the type it always had
+        const QByteArray shelf = run({{"eq.b4.on", 1}, {"eq.b4.gain", 12}, {"eq.b4.type", 1}});
+        QVERIFY(shelf != peak);
+        QVERIFY(rmsOf(shelf) > rmsOf(peak));  // a low shelf lifts everything below, not one band
+
+        // Band 1, a high-pass by default, moved up to 1 kHz.
+        const QByteArray gentle = run({{"eq.b0.on", 1}, {"eq.b0.freq", 1000}});
+        QCOMPARE(run({{"eq.b0.on", 1}, {"eq.b0.freq", 1000}, {"eq.b0.slope", 0}}), gentle);  // 12 dB/oct, as always
+        const QByteArray steep = run({{"eq.b0.on", 1}, {"eq.b0.freq", 1000}, {"eq.b0.slope", 3}});
+        QVERIFY(steep != gentle);
+        QVERIFY(rmsOf(steep) < rmsOf(gentle));  // 48 dB/oct removes more of the speech below 1 kHz
+    }
+
+    // ── Operator bypass, the run mask and the post-EQ tap ────────────────────
+
+    void operatorBypassPassesTheRadioThroughUntouched()
+    {
+        RxChain chain(48000);
+        auto nr = std::make_shared<CountingNr>();
+        chain.setNrProcessor(nr);
+        chain.setStageParam(QStringLiteral("tube.enabled"), 1);
+        chain.setStageParam(QStringLiteral("tube.drive"), 18);
+        chain.setStageParam(QStringLiteral("eq.enabled"), 1);
+        chain.setStageParam(QStringLiteral("eq.b4.on"), 1);
+        chain.setStageParam(QStringLiteral("eq.b4.gain"), 12);
+        const QByteArray in = makeNoisyBursts(48000, 0.5);
+
+        chain.setOperatorBypass(true);
+        QVERIFY(chain.operatorBypassed());
+        const QByteArray bypassed = runThrough(chain, in);
+        QVERIFY(!bypassed.isEmpty());
+        QVERIFY(bypassed == in.left(bypassed.size()));  // bit for bit, NR included
+        QCOMPARE(nr->processed, 0);
+        QVERIFY(!chain.nrActive());
+        QCOMPARE(chain.lastRun(), 0u);
+
+        chain.setOperatorBypass(false);
+        QCOMPARE(nr->transientResets, 1);  // what played meanwhile is not the noise it knew
+        QCOMPARE(nr->resets, 0);           // but the band is the same, so its estimate is kept
+        QVERIFY(runThrough(chain, in) != bypassed);
+        QVERIFY(nr->processed > 0);
+        chain.setOperatorBypass(false);
+        QCOMPARE(nr->transientResets, 1);  // not leaving it twice
+    }
+
+    void theRunMaskNamesOnlyTheStagesThatRan()
+    {
+        RxChain chain(48000);
+        const QByteArray block = makeNoisyBursts(48000, 0.1).left(512 * 2 * int(sizeof(float)));
+        chain.process(block);
+        QCOMPARE(chain.lastRun(), 0u);  // all disabled, as they start
+
+        chain.setStageParam(QStringLiteral("gate.enabled"), 1);
+        chain.setStageParam(QStringLiteral("comp.enabled"), 1);
+        chain.process(block);
+        QCOMPARE(chain.lastRun(), unsigned(RxChain::GateBit | RxChain::CompBit));
+
+        for (const QString& id : RxChain::stageIds()) chain.setStageParam(id + QStringLiteral(".enabled"), 1);
+        const unsigned all = RxChain::GateBit | RxChain::EqBit | RxChain::CompBit | RxChain::TubeBit | RxChain::PuduBit;
+        chain.process(block);
+        QCOMPARE(chain.lastRun(), all);
+
+        chain.setTransmitBypass(true);
+        chain.process(block);
+        QCOMPARE(chain.lastRun(), 0u);
+        chain.setTransmitBypass(false);
+        chain.process(block);
+        QCOMPARE(chain.lastRun(), all);
+
+        chain.setOperatorBypass(true);
+        chain.process(block);
+        QCOMPARE(chain.lastRun(), 0u);
+        chain.setOperatorBypass(false);
+        chain.process(block);
+        QCOMPARE(chain.lastRun(), all);
+
+        auto nr = std::make_shared<CountingNr>();
+        nr->swallow = true;
+        chain.setNrProcessor(nr);
+        QVERIFY(chain.process(block).isEmpty());
+        QCOMPARE(chain.lastRun(), 0u);  // an empty block ran nothing
+    }
+
+    void thePostEqTapCarriesWhatTheEqPassedOn()
+    {
+        SpscStereoRing ring(48000);
+        std::atomic<bool> wanted{false};
+        const QByteArray in = makeNoisyBursts(48000, 0.5).left(8 * 512 * 2 * int(sizeof(float)));
+
+        RxChain chain(48000);
+        chain.setPostEqTap(&ring, &wanted);
+        chain.setStageOrder({QStringLiteral("eq"), QStringLiteral("tube")});
+        chain.setStageParam(QStringLiteral("tube.enabled"), 1);
+        chain.setStageParam(QStringLiteral("tube.drive"), 18);
+        runThrough(chain, in);
+        QCOMPARE(ring.size(), size_t(0));  // nobody asked
+
+        wanted = true;
+        const QByteArray out = runThrough(chain, in);
+        // The EQ is off, and its place is still tapped, as upstream does: the radio's
+        // audio, before the tube after it shaped it.
+        QCOMPARE(drain(ring), in);
+        QVERIFY(out != in);
+
+        // On, the tap holds the EQ's own output.
+        const auto raise = [](RxChain& c) {
+            c.setStageParam(QStringLiteral("eq.enabled"), 1);
+            c.setStageParam(QStringLiteral("eq.b4.on"), 1);
+            c.setStageParam(QStringLiteral("eq.b4.gain"), 12);
+        };
+        raise(chain);
+        runThrough(chain, in);
+        RxChain eqOnly(48000);
+        raise(eqOnly);
+        QCOMPARE(drain(ring), runThrough(eqOnly, in));
+
+        // Nothing while bypassed, whichever bypass.
+        chain.setOperatorBypass(true);
+        runThrough(chain, in);
+        chain.setOperatorBypass(false);
+        chain.setTransmitBypass(true);
+        runThrough(chain, in);
+        chain.setTransmitBypass(false);
+        QCOMPARE(ring.size(), size_t(0));
+
+        // A full ring drops what does not fit, and the chain plays on.
+        SpscStereoRing small(1000);
+        chain.setPostEqTap(&small, &wanted);
+        QCOMPARE(runThrough(chain, in).size(), in.size());
+        QCOMPARE(small.size(), size_t(1000));
+
+        chain.setPostEqTap(nullptr, nullptr);
+        runThrough(chain, in);
+        QCOMPARE(ring.size(), size_t(0));
     }
 };
 

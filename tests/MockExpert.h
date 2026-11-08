@@ -45,6 +45,9 @@ public:
     void operatorSetModulation(const QString& mode);
     void operatorSetTransmit(bool transmitting);
     void operatorRestartDsp();
+    // The stream changes rate on its own, whatever the client asked for: a server that ignores
+    // the request. The block period stays as it was.
+    void operatorSetStreamRate(int hz);
 
     void sendBinary(const QByteArray& frame);
     void dropClient();
@@ -60,7 +63,6 @@ private:
     void sendInitBurst();
     void push(const QString& text);
 
-    QWebSocketServer m_server;
     QPointer<QWebSocket> m_client;
     QTimer m_tick;
     QTimer m_stream;
@@ -69,4 +71,7 @@ private:
     int m_receiver{-1};
     quint32 m_counter{0};
     qint64 m_phase{0};
+    // Last, so it goes first: it deletes any socket still open, whose disconnected handler
+    // (onNewConnection) still uses the timers above. macOS's Qt 6.4.2 emits there and crashed.
+    QWebSocketServer m_server;
 };

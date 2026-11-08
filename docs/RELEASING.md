@@ -134,5 +134,11 @@ SMOKE_METHODS="nr2 nr4 mnr dfnr rn2 nnr" scripts/smoke-test.sh \
   are left to the host on purpose. The list CI tests against is in `build.yml`.
 - **linuxdeploy comes from its rolling `continuous` release,** as it publishes no stable ones, so
   an AppImage build can break through no change here.
+- **Disconnecting and quitting wait for every recording to be written out,** however long the
+  disk takes, so no file is left with a stale header. ExpertSDR3's mute is restored first. A
+  folder on a disk that stops answering (a network share, a USB disk pulled mid-write) would
+  hang the disconnect, and the window with it on Quit; no test can stall a real disk, so check
+  it by hand before a release that changes recording: record to a network folder, cut the
+  network, and quit.
 - **The DeepFilterNet library is AetherSDR's prebuilt one,** checked against the SHA-256 pinned in
   its setup script, and built from source if unavailable.

@@ -178,6 +178,11 @@ void MockExpert::operatorRestartDsp()
     push(QStringLiteral("start;"));
 }
 
+void MockExpert::operatorSetStreamRate(int hz)
+{
+    m_sampleRate = hz;
+}
+
 void MockExpert::dropClient()
 {
     if (m_client) m_client->abort();

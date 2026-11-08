@@ -9,6 +9,7 @@
 #include "gui/MainWindow.h"
 #include "gui/ParamWidgets.h"
 #include "gui/RadioDiscoveryDialog.h"
+#include "gui/aether/Appearance.h"
 
 #include <QApplication>
 #include <QCheckBox>
@@ -24,7 +25,7 @@
 #include <QPushButton>
 #include <QSpinBox>
 #include <QSlider>
-#include <QTabWidget>
+#include <QStandardPaths>
 #include <QTcpServer>
 #include <QTemporaryDir>
 #include <QtTest>
@@ -52,7 +53,8 @@ private:
         m_engine = std::make_unique<Engine>(path);
         m_settings = std::make_unique<Settings>(path);
         m_profiles = std::make_unique<ProfileLibrary>(ProfileLibrary::defaultPath(path));
-        m_window = std::make_unique<MainWindow>(m_engine.get(), m_settings.get(), m_profiles.get(), config);
+        m_window = std::make_unique<MainWindow>(m_engine.get(), m_engine->taps(), m_settings.get(), m_profiles.get(),
+                                                config);
         m_window->show();
         QCoreApplication::processEvents();
     }
@@ -67,6 +69,13 @@ private:
     }
 
 private slots:
+    void initTestCase()
+    {
+        // Caches the pages write (AetherSDR's painted check boxes) go to the test location.
+        QStandardPaths::setTestModeEnabled(true);
+        Appearance::install();  // the look main() sets up, so tests see it too
+    }
+
     void cleanup()
     {
         m_window.reset();
@@ -82,18 +91,17 @@ private slots:
     void everyTabRendersAndCanBeCaptured()
     {
         make(AppConfig{});
-        auto* tabs = m_window->findChild<QTabWidget*>();
-        QVERIFY(tabs);
-        QCOMPARE(tabs->count(), 7);
+        const QStringList pages = m_window->pageIds();
+        // Radio, AetherNR, Gate, EQ, Compressor, Tube, Exciter and Final Output.
+        QCOMPARE(pages.size(), 8);
         const QString shots = qEnvironmentVariable("ESA_GUI_SHOT_DIR");
-        for (int i = 0; i < tabs->count(); ++i) {
-            tabs->setCurrentIndex(i);
+        for (const QString& page : pages) {
+            m_window->showPage(page);
             QCoreApplication::processEvents();
+            QCOMPARE(m_window->currentPage(), page);
             const QPixmap shot = m_window->grab();
             QVERIFY(!shot.isNull());
-            if (!shots.isEmpty()) {
-                shot.save(QDir(shots).filePath(QStringLiteral("tab-%1.png").arg(tabs->tabText(i))));
-            }
+            if (!shots.isEmpty()) shot.save(QDir(shots).filePath(QStringLiteral("page-%1.png").arg(page)));
         }
     }
 
@@ -102,7 +110,6 @@ private slots:
     {
         make(AppConfig{});
         for (const ParamSpec& spec : RxChain::stageParams()) {
-            if (spec.key.startsWith(QLatin1String("eq.b"))) continue;  // the EQ's own table
             QVERIFY2(control(spec.key), qPrintable(spec.key));
         }
         for (const NrMethod& method : nrMethods()) {
@@ -110,14 +117,15 @@ private slots:
         }
     }
 
-    void theEqTableHasARowForEveryBand()
+    void theEqHasControlsForEveryBand()
     {
         make(AppConfig{});
-        auto* tabs = m_window->findChild<QTabWidget*>();
-        QWidget* eq = tabs->widget(2);
-        const auto spins = eq->findChildren<QDoubleSpinBox*>();
-        // Frequency, gain and Q per band, plus the output level's own spin box.
-        QCOMPARE(int(spins.size()), AetherSDR::ClientEq::kDefaultBandCount * 3 + 1);
+        for (int band = 0; band < AetherSDR::ClientEq::kDefaultBandCount; ++band) {
+            for (const char* leaf : {"on", "freq", "gain", "q", "type", "slope"}) {
+                const QString key = QStringLiteral("eq.b%1.%2").arg(band).arg(QLatin1String(leaf));
+                QVERIFY2(control(key), qPrintable(key));
+            }
+        }
     }
 
     void aControlShowsTheStoredValue()
@@ -180,13 +188,20 @@ private slots:
         return nullptr;
     }
 
-    QStringList orderShown()
+    // The chain stages as the rail shows them, top to bottom.
+    QStringList railOrder()
     {
-        QStringList order;
-        const auto lists = m_window->findChildren<QListWidget*>();
-        for (QListWidget* list : lists) {
-            for (int i = 0; i < list->count(); ++i) order << list->item(i)->data(Qt::UserRole).toString();
+        QCoreApplication::processEvents();  // the rail re-lays its rows out on the next pass
+        QList<QPair<int, QString>> rows;
+        for (const QString& stage : RxChain::stageIds()) {
+            const QString name = QStringLiteral("aetherRxTab") + RxChain::stageLabel(stage).remove(QLatin1Char(' '));
+            auto* tab = m_window->findChild<QPushButton*>(name);
+            if (!tab) return {};
+            rows.append({tab->mapTo(m_window.get(), QPoint()).y(), stage});
         }
+        std::sort(rows.begin(), rows.end());
+        QStringList order;
+        for (const auto& row : rows) order << row.second;
         return order;
     }
 
@@ -210,23 +225,25 @@ private slots:
         control(QStringLiteral("comp.threshold"))->setValue(-30);
         control(QStringLiteral("gate.mode"))->setValue(1);
         control(QStringLiteral("gate.ratio"))->setValue(3.5);  // not the preset the mode implies
-        m_window->findChild<QTabWidget*>()->setCurrentIndex(0);
-        const auto combos = m_window->findChildren<QComboBox*>();
-        for (QComboBox* combo : combos) {
-            const int index = combo->findData(QStringLiteral("rn2"));
-            if (index >= 0) combo->setCurrentIndex(index);
-        }
+        // RN2, chosen on the AetherNR page as the operator would.
+        m_window->showPage(QStringLiteral("nr"));
+        auto* method = m_window->findChild<QComboBox*>(QStringLiteral("nrMethod"));
+        QVERIFY(method);
+        QVERIFY(method->findData(QStringLiteral("rn2")) >= 0);
+        method->setCurrentIndex(method->findData(QStringLiteral("rn2")));
         QVERIFY(m_window->saveProfileAs(QStringLiteral("Mine")));
 
         m_window->loadProfile(QString());
         QCOMPARE(control(QStringLiteral("comp.threshold"))->value(), -18.0);
         QCOMPARE(control(QStringLiteral("gate.mode"))->value(), 0.0);
+        QCOMPARE(method->currentData().toString(), QString());
         QCOMPARE(m_window->currentProfile(), QString());
         QVERIFY(!m_window->chainModified());
 
         m_window->loadProfile(QStringLiteral("Mine"));
         QCOMPARE(control(QStringLiteral("comp.threshold"))->value(), -30.0);
         QCOMPARE(control(QStringLiteral("gate.mode"))->value(), 1.0);
+        QCOMPARE(method->currentData().toString(), QStringLiteral("rn2"));
         // Upstream's mode is a preset overwriting ratio; the saved value has to win over it.
         QCOMPARE(control(QStringLiteral("gate.ratio"))->value(), 3.5);
         QVERIFY(!m_window->chainModified());
@@ -243,16 +260,10 @@ private slots:
         QVERIFY(m_profiles->save(QStringLiteral("EQ"), chain));
 
         m_window->loadProfile(QStringLiteral("EQ"));
-        QCOMPARE(orderShown(), chain.stageOrder);
-        auto* tabs = m_window->findChild<QTabWidget*>();
-        bool sawFrequency = false;
-        const auto spins = tabs->widget(2)->findChildren<QDoubleSpinBox*>();
-        for (QDoubleSpinBox* spin : spins) sawFrequency = sawFrequency || spin->value() == 850.0;
-        QVERIFY(sawFrequency);
-        bool sawEnabled = false;
-        const auto checks = tabs->widget(2)->findChildren<QCheckBox*>();
-        for (QCheckBox* check : checks) sawEnabled = sawEnabled || (check->text().startsWith(QLatin1String("5 ")) && check->isChecked());
-        QVERIFY(sawEnabled);
+        QCOMPARE(m_window->stageOrder(), chain.stageOrder);  // what the rail's host answers
+        QCOMPARE(railOrder(), chain.stageOrder);             // and what the rail shows
+        QCOMPARE(control(QStringLiteral("eq.b4.freq"))->value(), 850.0);
+        QCOMPARE(control(QStringLiteral("eq.b4.on"))->value(), 1.0);
     }
 
     void aProfileLeavesTheStationSettingsAlone()
@@ -265,11 +276,13 @@ private slots:
         chain.nrMethod = QStringLiteral("rn2");
         QVERIFY(m_profiles->save(QStringLiteral("X"), chain));
         m_window->loadProfile(QStringLiteral("X"));
-        QCOMPARE(m_window->findChild<QLineEdit*>()->text(), QStringLiteral("10.0.0.9"));
-        const auto sliders = m_window->findChildren<QSlider*>();
-        bool sawVolume = false;
-        for (QSlider* slider : sliders) sawVolume = sawVolume || (slider->minimum() == -60 && slider->value() == -12);
-        QVERIFY(sawVolume);
+        auto* host = m_window->findChild<QLineEdit*>(QStringLiteral("host"));
+        QVERIFY(host);
+        QCOMPARE(host->text(), QStringLiteral("10.0.0.9"));
+        auto* volume = m_window->findChild<QSlider*>(QStringLiteral("volume"));
+        QVERIFY(volume);
+        QCOMPARE(volume->minimum(), -60);
+        QCOMPARE(volume->value(), -12);
     }
 
     void changingAnythingShowsAsModified()
@@ -282,8 +295,9 @@ private slots:
         control(QStringLiteral("tube.drive"))->setValue(0);
         QVERIFY2(!m_window->chainModified(), "back to the saved value is not a change");
 
-        const auto spins = m_window->findChild<QTabWidget*>()->widget(2)->findChildren<QDoubleSpinBox*>();
-        spins.last()->setValue(spins.last()->value() + 1);
+        ParamControl* q = control(QStringLiteral("eq.b9.q"));
+        QVERIFY(q);
+        q->setValue(q->value() + 1);
         QVERIFY2(m_window->chainModified(), "the EQ table counts too");
     }
 
@@ -449,7 +463,9 @@ private slots:
         picked.port = radio.port();
         m_window->connectToRadio(picked);
         QTRY_VERIFY_WITH_TIMEOUT(radio.audioStartCount() == 1, 6000);
-        QCOMPARE(m_window->findChild<QLineEdit*>()->text(), QStringLiteral("127.0.0.1"));
+        auto* host = m_window->findChild<QLineEdit*>(QStringLiteral("host"));
+        QVERIFY(host);
+        QCOMPARE(host->text(), QStringLiteral("127.0.0.1"));
         const auto spins = m_window->findChildren<QSpinBox*>();
         bool sawPort = false;
         for (QSpinBox* spin : spins) sawPort = sawPort || spin->value() == radio.port();

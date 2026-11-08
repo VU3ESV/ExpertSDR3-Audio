@@ -224,32 +224,103 @@ if(ENABLE_DFNR)
     endif()
 endif()
 
+# ── The AetherRX pages, compiled unmodified from vendor/ ─────────────────────
+# The seven stage panels and their widgets, the rail and the theme, as
+# scripts/sync-aether.sh copied them from the list in scripts/aether-gui-files.txt.
+# They are built against our stand-ins for the three upstream headers they need but
+# that are not vendored (src/gui/aether/shim/core/), and against forked copies of the
+# few files that need changing to build here (src/gui/aether/fork/). Appearance.cpp,
+# ours, gives our window the same theme, font and ground.
+set(AETHER_GUI_DIR ${AETHER_DIR}/src/gui)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/scripts/aether-gui-files.txt)
+file(STRINGS ${CMAKE_SOURCE_DIR}/scripts/aether-gui-files.txt AETHER_GUI_SOURCES REGEX "\\.cpp$")
+list(FILTER AETHER_GUI_SOURCES EXCLUDE REGEX "^#")
+list(TRANSFORM AETHER_GUI_SOURCES PREPEND ${AETHER_GUI_DIR}/)
+
+add_library(aether_gui STATIC
+    ${AETHER_GUI_SOURCES}
+    ${CORE}/ThemeManager.cpp
+    ${CORE}/ThemeSeedGenerated.cpp     # the compiled-in theme ThemeManager starts from
+    src/gui/aether/shim/core/AudioEngine.h  # a QObject with no .cpp of its own name, so moc is told
+    src/gui/aether/AudioEngineShim.cpp
+    src/gui/aether/AppSettingsShim.cpp
+    src/gui/aether/LogShim.cpp
+    src/gui/aether/Appearance.cpp
+    src/gui/aether/fork/CanonGround.cpp
+    src/gui/aether/fork/NrGainStrip.cpp)
+target_include_directories(aether_gui PUBLIC
+    src/gui/aether/shim       # "core/AudioEngine.h", as the pages spell it
+    src/gui/aether/shim/core  # "AppSettings.h" and "LogManager.h", as ThemeManager.cpp does
+    src/gui/aether/fork       # a fork is included by the name its upstream file had
+    ${AETHER_DIR}/src ${AETHER_GUI_DIR} ${CORE})
+target_link_libraries(aether_gui PUBLIC aether_dsp Qt6::Widgets)
+# The one theme the pages are drawn in (ThemeManager scans :/themes/), and the font it
+# names. Qt links a static library's resources into whatever links the library;
+# test_aether_gui checks they arrive.
+qt_add_resources(aether_gui "aether_theme"
+    PREFIX "/themes"
+    BASE ${AETHER_DIR}/resources/themes
+    FILES ${AETHER_DIR}/resources/themes/default-dark.json)
+qt_add_resources(aether_gui "aether_fonts"
+    PREFIX "/fonts"
+    BASE ${AETHER_TP}/inter
+    FILES ${AETHER_TP}/inter/Inter-Regular.ttf ${AETHER_TP}/inter/Inter-Bold.ttf)
+# The tick in a ticked check box, which a style sheet cannot draw; Qt picks @2x or @3x
+# on a sharper screen. Upstream's tick, painted by fork/make-check-ticks.cpp (see the
+# README there).
+set(CANON_TICKS ${CMAKE_SOURCE_DIR}/src/gui/aether/fork)
+qt_add_resources(aether_gui "canon_ticks"
+    PREFIX "/canon"
+    BASE ${CANON_TICKS}
+    FILES
+        ${CANON_TICKS}/check-tick.png ${CANON_TICKS}/check-tick@2x.png
+        ${CANON_TICKS}/check-tick@3x.png ${CANON_TICKS}/check-tick-disabled.png
+        ${CANON_TICKS}/check-tick-disabled@2x.png ${CANON_TICKS}/check-tick-disabled@3x.png)
+
 # ── Application core (everything except the GUI, shared with tests) ──────────
 add_library(esa_core STATIC
     src/tci/TciProtocol.cpp src/tci/TciClient.cpp src/tci/TciDiscovery.cpp src/tci/MuteController.cpp
     src/dsp/RxChain.cpp src/dsp/NrRegistry.cpp
     src/audio/PlaybackBuffer.cpp src/audio/PortAudioSink.cpp
-    src/app/Engine.cpp src/app/Profiles.cpp src/app/Settings.cpp src/app/WavWriter.cpp)
+    src/app/Engine.cpp src/app/Profiles.cpp src/app/Settings.cpp)
 target_include_directories(esa_core PUBLIC src)
 target_link_libraries(esa_core PUBLIC
     Qt6::Core Qt6::Network Qt6::WebSockets aether_dsp esa_portaudio)
 
-# ── The application ──────────────────────────────────────────────────────────
-set(ESA_ICON_ICNS ${CMAKE_SOURCE_DIR}/packaging/icons/ExpertSDR3Audio.icns)
-set_source_files_properties(${ESA_ICON_ICNS} PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+# ── Recording core: WAV files, the disk thread, PLAY's reader ─────────────────
+# Its own block so it re-applies onto a restructured build: wherever the core library
+# ends up, these four sources go with it. Qt Core only; the test is test_recorder.
+target_sources(esa_core PRIVATE
+    src/app/WavFile.cpp src/app/Recorder.cpp src/app/RecordingPlayer.cpp src/app/RecordNaming.cpp)
 
-qt_add_executable(ExpertSDR3Audio MACOSX_BUNDLE WIN32
-    src/main.cpp src/gui/MainWindow.cpp src/gui/ParamWidgets.cpp
+# ── The window (shared by the application and test_gui) ──────────────────────
+add_library(esa_gui STATIC
+    src/gui/MainWindow.cpp src/gui/ParamWidgets.cpp src/gui/DetailsWindow.cpp
     src/gui/AboutDialog.cpp src/gui/RadioDiscoveryDialog.cpp
-    $<$<BOOL:${APPLE}>:${ESA_ICON_ICNS}>
-    $<$<BOOL:${WIN32}>:packaging/windows/app.rc>)
-target_link_libraries(ExpertSDR3Audio PRIVATE esa_core Qt6::Gui Qt6::Widgets)
-target_compile_definitions(ExpertSDR3Audio PRIVATE ESA_VERSION="${ESA_VERSION}")
-
-qt_add_resources(ExpertSDR3Audio "app_icon"
+    src/gui/shell/HeaderBar.cpp src/gui/shell/StatusChip.cpp
+    src/gui/pages/Pages.cpp src/gui/pages/RadioPage.cpp src/gui/pages/NrPage.cpp
+    src/gui/pages/OutputPage.cpp src/gui/pages/LegacyStagePage.cpp)
+target_link_libraries(esa_gui PUBLIC esa_core aether_gui Qt6::Gui Qt6::Widgets)
+qt_add_resources(esa_gui "app_icon"
     PREFIX "/icons"
     BASE ${CMAKE_SOURCE_DIR}/packaging/icons
     FILES ${CMAKE_SOURCE_DIR}/packaging/icons/ExpertSDR3Audio-256.png)
+
+# ── The application ──────────────────────────────────────────────────────────
+set(ESA_ICON_ICNS ${CMAKE_SOURCE_DIR}/packaging/icons/ExpertSDR3Audio.icns)
+set_source_files_properties(${ESA_ICON_ICNS} PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+# The Inter typeface is built in (aether_fonts above), and its licence, the SIL OFL, asks that
+# its text go with every copy. The Linux and Windows packages carry it too.
+set(ESA_INTER_LICENSE ${AETHER_TP}/inter/LICENSE.txt)
+set_source_files_properties(${ESA_INTER_LICENSE} PROPERTIES MACOSX_PACKAGE_LOCATION Resources/Inter)
+
+qt_add_executable(ExpertSDR3Audio MACOSX_BUNDLE WIN32
+    src/main.cpp
+    $<$<BOOL:${APPLE}>:${ESA_ICON_ICNS}>
+    $<$<BOOL:${APPLE}>:${ESA_INTER_LICENSE}>
+    $<$<BOOL:${WIN32}>:packaging/windows/app.rc>)
+target_link_libraries(ExpertSDR3Audio PRIVATE esa_gui)
+target_compile_definitions(ExpertSDR3Audio PRIVATE ESA_VERSION="${ESA_VERSION}")
 
 # The model is embedded so one binary works everywhere; DeepFilterFilter
 # extracts it to app data on first use because libdf needs a real file path.
@@ -283,6 +354,7 @@ if(UNIX AND NOT APPLE)
     install(FILES packaging/icons/ExpertSDR3Audio.svg
         DESTINATION share/icons/hicolor/scalable/apps RENAME expertsdr3-audio.svg)
     install(FILES LICENSE DESTINATION share/doc/expertsdr3-audio RENAME copyright)
+    install(FILES ${ESA_INTER_LICENSE} DESTINATION share/doc/expertsdr3-audio RENAME Inter-OFL.txt)
 
     set(CPACK_GENERATOR DEB)
     set(CPACK_PACKAGE_NAME expertsdr3-audio)
@@ -321,13 +393,33 @@ if(BUILD_TESTS)
     esa_test(test_engine_e2e tests/MockExpert.cpp)
     esa_test(test_discovery tests/MockExpert.cpp)
     esa_test(test_profiles)
-    esa_test(test_gui src/gui/MainWindow.cpp src/gui/ParamWidgets.cpp
-        src/gui/AboutDialog.cpp src/gui/RadioDiscoveryDialog.cpp tests/MockExpert.cpp)
-    target_link_libraries(test_gui PRIVATE Qt6::Gui Qt6::Widgets)
-    qt_add_resources(test_gui "app_icon_test"
-        PREFIX "/icons"
-        BASE ${CMAKE_SOURCE_DIR}/packaging/icons
-        FILES ${CMAKE_SOURCE_DIR}/packaging/icons/ExpertSDR3Audio-256.png)
+    # Recording: the core, which re-runs itself as a child for the disk-full and crash cases, and
+    # the app run headless with --record and --capture against an in-process MockExpert.
+    esa_test(test_recorder tests/MockExpert.cpp)
+    add_dependencies(test_recorder ExpertSDR3Audio)
+    target_compile_definitions(test_recorder PRIVATE ESA_APP_BINARY="$<TARGET_FILE:ExpertSDR3Audio>")
+    esa_test(test_gui tests/MockExpert.cpp)
+    target_link_libraries(test_gui PRIVATE esa_gui)
+    # The window's shell: rail, header, menus, geometry and every way to close it. No radio.
+    esa_test(test_shell)
+    target_link_libraries(test_shell PRIVATE esa_gui)
+
+    # The vendored pages against the shims alone, without esa_core: no engine, no radio.
+    # src only for dsp/StageSet.h, which is header-only, so the pages draw from the stages
+    # the window's mirror holds.
+    qt_add_executable(test_aether_gui tests/test_aether_gui.cpp)
+    target_include_directories(test_aether_gui PRIVATE src)
+    target_link_libraries(test_aether_gui PRIVATE aether_gui Qt6::Test)
+    add_test(NAME test_aether_gui COMMAND test_aether_gui)
+    set_tests_properties(test_aether_gui PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+    # The vendored pages cache small drawn images (check boxes, arrows) in the user's cache
+    # folder, which Qt's test mode only moves to ~/.qttest. Keep the GUI tests' copies in the
+    # build tree. Test mode builds its path from HOME; on macOS the system asks
+    # CFFIXED_USER_HOME, so both are set. Windows test runs still use %LOCALAPPDATA%\qttest.
+    set(esa_test_home "${CMAKE_BINARY_DIR}/test-home")
+    file(MAKE_DIRECTORY "${esa_test_home}")
+    set_tests_properties(test_gui test_shell test_aether_gui PROPERTIES ENVIRONMENT
+        "QT_QPA_PLATFORM=offscreen;HOME=${esa_test_home};CFFIXED_USER_HOME=${esa_test_home}")
     if(ENABLE_DFNR AND EXISTS ${DF_DIR}/models/DeepFilterNet3_onnx.tar.gz)
         qt_add_resources(test_rx_chain "dfnr_model_test"
             PREFIX "/models"

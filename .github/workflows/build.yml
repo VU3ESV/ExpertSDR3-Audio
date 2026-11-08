@@ -269,6 +269,64 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+  # The tests where threads share data without locks: the engine's thread, the window's
+  # timers, the NR pool and the recorder's disk thread, plus the app itself, which
+  # test_recorder runs headless as a child. Qt itself is not built with ThreadSanitizer, so
+  # the handoffs it orders are suppressed by tests/tsan.supp, or stated where it can see
+  # them (Recorder::post).
+  tsan:
+    name: Linux ThreadSanitizer
+    if: contains(inputs.platforms, 'linux')
+    # On the runner, not in the Debian container: the runner's kernel randomises mmap more
+    # than ThreadSanitizer's memory layout allows, and only the host can turn that down.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v7
+
+      # The Qt the release ships on macOS and Windows. The suppressions name its classes.
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: ${{ env.QT_VERSION }}
+          arch: linux_gcc_64
+          modules: qtwebsockets
+          cache: true
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang ninja-build pkg-config libfftw3-dev libasound2-dev libgl1-mesa-dev libxkbcommon-dev
+
+      - name: Allow ThreadSanitizer's memory layout
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      # DFNR is a prebuilt Rust library that ThreadSanitizer cannot see into; it is left out.
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          -DCMAKE_C_FLAGS=-fsanitize=thread -DCMAKE_CXX_FLAGS=-fsanitize=thread
+          -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread
+          -DENABLE_DFNR=OFF -DESA_STATIC_PORTAUDIO=ON -DESA_VERSION="$VERSION"
+
+      - name: Build and run the threaded tests
+        timeout-minutes: 45
+        env:
+          QT_QPA_PLATFORM: offscreen
+          # Check copies our code makes (memcpy and the like), not the ones inside Qt's own
+          # uninstrumented code. Spelled out, because Linux and macOS default differently,
+          # and these are the settings tests/tsan.supp was checked with.
+          TSAN_OPTIONS: >-
+            halt_on_error=1 second_deadlock_stack=1 ignore_interceptors_accesses=0
+            ignore_noninstrumented_modules=1 suppressions=${{ github.workspace }}/tests/tsan.supp
+        run: |
+          # All three, by name: building a target that has gone fails the job.
+          tests="test_engine_e2e test_recorder test_aether_gui"
+          cmake --build build --target $tests
+          ctest --test-dir build --output-on-failure --test-output-size-failed 100000 --timeout 900 \
+            -R "^($(echo $tests | tr ' ' '|'))\$"
+
   # Installs what was just built on clean systems, nothing from the build environment left over.
   verify-linux:
     name: ${{ matrix.target.name }} on ${{ matrix.image }}

@@ -1,0 +1,24 @@
+# ThreadSanitizer suppressions for the sanitizer job (TSAN_OPTIONS=suppressions=...).
+#
+# Qt is not built with ThreadSanitizer, so the ordering its event queue and thread pool
+# provide is invisible: data copied into a queued call or a pool job on one thread, then
+# used on the thread that runs it, looks like a race although Qt's own lock orders it.
+# Only those handoffs are listed, by the frames that build the job, which appear only in
+# the posting thread's stack. A race inside a slot, or on the engine's live data
+# (LiveTaps, the rings, the stage meters), still reports: weakening the taps' ring to
+# relaxed ordering was caught with this file in place.
+#
+# Checked against Qt 6.10, the version the job installs, with ignore_interceptors_accesses=0
+# and ignore_noninstrumented_modules=1 (set in the job; Linux and macOS default differently).
+
+# A lambda handed to QMetaObject::invokeMethod: its allocation and its captured copies.
+race:QMetaObject::invokeMethod
+# A lambda in a queued connection, built on the connecting thread.
+race:QtPrivate::QCallableObject*::QCallableObject
+# A lambda handed to QThreadPool::start, which wraps it in this.
+race:QRunnable::QGenericRunnable
+# A value copied into a queued signal's event by Qt's metatype system, on the emitting thread,
+# then read and destroyed where it is delivered: the EngineStatus a headless run (src/main.cpp)
+# and the window receive from the engine's thread. test_recorder runs the app as a child, and
+# the child inherits these options. Only the copy matches: the event's allocation is not in it.
+race:QtPrivate::QMetaTypeForType*::getCopyCtr

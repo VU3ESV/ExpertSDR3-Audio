@@ -212,3 +212,10 @@ simulated server built from measurements of the real one.
 GPL-3.0, inherited from AetherSDR. See [LICENSE](LICENSE), and
 [vendor/aethersdr/THIRD_PARTY_LICENSES](vendor/aethersdr/THIRD_PARTY_LICENSES) for the
 bundled components. If you distribute binaries, you must also offer the source.
+
+The window's look and its widgets are AetherSDR's own GUI code, also GPL-3.0, and it is
+drawn in the Inter typeface, which is built into the app under the SIL Open Font License 1.1
+([vendor/aethersdr/third_party/inter/LICENSE.txt](vendor/aethersdr/third_party/inter/LICENSE.txt)).
+Every package carries that licence: `Inter-OFL.txt` beside the program on Windows and in
+`/usr/share/doc/expertsdr3-audio` on Linux, and `Contents/Resources/Inter/LICENSE.txt` in
+the macOS app.

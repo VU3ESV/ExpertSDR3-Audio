@@ -5,16 +5,21 @@
 #include "dsp/NrProcessor.h"
 #include "dsp/RxChain.h"
 #include "gui/MainWindow.h"
+#include "gui/aether/Appearance.h"
+#include "gui/pages/Pages.h"
 #include "tci/TciDiscovery.h"
 
 #include <QApplication>
 #include <QCommandLineParser>
 #include <QCoreApplication>
 #include <QElapsedTimer>
+#include <QFileInfo>
 #include <QIcon>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
-#include <QStyleFactory>
+#include <QRegularExpression>
+#include <QSize>
 #include <QTextStream>
 #include <QThread>
 #include <QTimer>
@@ -70,6 +75,13 @@ void printParams()
         if (!s.choices.isEmpty()) out() << "  (" << s.choices.join(QStringLiteral(", ")) << ")";
         out() << "\n";
     }
+}
+
+QString pageIdList()
+{
+    QStringList ids;
+    for (const PageEntry& page : pageTable()) ids.append(page.id);
+    return ids.join(QStringLiteral(", "));
 }
 
 int runDiscovery()
@@ -166,17 +178,42 @@ private:
     Engine* m_engine;
 };
 
-int runHeadless(EngineHost& host, const AppConfig& config, const QString& capture, double durationSeconds)
+// --record's argument: a .wav file to record into, or else a folder to name the file in.
+bool recordsToFile(const QString& target)
+{
+    return target.endsWith(QStringLiteral(".wav"), Qt::CaseInsensitive) && !QFileInfo(target).isDir();
+}
+
+int runHeadless(EngineHost& host, const AppConfig& config, const QString& capture, const QString& record,
+                double durationSeconds)
 {
     Engine* engine = host.engine();
     auto last = std::make_shared<EngineStatus>();
-    QObject::connect(engine, &Engine::statusChanged, qApp,
-                     [last](const EngineStatus& status) { *last = status; }, Qt::QueuedConnection);
+    // What the summary reports comes from the run itself, except the files: those are only
+    // complete once the engine has stopped, and its last word on them arrives after the event
+    // loop has ended (taken below, after host.stop()).
+    auto stopped = std::make_shared<bool>(false);
+    QObject::connect(engine, &Engine::statusChanged, qApp, [last, stopped](const EngineStatus& status) {
+        if (!*stopped) {
+            *last = status;
+        } else {
+            last->recording = status.recording;
+            last->capture = status.capture;
+        }
+    }, Qt::QueuedConnection);
 
     QMetaObject::invokeMethod(engine, [=] {
         engine->configure(config);
         if (!capture.isEmpty()) engine->setCapture(capture);
         engine->connectRadio();
+        // From the first audio: the file is named, and opened, once the radio is there.
+        if (!record.isEmpty()) {
+            if (recordsToFile(record)) {
+                engine->startRecordingToFile(record);
+            } else {
+                engine->startRecording(record);
+            }
+        }
     });
 
     QTimer reporter;
@@ -192,7 +229,12 @@ int runHeadless(EngineHost& host, const AppConfig& config, const QString& captur
               << "  buffer " << QString::number(s.sink.bufferedMs, 'f', 0) << " ms"
               << "  drift " << QString::number(s.sink.driftPpm, 'f', 0) << " ppm"
               << "  underruns " << s.sink.underruns
-              << "  mute " << muteName(s.mutePhase) << "\n";
+              << "  mute " << muteName(s.mutePhase);
+        if (s.recording.active) {
+            out() << "  rec " << QString::number(s.recording.seconds, 'f', 0) << " s";
+            if (s.recording.droppedFrames > 0) out() << " (dropped " << s.recording.droppedFrames << " frames)";
+        }
+        out() << "\n";
         out().flush();
     });
     reporter.start(2000);
@@ -208,7 +250,9 @@ int runHeadless(EngineHost& host, const AppConfig& config, const QString& captur
     poll.start(50);
 
     qApp->exec();
+    *stopped = true;
     host.stop();
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);  // the engine's final status
 
     // Machine-readable summary for scripts.
     const EngineStatus& s = *last;
@@ -238,6 +282,17 @@ int runHeadless(EngineHost& host, const AppConfig& config, const QString& captur
         {QStringLiteral("underruns"), double(s.sink.underruns)},
         {QStringLiteral("overruns"), double(s.sink.overruns)},
         {QStringLiteral("mutePhase"), QString::fromLatin1(muteName(s.mutePhase))},
+        // The file's actual name: an existing file is never replaced, so it may end _1, _2...
+        {QStringLiteral("recording"), QJsonObject{
+            {QStringLiteral("path"), s.recording.path},
+            {QStringLiteral("seconds"), s.recording.seconds},
+            {QStringLiteral("droppedFrames"), double(s.recording.droppedFrames)},
+            {QStringLiteral("error"), s.recording.error},
+        }},
+        {QStringLiteral("capture"), QJsonObject{
+            {QStringLiteral("files"), QJsonArray::fromStringList(s.capture.files)},
+            {QStringLiteral("error"), s.capture.error},
+        }},
     };
     out() << "SUMMARY " << QJsonDocument(summary).toJson(QJsonDocument::Compact) << "\n";
     out().flush();
@@ -303,16 +358,44 @@ int main(int argc, char** argv)
     const QCommandLineOption deviceRateOpt(QStringLiteral("device-rate"), QStringLiteral("Force the output device's sample rate, converting to it if needed."), QStringLiteral("hz"));
     const QCommandLineOption rateOpt(QStringLiteral("rate"), QStringLiteral("Processing rate: 48000 (default) or 24000 for low-power machines."), QStringLiteral("hz"));
     const QCommandLineOption noMuteOpt(QStringLiteral("no-mute"), QStringLiteral("Leave ExpertSDR3's own audio alone."));
-    const QCommandLineOption captureOpt(QStringLiteral("capture"), QStringLiteral("Record to <base>.before.wav and <base>.after.wav."), QStringLiteral("base"));
+    const QCommandLineOption captureOpt(QStringLiteral("capture"), QStringLiteral("Headless: record the radio's audio to <base>.before.wav and the chain's output to <base>.after.wav (or the next free names; a rate change continues in _part2)."), QStringLiteral("base"));
+    const QCommandLineOption recordOpt(QStringLiteral("record"), QStringLiteral("Headless: record the chain's output from the first audio until exit or --duration, into this folder, named from the time, frequency and mode, or into this .wav file. An existing file is never replaced."), QStringLiteral("folder|file.wav"));
     const QCommandLineOption durationOpt(QStringLiteral("duration"), QStringLiteral("Headless: stop after this many seconds."), QStringLiteral("s"));
     const QCommandLineOption settingsOpt(QStringLiteral("settings"), QStringLiteral("Use this ini file instead of the normal settings store."), QStringLiteral("file"));
     const QCommandLineOption connectOpt(QStringLiteral("connect"), QStringLiteral("Connect immediately on startup."));
     const QCommandLineOption screenshotOpt(QStringLiteral("screenshot"), QStringLiteral("Save a PNG of the window after 2 s and exit (development)."), QStringLiteral("file"));
+    const QCommandLineOption pageOpt(QStringLiteral("page"), QStringLiteral("With --screenshot: the page to show (%1).").arg(pageIdList()), QStringLiteral("id"));
+    const QCommandLineOption sizeOpt(QStringLiteral("size"), QStringLiteral("With --screenshot: the window's size, e.g. 724x752, instead of the saved one."), QStringLiteral("WxH"));
     parser.addOptions({headlessOpt, listDevicesOpt, listParamsOpt, discoverOpt, listProfilesOpt, profileOpt,
                        importProfileOpt, exportProfileOpt, hostOpt, portOpt, rxOpt, deviceOpt, nrOpt,
-                       setOpt, gainOpt, bufferOpt, deviceRateOpt, rateOpt, noMuteOpt, captureOpt, durationOpt, settingsOpt,
-                       connectOpt, screenshotOpt});
+                       setOpt, gainOpt, bufferOpt, deviceRateOpt, rateOpt, noMuteOpt, captureOpt, recordOpt, durationOpt,
+                       settingsOpt, connectOpt, screenshotOpt, pageOpt, sizeOpt});
     parser.process(*app);
+
+    // For comparing pages with AetherRX's: only a screenshot run takes them, and it never
+    // saves the window's state, so an ordinary start comes back where the operator left it.
+    QString screenshotPage;
+    QSize screenshotSize;
+    if (parser.isSet(screenshotOpt)) {
+        if (parser.isSet(pageOpt)) {
+            screenshotPage = parser.value(pageOpt);
+            if (!findPage(screenshotPage)) {
+                qCritical("Unknown page \"%s\". Pages: %s", qPrintable(screenshotPage), qPrintable(pageIdList()));
+                return 2;
+            }
+        }
+        if (parser.isSet(sizeOpt)) {
+            const QRegularExpressionMatch match =
+                QRegularExpression(QStringLiteral("^(\\d+)x(\\d+)$")).match(parser.value(sizeOpt));
+            screenshotSize = match.hasMatch() ? QSize(match.captured(1).toInt(), match.captured(2).toInt()) : QSize();
+            if (screenshotSize.isEmpty()) {
+                qCritical("--size takes a width and height such as 724x752");
+                return 2;
+            }
+        }
+    } else if (parser.isSet(pageOpt) || parser.isSet(sizeOpt)) {
+        qWarning("--page and --size apply only with --screenshot");
+    }
 
     if (parser.isSet(listDevicesOpt)) {
         printDevices();
@@ -324,6 +407,15 @@ int main(int argc, char** argv)
     }
 
     if (parser.isSet(discoverOpt)) return runDiscovery();
+
+    if (parser.isSet(recordOpt) && !parser.isSet(headlessOpt)) {
+        qCritical("--record needs --headless");
+        return 2;
+    }
+    if (parser.isSet(recordOpt) && parser.value(recordOpt).isEmpty()) {
+        qCritical("--record needs a folder or a .wav file");
+        return 2;
+    }
 
     const QString settingsPath = parser.value(settingsOpt);
     Settings settings(settingsPath);
@@ -420,13 +512,21 @@ int main(int argc, char** argv)
     EngineHost host(settingsPath);
 
     if (parser.isSet(headlessOpt)) {
-        return runHeadless(host, config, parser.value(captureOpt),
+        return runHeadless(host, config, parser.value(captureOpt), parser.value(recordOpt),
                            parser.isSet(durationOpt) ? parser.value(durationOpt).toDouble() : 0.0);
     }
 
-    QApplication::setStyle(QStyleFactory::create(QStringLiteral("Fusion")));
+    Appearance::install();
     QApplication::setWindowIcon(QIcon(QStringLiteral(":/icons/ExpertSDR3Audio-256.png")));
-    MainWindow window(host.engine(), &settings, &profiles, config);
+    MainWindow window(host.engine(), host.engine()->taps(), &settings, &profiles, config);
+    // The page and size a screenshot shows are its own, not where the operator left things.
+    if (parser.isSet(screenshotOpt)) window.setSavesWindowState(false);
+    if (!screenshotPage.isEmpty()) window.showPage(screenshotPage);
+    if (screenshotSize.isValid()) {
+        // Exactly this size: no saved geometry, and not maximised on a small screen.
+        window.setWindowState(Qt::WindowNoState);
+        window.resize(screenshotSize);
+    }
     window.show();
     if (parser.isSet(connectOpt)) window.connectNow();
 

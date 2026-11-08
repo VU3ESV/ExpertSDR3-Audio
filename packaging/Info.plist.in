@@ -16,5 +16,7 @@
     <key>NSHighResolutionCapable</key><true/>
     <key>NSLocalNetworkUsageDescription</key>
     <string>Finds ExpertSDR3 radios on your network, and connects to their TCI server.</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>Saves your recordings in your Documents folder, and plays them back.</string>
 </dict>
 </plist>
