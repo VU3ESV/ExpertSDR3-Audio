@@ -24,7 +24,9 @@
 #include <QThread>
 #include <QTimer>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
@@ -466,7 +468,17 @@ int main(int argc, char** argv)
         config.fallbackPorts.clear();
     }
     if (parser.isSet(rxOpt)) config.receiver = parser.value(rxOpt).toInt();
-    if (parser.isSet(gainOpt)) config.outputGainDb = parser.value(gainOpt).toDouble();
+    if (parser.isSet(gainOpt)) {
+        // "nan" reads as a number, and would pass every clamp on its way to the speakers. A
+        // number past Volume's range is clamped to it, as a saved one is (Settings::load).
+        bool ok = false;
+        const double db = parser.value(gainOpt).toDouble(&ok);
+        if (!ok || !std::isfinite(db)) {
+            qCritical("--gain takes a number of dB, such as -6");
+            return 2;
+        }
+        config.outputGainDb = std::clamp(db, kMinOutputGainDb, kMaxOutputGainDb);
+    }
     if (parser.isSet(bufferOpt)) config.bufferMs = parser.value(bufferOpt).toInt();
     if (parser.isSet(deviceRateOpt)) config.deviceRate = parser.value(deviceRateOpt).toInt();
     if (parser.isSet(noMuteOpt)) config.muteExpert = false;

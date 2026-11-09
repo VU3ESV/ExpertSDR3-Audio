@@ -67,7 +67,9 @@ struct EngineStatus {
         // The file being written, or the last one written; empty until a file exists, so a
         // REC that never got audio names no file.
         QString path;
-        double seconds{0.0};       // audio recorded so far, across every part
+        // Audio recorded so far, across every part. Kept after the stop, as `path` is, so a
+        // headless run's summary has the length; the window shows it only while active.
+        double seconds{0.0};
         quint64 droppedFrames{0};  // audio the disk could not keep up with: shown in amber
         QString error;             // why REC was refused or stopped early; empty otherwise
         // `error` says why a press was turned down ("Connect to a radio first"), not why a

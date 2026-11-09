@@ -375,7 +375,8 @@ QStringList radioChangingCommands(const QStringList& commands)
     QStringList found;
     for (const QString& c : commands) {
         if (c.startsWith(QLatin1String("trx")) || c.startsWith(QLatin1String("volume"))
-            || c.startsWith(QLatin1String("mute"))) {
+            || c.startsWith(QLatin1String("mute")) || c.startsWith(QLatin1String("rx_volume"))
+            || c.startsWith(QLatin1String("rx_mute"))) {
             found << c;
         }
     }
@@ -960,6 +961,76 @@ private slots:
         QVERIFY(!f.status.audioFlowing);
         QCOMPARE(f.status.connection, TciClient::State::Disconnected);
         f.engine().shutdown();
+    }
+
+    // With a mute to give back, the link stays up after Disconnect until ExpertSDR3 has taken it,
+    // and the radio goes on streaming meanwhile. That session is over all the same: no status may
+    // show its audio flowing, and its blocks must not set the mute policy going again.
+    void audioArrivingWhileTheMuteIsGivenBackIsNotShownAsFlowing()
+    {
+        Fixture f;
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.mock.muted, kTimeout);
+        QTRY_VERIFY_WITH_TIMEOUT(f.audioFlowing(), kTimeout);
+        QTest::qWait(100);
+        const int engagesBefore = f.mock.muteCommandsSent(true);
+        f.mock.dropMuteSets = 2;  // the restore takes three tries, so the disconnect waits for it
+
+        QList<EngineStatus> after;
+        // What the output had been handed, at each of those statuses while it was open: the
+        // engine lets go of it as the link closes.
+        QList<quint64> heardAfter;
+        qint64 sentWhileClosing = -1;
+        const qint64 sentAtDisconnect = f.mock.blocksSent;
+        const QMetaObject::Connection watch = QObject::connect(&f.engine(), &Engine::statusChanged, &f.mock,
+                                                               [&](const EngineStatus& s) {
+            after.append(s);
+            heardAfter.append(s.outputOpen && f.sink ? f.sink->framesWritten : 0);
+            if (sentWhileClosing < 0 && s.connection == TciClient::State::Disconnected) {
+                sentWhileClosing = f.mock.blocksSent - sentAtDisconnect;
+            }
+        });
+        f.engine().disconnectRadio();
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.connection, TciClient::State::Disconnected, kTimeout);
+        QTest::qWait(300);
+        f.engine().shutdown();
+        QObject::disconnect(watch);
+
+        // What makes this the case it is: the hand-back was still pending with the link up, and
+        // the radio kept sending audio through it.
+        QVERIFY(std::any_of(after.cbegin(), after.cend(), [](const EngineStatus& s) {
+            return s.connection == TciClient::State::Ready && s.mutePhase == MuteController::Phase::Restoring;
+        }));
+        QVERIFY2(sentWhileClosing > 20, qPrintable(QString::number(sentWhileClosing)));
+        // And the engine still took that audio, for the output and any recording: it is only
+        // not shown as flowing.
+        qsizetype firstUp = -1;
+        qsizetype lastUp = -1;
+        for (qsizetype i = 0; i < after.size(); ++i) {
+            if (after[i].connection != TciClient::State::Ready || !after[i].outputOpen) continue;
+            if (firstUp < 0) firstUp = i;
+            lastUp = i;
+        }
+        QVERIFY(firstUp >= 0 && lastUp > firstUp);
+        QVERIFY2(after[lastUp].blocks > after[firstUp].blocks + 10,
+                 qPrintable(QStringLiteral("%1 to %2").arg(after[firstUp].blocks).arg(after[lastUp].blocks)));
+        QVERIFY2(heardAfter[lastUp] > heardAfter[firstUp],
+                 qPrintable(QStringLiteral("%1 to %2").arg(heardAfter[firstUp]).arg(heardAfter[lastUp])));
+
+        for (qsizetype i = 0; i < after.size(); ++i) {
+            const EngineStatus& s = after[i];
+            const QString which = QStringLiteral("status %1 of %2 after the disconnect, link %3")
+                                      .arg(i + 1)
+                                      .arg(after.size())
+                                      .arg(s.connection == TciClient::State::Ready ? QStringLiteral("still up")
+                                                                                   : QStringLiteral("down"));
+            QVERIFY2(!s.audioFlowing, qPrintable(which));
+            QVERIFY2(s.mutePhase != MuteController::Phase::Engaging && s.mutePhase != MuteController::Phase::Holding,
+                     qPrintable(which));
+        }
+        QVERIFY(!f.mock.muted);
+        QCOMPARE(f.mock.muteCommandsSent(true), engagesBefore);
+        QVERIFY(!Settings(f.settingsPath).loadMuteOwnership(QStringLiteral("127.0.0.1")).owned);
     }
 
     void forwardCounterGapsAreCountedAsLoss()
@@ -2218,11 +2289,18 @@ private slots:
             scoped.insert(scoped.end(), got.begin(), got.end());
         });
         // The engine reports the end straight away, so the sink then holds the playback alone.
+        // That status also says how much the recording holds, read as the radio's stream stood.
         bool wasPlaying = false;
         std::optional<size_t> heardAtEnd;
+        double recordedAtEnd = 0.0;
+        qint64 sentAtEnd = 0;
+        quint64 chainBlocksAtEnd = 0;
         QObject::connect(&f.engine(), &Engine::statusChanged, &f.mock, [&](const EngineStatus& s) {
             if (wasPlaying && !s.playback.active && !heardAtEnd) {
                 heardAtEnd = f.sink->samples.size();
+                recordedAtEnd = s.recording.seconds;
+                sentAtEnd = f.mock.blocksSent;
+                chainBlocksAtEnd = taps->blocks.load();
                 const std::vector<float> got = drain(taps->outTap);
                 scoped.insert(scoped.end(), got.begin(), got.end());
                 taps->outWanted = false;
@@ -2235,10 +2313,12 @@ private slots:
 
         // A recording made meanwhile holds the live chain, not what was played.
         const QString during = f.dir.filePath(QStringLiteral("during.wav"));
+        const qint64 sentAtRecording = f.mock.blocksSent;
         f.engine().startRecordingToFile(during);
         QVERIFY(f.status.recording.active);
 
         const quint64 blocksBefore = taps->blocks.load();
+        const qint64 sentBefore = f.mock.blocksSent;
         f.sink->samples.clear();
         taps->outWanted = true;
         window.start();
@@ -2265,11 +2345,23 @@ private slots:
         QCOMPARE(scoped.size(), file->frames.size());
         QVERIFY2(sameBits(scoped.data(), file->frames.data(), file->frames.size()), "the scope missed the playback");
         QVERIFY(failures.isEmpty());
-        // The chain, its meters and the recording kept running meanwhile.
-        QVERIFY(taps->blocks.load() > blocksBefore + 50);
+        // The chain, its meters and the recording kept running meanwhile: every block the radio
+        // sent went through the chain and into the recording, less the few still on their way.
+        // Measured against the stream, not the clock: on a busy machine the mock's timer falls
+        // behind and sends less than real time, which PLAY, paced by the clock, does not.
+        const double blockSeconds = double(f.mock.blockSamples / 2) / 48000.0;
+        constexpr qint64 kInFlight = 5;
+        const qint64 sentDuringPlay = sentAtEnd - sentBefore;
+        const qint64 sentDuringRecording = sentAtEnd - sentAtRecording;
+        qInfo() << "while playing, the radio sent" << sentDuringPlay << "blocks and the chain took"
+                << chainBlocksAtEnd - blocksBefore << "; the recording holds" << recordedAtEnd << "s of"
+                << double(sentDuringRecording) * blockSeconds << "s sent";
+        QVERIFY2(sentDuringPlay > 20, qPrintable(QString::number(sentDuringPlay)));  // it did stream meanwhile
+        QVERIFY2(qint64(chainBlocksAtEnd - blocksBefore) >= sentDuringPlay - kInFlight,
+                 qPrintable(QStringLiteral("%1 of %2").arg(chainBlocksAtEnd - blocksBefore).arg(sentDuringPlay)));
         QVERIFY(f.status.recording.active);
-        QVERIFY2(f.status.recording.seconds >= double(took) / 1000.0 - 0.3,
-                 qPrintable(QString::number(f.status.recording.seconds)));
+        QVERIFY2(recordedAtEnd >= double(sentDuringRecording - kInFlight) * blockSeconds,
+                 qPrintable(QStringLiteral("%1 s of %2 s").arg(recordedAtEnd).arg(double(sentDuringRecording) * blockSeconds)));
         f.engine().stopRecording();
         QTRY_COMPARE_WITH_TIMEOUT(f.status.lastRecordingPath, during, kTimeout);
         const std::optional<Recorded> live = readRecording(during);

@@ -2,6 +2,7 @@
 
 #include "app/Settings.h"
 #include "gui/DetailsWindow.h"
+#include "gui/ParamWidgets.h"
 #include "gui/aether/Guards.h"
 #include "gui/binding/StageBinding.h"
 
@@ -9,6 +10,7 @@
 #include "StagePage.h"
 
 #include <QLayout>
+#include <QTimer>
 #include <QVBoxLayout>
 #include <QtGlobal>
 
@@ -60,6 +62,18 @@ StageHost::StageHost(PageContext& ctx, StageSpec spec)
     m_details = ctx.details(m_spec.stage);
     Q_ASSERT(m_details);
     if (m_details) m_details->populate(ctx.addParam);
+
+    if (m_spec.syncOnChange && m_details) {
+        // Once the change has settled, outside whatever panel handler made it: a value the
+        // panel set itself is redrawn as the settings rounded it, which is harmless.
+        m_redraw = new QTimer(this);
+        m_redraw->setSingleShot(true);
+        m_redraw->setInterval(0);
+        connect(m_redraw, &QTimer::timeout, this, &StageHost::syncPanel);
+        for (ParamControl* control : m_details->controls()) {
+            connect(control, &ParamControl::valueChanged, m_redraw, qOverload<>(&QTimer::start));
+        }
+    }
 }
 
 void StageHost::attach()
@@ -86,7 +100,7 @@ void StageHost::nameKnobs()
     }
     for (int i = 0; i < knobs.size(); ++i) {
         knobs.at(i)->setAccessibleName(m_spec.knobs.at(i).first);
-        m_knobs.append({m_spec.knobs.at(i).second, knobs.at(i)});
+        if (!m_spec.knobs.at(i).second.isEmpty()) m_knobs.append({m_spec.knobs.at(i).second, knobs.at(i)});
     }
 }
 

@@ -181,7 +181,8 @@ QStringList radioChangingCommands(const QStringList& commands)
     QStringList found;
     for (const QString& c : commands) {
         if (c.startsWith(QLatin1String("trx")) || c.startsWith(QLatin1String("volume"))
-            || c.startsWith(QLatin1String("mute"))) {
+            || c.startsWith(QLatin1String("mute")) || c.startsWith(QLatin1String("rx_volume"))
+            || c.startsWith(QLatin1String("rx_mute"))) {
             found << c;
         }
     }
@@ -523,14 +524,35 @@ private slots:
         knobField->setFocus();
         QTest::keyClick(knobField, Qt::Key_Escape);
 
-        // A parameter's exact value, on a page that still shows today's controls.
+        // A parameter's value in a spin box on a page of the main window: AetherNR's readings.
+        m_window->showPage(QStringLiteral("nr"));
+        auto* nr = m_window->findChild<QWidget*>(QStringLiteral("page_nr"));
+        QVERIFY(nr);
+        QDoubleSpinBox* reading = nullptr;
+        for (QDoubleSpinBox* spin : nr->findChildren<QDoubleSpinBox*>()) {
+            if (spin->isVisible()) {
+                reading = spin;
+                break;
+            }
+        }
+        QVERIFY(reading);
+        reading->setFocus();
+        QTest::keyClick(reading, Qt::Key_Escape);
+        QVERIFY(m_window->isVisible());
+
+        // A parameter's exact value, in the stage's exact-values window: Escape closes that
+        // window, as it should a secondary one, and never the main one.
         m_window->showPage(QStringLiteral("comp"));
-        auto* grid = m_window->findChild<QWidget*>(QStringLiteral("page_comp"));
-        QVERIFY(grid);
-        auto* field = grid->findChild<QDoubleSpinBox*>();
+        auto* details = m_window->findChild<DetailsWindow*>(QStringLiteral("details_comp"));
+        QVERIFY(details);
+        details->present();
+        QVERIFY(QTest::qWaitForWindowExposed(details));
+        auto* field = details->findChild<QDoubleSpinBox*>();
         QVERIFY(field);
         field->setFocus();
         QTest::keyClick(field, Qt::Key_Escape);
+        QTRY_VERIFY(!details->isVisible());
+        activate();
 
         // In the gear's menu, Escape closes the menu.
         rail()->findChild<QPushButton*>(QStringLiteral("aetherRxSettingsButton"))->click();
@@ -1413,29 +1435,42 @@ private slots:
 
     void theAetherNrBoxBringsBackTheLastMethod()
     {
+        // The AetherNR page's method tabs that are lit, by method id: the method NR runs.
+        const auto lit = [this] {
+            QStringList ids;
+            const auto buttons = m_window->findChildren<QPushButton*>();
+            for (QPushButton* b : buttons) {
+                if (b->objectName().startsWith(QLatin1String("nrTab_")) && b->isChecked()) ids << b->objectName().mid(6);
+            }
+            return ids;
+        };
+        const auto tab = [this](const QString& id) {
+            return m_window->findChild<QPushButton*>(QStringLiteral("nrTab_") + id);
+        };
         make();
         auto* box = rail()->findChild<QCheckBox*>(QStringLiteral("aetherRxEnableAetherNR"));
-        auto* method = m_window->findChild<QComboBox*>(QStringLiteral("nrMethod"));
-        QVERIFY(box && method);
+        QVERIFY(box && tab(QStringLiteral("rn2")));
         QVERIFY(!box->isChecked());
+        QCOMPARE(lit(), QStringList());
 
         box->click();  // never chosen before: NR2
-        QCOMPARE(method->currentData().toString(), QStringLiteral("nr2"));
-        method->setCurrentIndex(method->findData(QStringLiteral("rn2")));
+        QCOMPARE(lit(), QStringList{QStringLiteral("nr2")});
+        tab(QStringLiteral("rn2"))->click();
         QVERIFY(box->isChecked());
         box->click();
-        QCOMPARE(method->currentData().toString(), QString());
+        QCOMPARE(lit(), QStringList());
         QVERIFY(!box->isChecked());
         QCOMPARE(Settings(iniPath()).lastNrMethod(), QStringLiteral("rn2"));
         box->click();
-        QCOMPARE(method->currentData().toString(), QStringLiteral("rn2"));
+        QCOMPARE(lit(), QStringList{QStringLiteral("rn2")});
 
         // A later session remembers it too.
-        method->setCurrentIndex(0);  // Off
+        tab(QStringLiteral("rn2"))->click();  // the lit tab: off
+        QCOMPARE(lit(), QStringList());
         make();
         box = rail()->findChild<QCheckBox*>(QStringLiteral("aetherRxEnableAetherNR"));
         box->click();
-        QCOMPARE(m_window->findChild<QComboBox*>(QStringLiteral("nrMethod"))->currentData().toString(), QStringLiteral("rn2"));
+        QCOMPARE(lit(), QStringList{QStringLiteral("rn2")});
     }
 
     void theStageMenuAndAltArrowsMoveAStage()
@@ -2673,8 +2708,8 @@ private slots:
     }
 
     // A stage page's exact values are one click from the header, the gear or the stage's
-    // tab. Pages with none (Radio, AetherNR, Final Output, and the stages still on today's
-    // grids, which show every value themselves) leave the button and the entries off.
+    // tab. Pages with none (Radio, AetherNR and Final Output) leave the button and the
+    // entries off.
     void theExactValuesOpenFromTheHeaderTheGearAndTheTab()
     {
         make();
@@ -2685,15 +2720,17 @@ private slots:
         auto* gear = m_window->findChild<QMenu*>(QStringLiteral("gearMenu"));
         QAction* gearEntry = actionNamed(gear, QStringLiteral("Exact values..."));
         QVERIFY(gearEntry);
-        for (const char* id : {"radio", "nr", "output", "eq", "comp", "tube", "exciter"}) {
+        for (const char* id : {"radio", "nr", "output"}) {
             m_window->showPage(QLatin1String(id));
             QVERIFY2(!button->isEnabled(), id);
             QVERIFY2(!gearEntry->isEnabled(), id);
-            // On a stage page that has every value on it, the button says so, rather than send
-            // the operator to the stage pages.
-            const bool stagePage = !findPage(QLatin1String(id))->stage.isEmpty();
-            QCOMPARE(button->toolTip(), stagePage ? QStringLiteral("All of this stage's values are on its page.")
-                                                  : QStringLiteral("Exact values are for the stage pages."));
+            QCOMPARE(button->toolTip(), QStringLiteral("Exact values are for the stage pages."));
+        }
+        // The stages on AetherRX's pages have theirs; the EQ's hold its output gain.
+        for (const char* id : {"eq", "comp", "tube", "exciter"}) {
+            m_window->showPage(QLatin1String(id));
+            QVERIFY2(button->isEnabled(), id);
+            QVERIFY2(gearEntry->isEnabled(), id);
         }
         auto* details = m_window->findChild<DetailsWindow*>(QStringLiteral("details_gate"));
         QVERIFY(details && !details->isVisible());
@@ -2727,8 +2764,25 @@ private slots:
         emit railTab(QStringLiteral("Compressor"))->customContextMenuRequested(QPoint(10, 10));
         menu = openPopup();
         QVERIFY(menu);
-        QVERIFY(!actionNamed(menu, QStringLiteral("Exact values..."))->isEnabled());
+        tabEntry = actionNamed(menu, QStringLiteral("Exact values..."));
+        QVERIFY(tabEntry && tabEntry->isEnabled());
+        tabEntry->trigger();
         menu->close();
+        auto* compDetails = m_window->findChild<DetailsWindow*>(QStringLiteral("details_comp"));
+        QTRY_VERIFY(compDetails && compDetails->isVisible());
+        compDetails->close();
+        // Every stage's tab now has exact values, the EQ's included.
+        activate();
+        emit railTab(QStringLiteral("EQ"))->customContextMenuRequested(QPoint(10, 10));
+        menu = openPopup();
+        QVERIFY(menu);
+        tabEntry = actionNamed(menu, QStringLiteral("Exact values..."));
+        QVERIFY(tabEntry && tabEntry->isEnabled());
+        tabEntry->trigger();
+        menu->close();
+        auto* eqDetails = m_window->findChild<DetailsWindow*>(QStringLiteral("details_eq"));
+        QTRY_VERIFY(eqDetails && eqDetails->isVisible());
+        eqDetails->close();
     }
 
     // The header's button marks a page that leaves out a value moved from its default:

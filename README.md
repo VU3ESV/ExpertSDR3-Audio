@@ -15,7 +15,7 @@ on the machine, and mutes ExpertSDR3's own audio while it plays so you don't hea
 
 ## Noise reduction methods
 
-Pick one on the **NR** tab or with `--nr`. All are AetherSDR's own code, unmodified.
+Pick one from the **AetherNR** page's tabs or with `--nr`. All are AetherSDR's own code, unmodified.
 
 | Method | What it is | SNR gain | Noise in pauses | Delay | CPU |
 |---|---|---|---|---|---|
@@ -92,7 +92,7 @@ Cargo if there is none for your platform. Skip it to build without DFNR. Other o
 1. In ExpertSDR3, enable TCI in its options, and start the radio.
 2. Start the app and press **Connect**. If nothing answers on the port shown, the usual TCI
    ports (40001, 50001, 60001) are tried automatically.
-3. Choose your **Device**, and a method on the **NR** tab.
+3. Choose your **Device** on **Final Output**, and a method from the **AetherNR** page's tabs.
 
 To run without a display, for example on a Raspberry Pi:
 ```sh

@@ -300,10 +300,15 @@ add_library(esa_gui STATIC
     src/gui/AboutDialog.cpp src/gui/RadioDiscoveryDialog.cpp
     src/gui/shell/HeaderBar.cpp src/gui/shell/StatusChip.cpp
     src/gui/pages/Pages.cpp src/gui/pages/RadioPage.cpp src/gui/pages/NrPage.cpp
-    src/gui/pages/OutputPage.cpp src/gui/pages/LegacyStagePage.cpp
+    src/gui/pages/OutputPage.cpp
     src/gui/pages/StageHost.cpp src/gui/pages/GatePage.cpp
+    src/gui/pages/CompPage.cpp src/gui/pages/TubePage.cpp src/gui/pages/ExciterPage.cpp
     src/gui/binding/StageBinding.cpp)
 target_link_libraries(esa_gui PUBLIC esa_core aether_gui Qt6::Gui Qt6::Widgets)
+# The EQ page and its analyser's feed, in their own block so the line re-applies cleanly.
+target_sources(esa_gui PRIVATE src/gui/pages/EqPage.cpp src/gui/binding/EqFeed.cpp)
+# Final Output: this computer's output settings on its page, and the feed of its meter and scope.
+target_sources(esa_gui PRIVATE src/gui/pages/StationBand.cpp src/gui/binding/OutputFeed.cpp)
 
 # ── The window's frame (ui/frame): the platform's own, or AetherRX's ─────────
 # Its own block, so it re-applies onto a restructured build. A Mac hides the system's title

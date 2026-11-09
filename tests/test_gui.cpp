@@ -74,6 +74,17 @@ private:
         return nullptr;
     }
 
+    // The AetherNR page's method tabs that are lit, by method id: the method NR runs.
+    QStringList litNrTabs()
+    {
+        QStringList lit;
+        const auto buttons = m_window->findChildren<QPushButton*>();
+        for (QPushButton* b : buttons) {
+            if (b->objectName().startsWith(QLatin1String("nrTab_")) && b->isChecked()) lit << b->objectName().mid(6);
+        }
+        return lit;
+    }
+
 private slots:
     void initTestCase()
     {
@@ -231,26 +242,25 @@ private slots:
         control(QStringLiteral("comp.threshold"))->setValue(-30);
         control(QStringLiteral("gate.mode"))->setValue(1);
         control(QStringLiteral("gate.ratio"))->setValue(3.5);  // not the preset the mode implies
-        // RN2, chosen on the AetherNR page as the operator would. Once that page has its method
-        // tabs, this presses nrTab_rn2 instead of setting the interim combo.
+        // RN2, chosen on the AetherNR page as the operator would: its tab.
         m_window->showPage(QStringLiteral("nr"));
-        auto* method = m_window->findChild<QComboBox*>(QStringLiteral("nrMethod"));
-        QVERIFY(method);
-        QVERIFY(method->findData(QStringLiteral("rn2")) >= 0);
-        method->setCurrentIndex(method->findData(QStringLiteral("rn2")));
+        auto* rn2 = m_window->findChild<QPushButton*>(QStringLiteral("nrTab_rn2"));
+        QVERIFY(rn2 && rn2->isEnabled());
+        rn2->click();
+        QCOMPARE(litNrTabs(), QStringList{QStringLiteral("rn2")});
         QVERIFY(m_window->saveProfileAs(QStringLiteral("Mine")));
 
         m_window->loadProfile(QString());
         QCOMPARE(control(QStringLiteral("comp.threshold"))->value(), -18.0);
         QCOMPARE(control(QStringLiteral("gate.mode"))->value(), 0.0);
-        QCOMPARE(method->currentData().toString(), QString());
+        QCOMPARE(litNrTabs(), QStringList());
         QCOMPARE(m_window->currentProfile(), QString());
         QVERIFY(!m_window->chainModified());
 
         m_window->loadProfile(QStringLiteral("Mine"));
         QCOMPARE(control(QStringLiteral("comp.threshold"))->value(), -30.0);
         QCOMPARE(control(QStringLiteral("gate.mode"))->value(), 1.0);
-        QCOMPARE(method->currentData().toString(), QStringLiteral("rn2"));
+        QCOMPARE(litNrTabs(), QStringList{QStringLiteral("rn2")});
         // Upstream's mode is a preset overwriting ratio; the saved value has to win over it.
         QCOMPARE(control(QStringLiteral("gate.ratio"))->value(), 3.5);
         QVERIFY(!m_window->chainModified());
@@ -289,11 +299,11 @@ private slots:
         auto* host = m_window->findChild<QLineEdit*>(QStringLiteral("host"));
         QVERIFY(host);
         QCOMPARE(host->text(), QStringLiteral("10.0.0.9"));
-        // Once Final Output is AetherRX's own, this reads its Volume knob's value() instead.
-        auto* volume = m_window->findChild<QSlider*>(QStringLiteral("volume"));
+        // Final Output's Volume knob, -60 to +30 dB, still where this computer had it.
+        AetherSDR::ClientCompKnob* volume = knob(QStringLiteral("Volume"));
         QVERIFY(volume);
-        QCOMPARE(volume->minimum(), -60);
-        QCOMPARE(volume->value(), -12);
+        QCOMPARE(volume->value(), -12.0f);
+        QCOMPARE(m_window->config().outputGainDb, -12.0);
     }
 
     // An AetherRX knob, found as the operator finds it: by what it is and what it says.

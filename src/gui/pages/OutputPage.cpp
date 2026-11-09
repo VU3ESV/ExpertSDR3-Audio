@@ -1,190 +1,241 @@
 #include "gui/pages/OutputPage.h"
 
-#include "gui/shell/StatusChip.h"
+#include "gui/aether/Guards.h"
+#include "gui/binding/OutputFeed.h"
+#include "gui/pages/StationBand.h"
 
+#include "ClientCompKnob.h"
+#include "StagePage.h"
+#include "StripRxOutputPanel.h"
+#include "StripWaveformPanel.h"
+#include "WaveformWidget.h"
+#include "core/AudioEngine.h"
 #include "core/ThemeManager.h"
 
-#include <QCheckBox>
-#include <QComboBox>
-#include <QFrame>
-#include <QGridLayout>
-#include <QGroupBox>
+#include <QEvent>
 #include <QLabel>
-#include <QProgressBar>
-#include <QPushButton>
 #include <QSignalBlocker>
-#include <QSlider>
-#include <QSpinBox>
 #include <QVBoxLayout>
+#include <QtGlobal>
 
 #include <algorithm>
-#include <cmath>
 
 namespace esa {
 
 namespace {
-const QString kLabel = QStringLiteral("color.text.label");
+
+using AetherSDR::ClientCompKnob;
+
+constexpr float kMinVolumeDb = float(kMinOutputGainDb);
+constexpr float kMaxVolumeDb = float(kMaxOutputGainDb);
+
+} // namespace
+
+float OutputPage::volumeFromNorm(float norm)
+{
+    norm = std::clamp(norm, 0.0f, 1.0f);
+    // Each half from its own end, so the middle is exactly 0 dB, never -0.
+    if (norm <= 0.5f) return kMinVolumeDb + 2.0f * norm * -kMinVolumeDb;
+    return 2.0f * (norm - 0.5f) * kMaxVolumeDb;
+}
+
+float OutputPage::normFromVolume(float db)
+{
+    db = std::clamp(db, kMinVolumeDb, kMaxVolumeDb);
+    if (db <= 0.0f) return 0.5f * (db - kMinVolumeDb) / -kMinVolumeDb;
+    return 0.5f + 0.5f * db / kMaxVolumeDb;
 }
 
 OutputPage::OutputPage(PageContext& ctx)
     : Page(ctx)
 {
+    // As AetherRxDialog builds its last tab: the output panel at the top, the waveform below
+    // taking what room is left (its own top stretch keeps the scope at the bottom), and
+    // between them, where AetherRX leaves room, this computer's output.
+    m_output = new AetherSDR::StripRxOutputPanel(ctx.aether);
+    m_waveform = new AetherSDR::StripWaveformPanel(ctx.aether);
+    m_scope = m_waveform->findChild<AetherSDR::WaveformWidget*>();
+    makeVolume();
+    m_band = new StationBand(ctx);
+
     auto* content = new QWidget;
     auto* column = new QVBoxLayout(content);
-    column->addWidget(buildOutputBox());
-    column->addWidget(buildMeter());
-    column->addStretch(1);
-
+    column->setContentsMargins(0, 0, 0, 0);
+    column->setSpacing(8);
+    column->addWidget(m_output, 0, Qt::AlignTop);
+    column->addWidget(m_band);
+    column->addWidget(m_waveform, 1);
+    // Exactly the page wherever it fits. On a screen too short for it (a Raspberry Pi's
+    // 480 lines) it scrolls, rather than cutting the scope off at the bottom.
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
-    layout->addWidget(scrollable(content));
-    AetherSDR::ThemeManager::instance().applyStyleSheet(this, interimPageSheet());
+    QWidget* scroller = scrollable(content);
+    // A slim canon bar, as the other pages scroll with; only when it scrolls at all. Across
+    // too: a window at its narrowest cuts MUTE and BOOST off at the right, and the bar is the
+    // way to them, so it needs a handle to see and take.
+    AetherSDR::ThemeManager::instance().applyStyleSheet(scroller, QStringLiteral(R"(
+QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
+QScrollBar::handle:vertical {
+    background: {{color.canon.lineHi}};
+    border-radius: 3px;
+    min-height: 30px;
+}
+QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px; }
+QScrollBar::handle:horizontal {
+    background: {{color.canon.lineHi}};
+    border-radius: 3px;
+    min-width: 30px;
+}
+QScrollBar::add-line, QScrollBar::sub-line {
+    width: 0;
+    height: 0;
+    border: none;
+    background: none;
+}
+QScrollBar::add-page, QScrollBar::sub-page { background: none; }
+)"));
+    layout->addWidget(scroller);
+
+    // What goes to the speakers, shaped by the window's own Volume and BOOST, read before MUTE.
+    m_feed = new OutputFeed(
+        ctx.taps, ctx.aether,
+        [this] {
+            OutputFeed::Shape shape;
+            shape.volumeDb = config().outputGainDb;
+            shape.boost = config().boost;
+            return shape;
+        },
+        this);
+    connect(m_feed, &OutputFeed::silenceChanged, this, &OutputPage::showScopeNote);
+
+    if (m_scope) {
+        m_scopeNote = new QLabel(m_scope);
+        m_scopeNote->setObjectName(QStringLiteral("outputScopeNote"));
+        m_scopeNote->setAlignment(Qt::AlignCenter);
+        // A click still reaches the scope beneath, which pauses it.
+        m_scopeNote->setAttribute(Qt::WA_TransparentForMouseEvents);
+        m_scopeNote->hide();
+        m_scope->installEventFilter(this);
+    }
 }
 
-QWidget* OutputPage::buildOutputBox()
+void OutputPage::makeVolume()
 {
-    auto* box = new QGroupBox(QStringLiteral("Audio output"));
-    auto* grid = new QGridLayout(box);
-
-    m_device = new QComboBox;
-    m_device->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
-    auto* refresh = new QPushButton(QStringLiteral("Refresh"));
-    refresh->setToolTip(QStringLiteral("Look again for audio devices, e.g. after plugging one in."));
-
-    m_buffer = new QSpinBox;
-    m_buffer->setRange(10, 500);
-    m_buffer->setSuffix(QStringLiteral(" ms"));
-    m_buffer->setValue(config().bufferMs);
-    m_buffer->setToolTip(QStringLiteral("Lower is less delay; raise it if you hear dropouts. Grows by itself after an underrun."));
-
-    m_gain = new QSlider(Qt::Horizontal);
-    m_gain->setObjectName(QStringLiteral("volume"));
-    m_gain->setAccessibleName(QStringLiteral("Volume"));
-    m_gain->setRange(-60, 30);
-    m_gain->setValue(int(config().outputGainDb));
-    m_gainLabel = new QLabel;
-    m_gainLabel->setMinimumWidth(52);
-    m_gainLabel->setText(QStringLiteral("%1 dB").arg(m_gain->value()));
-
-    m_boost = new QCheckBox(QStringLiteral("Soft boost"));
-    m_boost->setChecked(config().boost);
-    m_boost->setToolTip(QStringLiteral("About 2x louder on quiet signals, never past full scale."));
-    m_muteOutput = new QPushButton(QStringLiteral("Mute"));
-    m_muteOutput->setCheckable(true);
-
-    // Full width, so a long error wraps here instead of pushing the controls above about.
-    m_outputStatus = hintLabel();
-    m_outputStatus->hide();  // until there is something to say
-    m_devicesNote = hintLabel(colored(QStringLiteral("color.accent.danger"), QStringLiteral("No audio output devices found")));
-    m_devicesNote->hide();
-
-    grid->addWidget(new QLabel(QStringLiteral("Device")), 0, 0);
-    grid->addWidget(m_device, 0, 1, 1, 3);
-    grid->addWidget(refresh, 0, 4);
-    grid->addWidget(new QLabel(QStringLiteral("Volume")), 1, 0);
-    grid->addWidget(m_gain, 1, 1);
-    grid->addWidget(m_gainLabel, 1, 2);
-    grid->addWidget(m_boost, 1, 3);
-    grid->addWidget(m_muteOutput, 1, 4);
-    grid->addWidget(new QLabel(QStringLiteral("Buffer")), 2, 0);
-    grid->addWidget(m_buffer, 2, 1);
-    grid->addWidget(m_outputStatus, 3, 0, 1, 5);
-    grid->addWidget(m_devicesNote, 4, 0, 1, 5);
-    grid->setColumnStretch(1, 1);
-
-    connect(m_device, &QComboBox::currentIndexChanged, this, &OutputPage::onDeviceSelected);
-    connect(refresh, &QPushButton::clicked, this, [this] {
-        context().post([](Engine* engine) { engine->refreshDevices(); });
-    });
-    connect(m_buffer, &QSpinBox::valueChanged, this, [this](int ms) {
-        config().bufferMs = ms;
-        context().post([ms](Engine* engine) { engine->setBufferMs(ms); });
-    });
-    connect(m_gain, &QSlider::valueChanged, this, [this](int db) {
-        m_gainLabel->setText(QStringLiteral("%1 dB").arg(db));
-        config().outputGainDb = db;
-        context().post([db](Engine* engine) { engine->setOutputGainDb(db); });
-    });
-    connect(m_boost, &QCheckBox::toggled, this, [this](bool on) {
-        config().boost = on;
-        context().post([on](Engine* engine) { engine->setBoost(on); });
-    });
-    connect(m_muteOutput, &QPushButton::toggled, this, [this](bool on) {
-        context().post([on](Engine* engine) { engine->setOutputMuted(on); });
-    });
-    return box;
+    // Upstream's Trim, the panel's only knob, becomes the one gain control there is.
+    const auto knobs = m_output->findChildren<ClientCompKnob*>();
+    Q_ASSERT(knobs.size() == 1);
+    if (knobs.size() != 1) {
+        // test_aether_gui fails on this too: the panel changed in a sync.
+        qWarning("The Final Output panel has %d knobs where one was expected.", int(knobs.size()));
+        if (knobs.isEmpty()) return;
+    }
+    m_volume = knobs.constFirst();
+    m_volume->setLabel(QStringLiteral("Volume"));
+    m_volume->setAccessibleName(QStringLiteral("Volume"));
+    m_volume->setToolTip(QStringLiteral("How loud this app plays, from -60 to +30 dB; 0 dB at the top. "
+                                        "Double-click for 0 dB. Kept with this computer's settings, not in profiles."));
+    m_volume->setRange(kMinVolumeDb, kMaxVolumeDb);
+    m_volume->setDefault(0.0f);
+    m_volume->setValueFromNorm(&OutputPage::volumeFromNorm);
+    m_volume->setNormFromValue(&OutputPage::normFromVolume);
+    // Upstream's "+0.8 dB" reading stays.
+    const QSignalBlocker block(m_volume);
+    m_volume->setValue(float(config().outputGainDb));
 }
 
-QWidget* OutputPage::buildMeter()
+void OutputPage::attach()
 {
-    auto* box = new QFrame;
-    auto* grid = new QGridLayout(box);
-    grid->setContentsMargins(4, 0, 4, 0);
+    // As AetherRxDialog, once every page is in the window: bound to RX, then the floating
+    // editors' chrome taken off. Both title plates stay, because on this page they are what
+    // tell the two panels apart.
+    m_output->showForRx();
+    m_waveform->showForRx();
+    AetherSDR::tidyEmbeddedPanel(m_output, /*keepTitle=*/true);
+    AetherSDR::tidyEmbeddedPanel(m_waveform, /*keepTitle=*/true);
+    WheelAccumulator::install(m_output);
+    ValueFieldGuard::install(m_output);
 
-    m_outputMeter = new QProgressBar;
-    m_outputMeter->setRange(-60, 0);
-    m_outputMeter->setValue(-60);
-    m_outputMeter->setTextVisible(false);
-    m_outputMeter->setAccessibleName(QStringLiteral("To speakers"));
-    m_outputValue = new QLabel(QStringLiteral("-- dB"));
-    m_outputValue->setMinimumWidth(60);
-    m_stats = hintLabel();
-
-    grid->addWidget(new QLabel(QStringLiteral("To speakers")), 0, 0);
-    grid->addWidget(m_outputMeter, 0, 1);
-    grid->addWidget(m_outputValue, 0, 2);
-    grid->addWidget(m_stats, 1, 0, 1, 3);
-    grid->setColumnStretch(1, 1);
-    return box;
+    if (!m_scope) return;
+    // A click pauses the scope. A double-click would open upstream's WAVE settings, which
+    // this app does not have.
+    m_scope->setToolTip(QStringLiteral("Click to pause or resume the waveform."));
+#if defined(Q_PROCESSOR_ARM) && defined(Q_OS_LINUX)
+    // Upstream redraws it at 62 Hz, too much for a Raspberry Pi beside everything else. Only
+    // Linux on ARM: an Apple Silicon Mac keeps upstream's rate.
+    m_scope->setRefreshRateHz(30);
+#endif
+    // In the colour and size upstream writes its own message over the scope in.
+    m_scope->ensurePolished();
+    const double points = std::max(8.0, m_scope->font().pointSizeF() - 1.0);
+    AetherSDR::ThemeManager::instance().applyStyleSheet(
+        m_scopeNote, QStringLiteral("QLabel { background: transparent; color: {{color.text.secondary}};"
+                                    " font-size: %1pt; padding: 0; }")
+                         .arg(points));
+    showScopeNote();
 }
 
 void OutputPage::showDevices(const QList<AudioDeviceInfo>& devices)
 {
-    const QSignalBlocker block(m_device);
-    const QString selected = config().deviceKey;
-    m_device->clear();
-    m_device->addItem(QStringLiteral("System default"), QString());
-    for (const AudioDeviceInfo& device : devices) {
-        QString label = QStringLiteral("%1  (%2)").arg(device.name, device.hostApi);
-        if (device.isDefault) label += QStringLiteral("  *");
-        m_device->addItem(label, device.key);
-    }
-    m_devicesNote->setVisible(devices.isEmpty());
-    const int index = m_device->findData(selected);
-    if (index >= 0) {
-        m_device->setCurrentIndex(index);
-    } else {
-        // The saved device is not plugged in right now. Show it rather than silently
-        // switching the setting, so plugging it back in restores it.
-        m_device->addItem(QStringLiteral("%1 (not found)").arg(selected.section(QLatin1Char('|'), 1)), selected);
-        m_device->setCurrentIndex(selected.isEmpty() ? 0 : m_device->count() - 1);
-    }
-}
-
-void OutputPage::onDeviceSelected(int index)
-{
-    const QString key = m_device->itemData(index).toString();
-    config().deviceKey = key;
-    context().post([key](Engine* engine) { engine->setOutputDevice(key); });
+    m_band->showDevices(devices);
 }
 
 void OutputPage::showStatus(const EngineStatus& s)
 {
-    const QString output = statusText::output(s);
-    if (output != m_outputStatus->text()) m_outputStatus->setText(output);
-    m_outputStatus->setVisible(!output.isEmpty());
+    m_band->showStatus(s);
+    m_radioConnected = s.connection == TciClient::State::Ready;
+    showScopeNote();
+}
 
-    // The output meter shows what actually reaches the device, after volume.
-    const float outputDb = s.sink.peak > 1e-6f ? 20.0f * std::log10(s.sink.peak) : -120.0f;
-    m_outputMeter->setValue(int(std::clamp(outputDb, -60.0f, 0.0f)));
-    m_outputValue->setText(outputDb > -100.0f ? QStringLiteral("%1 dB").arg(outputDb, 0, 'f', 0)
-                                              : QStringLiteral("-- dB"));
+void OutputPage::showChain()
+{
+    // Volume, BOOST and MUTE are not part of a profile, so a load leaves them as they were.
+    m_output->syncControlsFromEngine();
+}
 
-    m_stats->setText(colored(kLabel, QStringLiteral("DSP %1%   ·   clock correction %2 ppm   ·   underruns %3   ·   lost blocks %4")
-                                         .arg(s.dspLoad * 100.0, 0, 'f', 1)
-                                         .arg(s.sink.driftPpm, 0, 'f', 0)
-                                         .arg(s.sink.underruns)
-                                         .arg(s.droppedBlocks)));
+void OutputPage::showEvent(QShowEvent* event)
+{
+    Page::showEvent(event);
+    m_feed->start();
+    showScopeNote();
+}
+
+void OutputPage::hideEvent(QHideEvent* event)
+{
+    m_feed->stop();
+    Page::hideEvent(event);
+}
+
+bool OutputPage::eventFilter(QObject* watched, QEvent* event)
+{
+    if (watched == m_scope && (event->type() == QEvent::Resize || event->type() == QEvent::Show)) {
+        placeScopeNote();
+    }
+    return Page::eventFilter(watched, event);
+}
+
+void OutputPage::showScopeNote()
+{
+    if (!m_scopeNote) return;
+    // Silence is fed only when nothing reaches the output: no radio, or a radio sending
+    // nothing. A muted output still has audio reaching it, and MUTE says why it is quiet.
+    const QString text = m_radioConnected ? QStringLiteral("No audio from radio") : QStringLiteral("Not connected");
+    if (text != m_scopeNote->text()) {
+        m_scopeNote->setText(text);
+        placeScopeNote();
+    }
+    m_scopeNote->setVisible(m_feed->feedingSilence());
+}
+
+void OutputPage::placeScopeNote()
+{
+    if (!m_scopeNote || !m_scope) return;
+    // Where upstream writes its "Enable PC Audio": the middle of the plot, which is the
+    // scope less its readout line, its footer and its dB column (WaveformWidget::plotArea).
+    const QRect plot = m_scope->rect().adjusted(5, 18, -34, -17);
+    m_scopeNote->adjustSize();
+    QRect note(QPoint(), m_scopeNote->size());
+    note.moveCenter(plot.center());
+    m_scopeNote->setGeometry(note);
 }
 
 } // namespace esa

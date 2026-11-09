@@ -67,6 +67,9 @@ struct PageContext {
     std::function<void()> chainChanged;
     // Turns a noise-reduction method on, or NR off with an empty id.
     std::function<void(const QString& id)> selectNrMethod;
+    // The method the AetherNR box turns back on (nr/lastMethod, else NR2), which the AetherNR
+    // page shows while NR is off.
+    std::function<QString()> lastNrMethod;
     // Opens Find Radios.
     std::function<void()> findRadios;
 
@@ -91,8 +94,8 @@ enum RailId : int {
     kRailRadio = 100,
 };
 
-// One row of the rail and the page it opens. A page that changes kind (the vendored stage
-// pages replacing today's grids) changes only its `make` here.
+// One row of the rail and the page it opens. A page that changes kind changes only its
+// `make` here.
 struct PageEntry {
     QString id;     // for --page and ui/page
     int railId;
@@ -107,13 +110,9 @@ struct PageEntry {
 const QList<PageEntry>& pageTable();
 const PageEntry* findPage(const QString& id);
 
-// Today's controls in the canon look, for the interim pages that still show them. Applied to
-// the page itself, so it outranks the canon body's "everything is transparent" rule there
-// and reaches nothing outside it: not the rail, the header, or a vendored page.
-QString interimPageSheet();
-
-// The same look for the dialogs the window opens (profile names, Find Radios, About, message
-// boxes): scoped to QDialog, so the window can carry it without it reaching the rail.
+// Today's controls in the canon look, for the dialogs the window opens (profile names, Find
+// Radios, About, message boxes): scoped to QDialog, so the window can carry it without it
+// reaching the rail.
 QString dialogSheet();
 
 // A wrapping rich-text label, for status and description lines.

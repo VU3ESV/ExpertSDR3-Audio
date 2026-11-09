@@ -436,6 +436,26 @@ private slots:
         QVERIFY(!sameChain(base, value));
     }
 
+    // Values compare as they show. EQ's Q defaults to 0.707, which its control, at 2 decimals,
+    // can only hold as 0.71: that is still the default. One step away is not.
+    void aValueComparesAtItsShownDecimals()
+    {
+        const QString q = QStringLiteral("eq.b0.q");
+        const ParamSpec* spec = findParamSpec(q);
+        QVERIFY(spec);
+        QCOMPARE(spec->decimals, 2);
+        QVERIFY(std::abs(spec->def - 0.707) < 1e-6);
+        ChainSettings shown = defaultChain();
+        shown.params.insert(q, 0.71);
+        QVERIFY(sameChain(shown, defaultChain()));
+        ChainSettings stepAway = defaultChain();
+        stepAway.params.insert(q, 0.72);
+        QVERIFY(!sameChain(stepAway, defaultChain()));
+        ChainSettings justBelow = defaultChain();
+        justBelow.params.insert(q, 0.70);
+        QVERIFY(!sameChain(justBelow, defaultChain()));
+    }
+
     void anUnsetValueMeansItsDefault()
     {
         ChainSettings implicit;
@@ -666,6 +686,32 @@ private slots:
             raw.setValue(QStringLiteral("params/") + key, stored);
         }
         QCOMPARE(Settings(ini).load().params.value(key), loaded);
+    }
+
+    // The Volume a file holds comes back as a Volume the knob can show: within its range, and
+    // a "nan", which would pass every clamp on its way to the speakers, as the default.
+    void aSavedVolumeLoadsWithinItsRange_data()
+    {
+        QTest::addColumn<QString>("stored");
+        QTest::addColumn<double>("loaded");
+        QTest::newRow("in range") << QStringLiteral("-6.5") << -6.5;
+        QTest::newRow("nan") << QStringLiteral("nan") << 0.0;
+        QTest::newRow("inf") << QStringLiteral("inf") << 0.0;
+        QTest::newRow("-inf") << QStringLiteral("-inf") << 0.0;
+        QTest::newRow("too loud") << QStringLiteral("45") << 30.0;
+        QTest::newRow("too quiet") << QStringLiteral("-80") << -60.0;
+    }
+
+    void aSavedVolumeLoadsWithinItsRange()
+    {
+        QFETCH(QString, stored);
+        QFETCH(double, loaded);
+        const QString ini = path("volume.ini");
+        {
+            QSettings raw(ini, QSettings::IniFormat);
+            raw.setValue(QStringLiteral("output/gainDb"), stored);
+        }
+        QCOMPARE(Settings(ini).load().outputGainDb, loaded);
     }
 };
 

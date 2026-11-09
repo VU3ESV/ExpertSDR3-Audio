@@ -465,7 +465,8 @@ QStringList radioChangingCommands(const QStringList& commands)
     QStringList found;
     for (const QString& c : commands) {
         if (c.startsWith(QLatin1String("trx")) || c.startsWith(QLatin1String("volume"))
-            || c.startsWith(QLatin1String("mute"))) {
+            || c.startsWith(QLatin1String("mute")) || c.startsWith(QLatin1String("rx_volume"))
+            || c.startsWith(QLatin1String("rx_mute"))) {
             found << c;
         }
     }

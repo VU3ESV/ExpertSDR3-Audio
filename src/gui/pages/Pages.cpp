@@ -1,7 +1,6 @@
 #include "gui/pages/Pages.h"
 
 #include "dsp/RxChain.h"
-#include "gui/pages/LegacyStagePage.h"
 #include "gui/pages/NrPage.h"
 #include "gui/pages/OutputPage.h"
 #include "gui/pages/RadioPage.h"
@@ -34,12 +33,6 @@ AppConfig& Page::config() const
 const QList<PageEntry>& pageTable()
 {
     static const QList<PageEntry> table = [] {
-        const auto legacy = [](const QString& stage) {
-            return [stage](PageContext& c) -> Page* { return new LegacyStagePage(c, stage); };
-        };
-        const auto stageRow = [&](const QString& id, int railId, const QString& stage) {
-            return PageEntry{id, railId, RxChain::stageLabel(stage), stage, true, legacy(stage)};
-        };
         return QList<PageEntry>{
             {QStringLiteral("radio"), kRailRadio, QStringLiteral("Radio"), QString(), false,
              [](PageContext& c) -> Page* { return new RadioPage(c); }},
@@ -47,10 +40,13 @@ const QList<PageEntry>& pageTable()
              [](PageContext& c) -> Page* { return new NrPage(c); }},
             {QStringLiteral("gate"), kRailGate, RxChain::stageLabel(QStringLiteral("gate")), QStringLiteral("gate"), true,
              makeGatePage},
-            stageRow(QStringLiteral("eq"), kRailEq, QStringLiteral("eq")),
-            stageRow(QStringLiteral("comp"), kRailComp, QStringLiteral("comp")),
-            stageRow(QStringLiteral("tube"), kRailTube, QStringLiteral("tube")),
-            stageRow(QStringLiteral("exciter"), kRailExciter, QStringLiteral("pudu")),
+            {QStringLiteral("eq"), kRailEq, RxChain::stageLabel(QStringLiteral("eq")), QStringLiteral("eq"), true, makeEqPage},
+            {QStringLiteral("comp"), kRailComp, RxChain::stageLabel(QStringLiteral("comp")), QStringLiteral("comp"), true,
+             makeCompPage},
+            {QStringLiteral("tube"), kRailTube, RxChain::stageLabel(QStringLiteral("tube")), QStringLiteral("tube"), true,
+             makeTubePage},
+            {QStringLiteral("exciter"), kRailExciter, RxChain::stageLabel(QStringLiteral("pudu")), QStringLiteral("pudu"),
+             true, makeExciterPage},
             {QStringLiteral("output"), kRailOutput, QStringLiteral("Final Output"), QString(), false,
              [](PageContext& c) -> Page* { return new OutputPage(c); }},
         };
@@ -170,60 +166,6 @@ QString sharedControlRules()
 }
 
 } // namespace
-
-QString interimPageSheet()
-{
-    return QString(sharedControlRules()).replace(QLatin1String("@scope@"), QString()) + QStringLiteral(R"(
-QLabel, QCheckBox { color: {{color.canon.inkSoft}}; }
-QLabel:disabled, QCheckBox:disabled { color: {{color.button.foreground.disabled}}; }
-
-QGroupBox {
-    background: transparent;
-    border: 1px solid {{color.canon.lineHi}};
-    border-radius: 8px;
-    margin-top: 10px;
-    padding-top: 6px;
-    font-weight: 700;
-}
-QGroupBox::title {
-    subcontrol-origin: margin;
-    left: 10px;
-    padding: 0 4px;
-    color: {{color.canon.ink}};
-}
-
-QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
-QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px; }
-QScrollBar::handle:vertical {
-    background: {{color.canon.lineHi}};
-    border-radius: 3px;
-    min-height: 30px;
-}
-QScrollBar::handle:horizontal {
-    background: {{color.canon.lineHi}};
-    border-radius: 3px;
-    min-width: 30px;
-}
-QScrollBar::add-line, QScrollBar::sub-line {
-    width: 0;
-    height: 0;
-    border: none;
-    background: none;
-}
-QScrollBar::add-page, QScrollBar::sub-page { background: none; }
-
-QProgressBar {
-    background: {{color.canon.control}};
-    border: 1px solid {{color.canon.line}};
-    border-radius: 3px;
-    max-height: 12px;
-}
-QProgressBar::chunk {
-    background: {{color.accent.success}};
-    border-radius: 2px;
-}
-)");
-}
 
 QString dialogSheet()
 {

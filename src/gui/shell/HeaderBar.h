@@ -36,10 +36,9 @@ public:
     QString profileState() const;
 
     // "⋯": the current stage's exact values. Usable only on a page that has them; the dot
-    // says the page leaves out a value moved from its default. `onStagePage`: unusable because
-    // the stage's page shows every value it has, rather than because this is no stage's page.
+    // says the page leaves out a value moved from its default.
     QPushButton* exactValuesButton() const { return m_exactValues; }
-    void setExactValues(bool available, bool flagged, bool onStagePage);
+    void setExactValues(bool available, bool flagged);
     bool exactValuesFlagged() const;
 
     // "● REC 01:23" while a recording is on, amber once it has lost audio, and

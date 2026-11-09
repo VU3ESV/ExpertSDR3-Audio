@@ -10,6 +10,7 @@
 #include <QUrl>
 
 #include <algorithm>
+#include <cmath>
 
 namespace esa {
 
@@ -90,7 +91,10 @@ AppConfig Settings::load() const
     c.receiver = s.value(QStringLiteral("radio/receiver"), c.receiver).toInt();
     c.deviceKey = s.value(QStringLiteral("output/device")).toString();
     c.bufferMs = s.value(QStringLiteral("output/bufferMs"), c.bufferMs).toInt();
-    c.outputGainDb = s.value(QStringLiteral("output/gainDb"), c.outputGainDb).toDouble();
+    // A damaged or hand-edited file can hold "nan", which no clamp after this stops on its way
+    // to the speakers; that is no Volume at all, so the default.
+    const double gainDb = s.value(QStringLiteral("output/gainDb"), c.outputGainDb).toDouble();
+    if (std::isfinite(gainDb)) c.outputGainDb = std::clamp(gainDb, kMinOutputGainDb, kMaxOutputGainDb);
     c.boost = s.value(QStringLiteral("output/boost"), c.boost).toBool();
     c.muteExpert = s.value(QStringLiteral("output/muteExpert"), c.muteExpert).toBool();
     c.chainRate = s.value(QStringLiteral("chain/rate"), c.chainRate).toInt();

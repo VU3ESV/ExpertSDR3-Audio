@@ -10,7 +10,6 @@
 #include <functional>
 
 class QGridLayout;
-class QLabel;
 
 namespace esa {
 
@@ -21,8 +20,8 @@ class ParamControl;
 // so it is non-modal, sits on the canon ground, and Escape closes it.
 //
 // The window keeps one per stage for its whole life, hidden until asked for, so every control
-// exists from the start. A stage whose page is still today's grid shows its controls there
-// instead, and this stays empty, saying so.
+// exists from the start. None is ever empty: every stage has at least its on/off, which its
+// page leaves to the rail.
 class DetailsWindow : public QDialog {
     Q_OBJECT
 
@@ -43,9 +42,6 @@ public:
     const QList<ParamControl*>& controls() const { return m_controls; }
     bool hasControls() const { return !m_controls.isEmpty(); }
 
-    // A line in place of the controls, for a stage that shows them on its page.
-    void setNote(const QString& text);
-
     // Where the stage's ParamControls go, laid out as ParamControl lays a row.
     QGridLayout* grid() const { return m_grid; }
     // The first row nothing uses yet.
@@ -59,7 +55,6 @@ public:
 private:
     QString m_stage;
     QGridLayout* m_grid{nullptr};
-    QLabel* m_note{nullptr};
     QList<ParamControl*> m_controls;
 };
 

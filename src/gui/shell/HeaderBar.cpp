@@ -298,7 +298,7 @@ HeaderBar::HeaderBar(const QString& title, QWidget* parent)
 
     m_exactValues = new ExactValuesButton;
     row->addWidget(m_exactValues);
-    setExactValues(false, false, false);
+    setExactValues(false, false);
 
     AetherSDR::ThemeManager::instance().applyStyleSheet(this, headerSheet());
 }
@@ -316,7 +316,7 @@ QString HeaderBar::profileState() const
     return m_profileState->isHidden() ? QString() : m_profileState->text();
 }
 
-void HeaderBar::setExactValues(bool available, bool flagged, bool onStagePage)
+void HeaderBar::setExactValues(bool available, bool flagged)
 {
     auto* button = static_cast<ExactValuesButton*>(m_exactValues);
     button->setEnabled(available);
@@ -325,8 +325,6 @@ void HeaderBar::setExactValues(bool available, bool flagged, bool onStagePage)
     if (available) {
         tip = QStringLiteral("Exact values: every setting of this stage, including those its page does not show.");
         if (flagged) tip += QStringLiteral("\nSome of those the page does not show are changed from their defaults.");
-    } else if (onStagePage) {
-        tip = QStringLiteral("All of this stage's values are on its page.");
     } else {
         tip = QStringLiteral("Exact values are for the stage pages.");
     }

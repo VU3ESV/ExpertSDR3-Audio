@@ -1018,7 +1018,11 @@ void Engine::onAudioBlock(const tci::StreamHeader& header, const QByteArray& fra
 
     ++m_blocks;
     m_lastBlockMs = nowMs();
-    if (!m_audioConfirmed) {
+    // Only a session the operator still wants can confirm audio. The radio goes on streaming while
+    // a disconnect waits for ExpertSDR3 to take its mute back, and those blocks are still played
+    // and recorded, but they must not show the ended session's audio as flowing, nor set the mute
+    // policy going again.
+    if (m_sessionActive && !m_audioConfirmed) {
         m_audioConfirmed = true;
         updateMuteWanted();
     }

@@ -189,6 +189,41 @@ release that changes recording or the Recordings menu, on each platform with a r
   not record, that its warning's Choose Folder... button opens the folder dialog, that REC
   then records into the folder chosen there, and that the window carries on.
 
+## Checking the EQ page by hand
+
+Tests drag the curve with synthetic mouse events and feed the analyser MockExpert's tone, so
+neither a hand on a mouse or trackpad nor a radio's audio has gone through them. Before a release
+that changes `src/gui/pages/EqPage.cpp`, `src/gui/binding/EqFeed.*` or the vendored EQ panel, with
+a release build and a radio:
+
+- Dragging a band's handle changes the sound while the drag goes on, smoothly, not only when the
+  button is let go; so does Shift-dragging it for its Q.
+- The analyser follows the radio's audio while the EQ page shows, and the OUT strip shows its
+  level. Both fall away within a moment when the stream stops or BYPASS is on.
+- A type icon, a handle's right-click menu (its type, and the slope of a high- or low-pass) and
+  Reset each change the sound at once, and Modified follows.
+- On a Raspberry Pi, the window's CPU with the EQ page showing, against the Gate page, and
+  again while dragging a handle: each step of a drag restyles the band readings.
+
+## Checking Final Output by hand
+
+Tests use outputs that play nothing, so nobody has listened. Before a release that changes the
+Final Output page or the output path, on each platform with a release build and a radio:
+
+- By ear: the Volume knob turns from silence-quiet at -60 dB to +30 dB, with 0 dB at
+  12 o'clock sounding as loud as the old 0 dB; BOOST lifts quiet audio without crackle on
+  peaks; MUTE silences this app at once, and only this app: ExpertSDR3's own audio does what
+  the Radio page's Mute ExpertSDR3 says, and clicking MUTE again brings the sound back.
+- The meter and the waveform follow what is heard: they rise with Volume and BOOST. Under
+  MUTE they keep moving, as AetherSDR's do, showing what would play. With no radio the scope reads "Not connected", and with a radio sending no
+  audio "No audio from radio", never "Enable PC Audio".
+- The knob turns with a Mac trackpad, one notch per swipe, and the waveform's footer shows the
+  radio's rate (48 kHz, or 24 kHz with `--rate 24000`).
+- Plug in a USB headset, press Refresh: it is listed, choosing it moves the sound there, and
+  unplugging it leaves it in the list as "(not found)" until it comes back.
+- On the Pi: GUI CPU with Final Output on screen while audio plays (the waveform redraws at
+  30 Hz on Linux on ARM), and the page scrolls rather than cutting off the scope on its 480-line screen.
+
 ## Choices worth knowing about
 
 - **CI cannot test DFNR on macOS, so a release does not either.** GitHub's Mac runners are virtual
@@ -217,3 +252,7 @@ release that changes recording or the Recordings menu, on each platform with a r
   network, and quit.
 - **The DeepFilterNet library is AetherSDR's prebuilt one,** checked against the SHA-256 pinned in
   its setup script, and built from source if unavailable.
+- **A double-click on an Exciter knob lands on AetherSDR's default,** 6 dB for Body drive and 30 %
+  for either mix, where this app's defaults are 0 dB and 50 %. The page is AetherSDR's own. Our
+  defaults stay because a value left at its default is not stored: changing one would change the
+  sound of everyone who never moved that knob.

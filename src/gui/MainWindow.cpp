@@ -53,6 +53,7 @@
 #endif
 
 #include <algorithm>
+#include <cmath>
 #include <utility>
 
 namespace esa {
@@ -299,11 +300,25 @@ void MainWindow::buildBinding()
     m_binding->seed();
 
     // Upstream's engine, as far as the panels use it: the mirror's stages and their saves.
-    // Mute, BOOST and the output trim are the Final Output page's, and the EQ's analyser
-    // samples the EQ page's; until those pages come, the stand-in reads them as off and
-    // drops writes.
+    // The EQ's analyser samples are the EQ page's: it adds that hook to these when it
+    // attaches, so these are set first and never replaced whole afterwards.
     AetherSDR::AudioEngine::Hooks hooks;
     m_binding->fillHooks(&hooks);
+    // Final Output's MUTE, BOOST and Volume, each with one owner. MUTE silences this app's own
+    // output for this session; ExpertSDR3's mute stays the mute controller's. BOOST and Volume
+    // are this computer's settings, saved, never in a profile.
+    hooks.muted = [this] { return m_outputMuted; };
+    hooks.setMuted = [this](bool muted) {
+        m_outputMuted = muted;
+        onEngine([engine = m_engine, muted] { engine->setOutputMuted(muted); });
+    };
+    hooks.boost = [this] { return m_config.boost; };
+    hooks.setBoost = [this](bool on) {
+        m_config.boost = on;
+        onEngine([engine = m_engine, on] { engine->setBoost(on); });
+    };
+    hooks.outputDb = [this] { return float(m_config.outputGainDb); };
+    hooks.setOutputDb = [this](float db) { setVolumeDb(db); };
     m_aether = new AetherSDR::AudioEngine(this);
     m_aether->setHooks(hooks);
 }
@@ -326,6 +341,7 @@ void MainWindow::buildPageContext()
         m_rail->refreshFromHost();
     };
     m_context.selectNrMethod = [this](const QString& id) { selectNrMethod(id); };
+    m_context.lastNrMethod = [this] { return lastNrMethod(); };
     m_context.findRadios = [this] { findRadios(); };
     m_context.aether = m_aether;
     m_context.binding = m_binding;
@@ -441,7 +457,7 @@ QWidget* MainWindow::buildRail()
 void MainWindow::buildDetails()
 {
     // One per stage, made now and kept hidden, so every stage's controls exist from the
-    // start. A stage page fills its own; today's grids keep theirs on the page.
+    // start. Each stage page leaves some of its values to its window, at least its on/off.
     for (const QString& stage : RxChain::stageIds()) {
         const QString title = QStringLiteral("%1: exact values").arg(RxChain::stageLabel(stage));
         m_details.insert(stage, new DetailsWindow(stage, title, this));
@@ -465,10 +481,6 @@ void MainWindow::buildPages()
     m_binding->goLive();
     m_binding->seed();
     for (StageHost* host : std::as_const(m_hosts)) host->syncPanel();
-
-    for (DetailsWindow* details : std::as_const(m_details)) {
-        if (!details->hasControls()) details->setNote(QStringLiteral("All of this stage's values are on its page."));
-    }
 
     m_radio = m_stack->findChild<RadioPage*>();
     m_output = m_stack->findChild<OutputPage*>();
@@ -776,7 +788,7 @@ void MainWindow::updateExactValues()
 {
     const QString stage = currentStage();
     const StageHost* host = m_hosts.value(stage);
-    m_header->setExactValues(hasDetails(stage), host && host->hidesChangedValue(), !stage.isEmpty());
+    m_header->setExactValues(hasDetails(stage), host && host->hidesChangedValue());
     m_exactValuesAction->setEnabled(hasDetails(stage));
 }
 
@@ -791,16 +803,7 @@ bool MainWindow::stageEnabled(int railId) const
 void MainWindow::setStageEnabled(int railId, bool on)
 {
     if (railId == kRailNr) {
-        if (!on) {
-            // Remembered, so ticking the box again brings back the same method.
-            m_settings->setLastNrMethod(m_config.nrMethod);
-            selectNrMethod(QString());
-            return;
-        }
-        QString id = m_settings->lastNrMethod();
-        if (id.isEmpty() && findNrMethod(QStringLiteral("nr2"))) id = QStringLiteral("nr2");
-        if (id.isEmpty() && !nrMethods().isEmpty()) id = nrMethods().constFirst().id;
-        selectNrMethod(id);
+        selectNrMethod(on ? lastNrMethod() : QString());
         return;
     }
     const PageEntry* page = pageOfRail(railId);
@@ -810,10 +813,20 @@ void MainWindow::setStageEnabled(int railId, bool on)
     }
 }
 
+QString MainWindow::lastNrMethod() const
+{
+    QString id = m_settings->lastNrMethod();
+    if (id.isEmpty() && findNrMethod(QStringLiteral("nr2"))) id = QStringLiteral("nr2");
+    if (id.isEmpty() && !nrMethods().isEmpty()) id = nrMethods().constFirst().id;
+    return id;
+}
+
 void MainWindow::selectNrMethod(const QString& id)
 {
+    // nr/lastMethod is the method that ran last, whichever way NR went off: ticking the box
+    // brings it back, and the AetherNR page keeps showing it meanwhile.
+    m_settings->setLastNrMethod(id.isEmpty() ? m_config.nrMethod : id);
     m_config.nrMethod = id;
-    if (!id.isEmpty()) m_settings->setLastNrMethod(id);
     m_nr->showMethod(id);
     onEngine([engine = m_engine, id] { engine->setNrMethod(id); });
     updateProfileState();
@@ -867,6 +880,20 @@ void MainWindow::onParamChanged(const QString& key, double value)
     }
     updateProfileState();
     if (key.endsWith(QLatin1String(".enabled"))) m_rail->refreshFromHost();
+}
+
+void MainWindow::setVolumeDb(double db)
+{
+    // A knob dragged reports every fraction of a dB. Tenths are what it shows and what is
+    // kept, so a drag's float noise reaches neither the settings nor the engine; never -0,
+    // which the settings would write out as such. A NaN would pass both the rounding and the
+    // clamp and reach the speakers, so it changes nothing.
+    if (!std::isfinite(db)) return;
+    double volume = std::clamp(std::round(db * 10.0) / 10.0, kMinOutputGainDb, kMaxOutputGainDb);
+    if (volume == 0.0) volume = 0.0;
+    if (volume == m_config.outputGainDb) return;
+    m_config.outputGainDb = volume;
+    onEngine([engine = m_engine, volume] { engine->setOutputGainDb(volume); });
 }
 
 // ── Finding radios ──────────────────────────────────────────────────────────
@@ -938,7 +965,10 @@ void MainWindow::loadProfile(const QString& name)
     const Profile* profile = m_profiles->find(name);
     const ChainSettings chain = profile ? profile->chain : defaultChain();
 
+    const QString nrBefore = m_config.nrMethod;
     applyChain(m_config, chain);
+    // As a click would: the method that ran last is what the AetherNR box brings back.
+    m_settings->setLastNrMethod(m_config.nrMethod.isEmpty() ? nrBefore : m_config.nrMethod);
     m_config.profileName = profile ? profile->name : QString();
     m_profileNote.clear();
     if (!chain.nrMethod.isEmpty() && !findNrMethod(chain.nrMethod)) {

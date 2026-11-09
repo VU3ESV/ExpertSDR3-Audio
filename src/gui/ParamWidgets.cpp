@@ -28,7 +28,10 @@ ParamControl::ParamControl(const ParamSpec& spec, double value, QGridLayout* gri
         return;
     }
 
-    grid->addWidget(new QLabel(spec.label), row, 0);
+    m_label = new QLabel(spec.label);
+    // Named so a page's sheet can set the row labels apart from its other labels.
+    m_label->setObjectName(QStringLiteral("ParamLabel"));
+    grid->addWidget(m_label, row, 0);
 
     if (!spec.choices.isEmpty()) {
         m_combo = new QComboBox;
@@ -76,16 +79,21 @@ ParamControl::ParamControl(const ParamSpec& spec, double value, QGridLayout* gri
 
 void ParamControl::makeSpin(double value)
 {
+    // A percent spec's 0.01 steps are whole percent: two fewer decimals on show.
+    const double scale = spinScale();
+    const int decimals = m_spec.percent ? std::max(0, m_spec.decimals - 2) : m_spec.decimals;
     m_spin = new QDoubleSpinBox;
-    m_spin->setRange(m_spec.min, m_spec.max);
-    m_spin->setDecimals(m_spec.decimals);
-    m_spin->setSingleStep(std::pow(10.0, -m_spec.decimals));
+    m_spin->setRange(m_spec.min * scale, m_spec.max * scale);
+    m_spin->setDecimals(decimals);
+    m_spin->setSingleStep(std::pow(10.0, -decimals));
     m_spin->setKeyboardTracking(false);
-    m_spin->setValue(value);
-    if (!m_spec.unit.isEmpty()) {
+    m_spin->setValue(value * scale);
+    if (m_spec.percent) {
+        m_spin->setSuffix(QStringLiteral(" %"));
+    } else if (!m_spec.unit.isEmpty()) {
         m_spin->setSuffix((m_spec.unit.startsWith(QLatin1Char(':')) ? QString() : QStringLiteral(" ")) + m_spec.unit);
     }
-    connect(m_spin, &QDoubleSpinBox::valueChanged, this, [this](double v) { apply(v, true); });
+    connect(m_spin, &QDoubleSpinBox::valueChanged, this, [this](double v) { apply(v / spinScale(), true); });
 }
 
 double ParamControl::rounded(double value) const
@@ -131,8 +139,9 @@ void ParamControl::apply(double value, bool notify)
     }
     if (m_spin) {
         const QSignalBlocker block(m_spin);
-        m_spin->setValue(value);
+        m_spin->setValue(value * spinScale());
     }
+    emit valueShown(value);
     if (notify) emit valueChanged(m_spec.key, value);
 }
 
@@ -148,9 +157,38 @@ void ParamControl::setValueSilently(double value)
 
 void ParamControl::setEnabled(bool enabled)
 {
-    for (QWidget* widget : {static_cast<QWidget*>(m_check), static_cast<QWidget*>(m_combo),
-                            static_cast<QWidget*>(m_slider), static_cast<QWidget*>(m_spin)}) {
-        if (widget) widget->setEnabled(enabled);
+    m_enabled = enabled;
+    for (QWidget* widget : widgets()) widget->setEnabled(enabled);
+}
+
+QList<QWidget*> ParamControl::widgets() const
+{
+    QList<QWidget*> all;
+    for (QWidget* widget : {static_cast<QWidget*>(m_label), static_cast<QWidget*>(m_check),
+                            static_cast<QWidget*>(m_combo), static_cast<QWidget*>(m_slider),
+                            static_cast<QWidget*>(m_spin)}) {
+        if (widget) all.append(widget);
+    }
+    return all;
+}
+
+void followEnabledBy(const QList<ParamControl*>& controls)
+{
+    for (ParamControl* control : controls) {
+        const ParamSpec& spec = control->spec();
+        if (spec.enabledByKey.isEmpty()) continue;
+        const auto by = std::find_if(controls.begin(), controls.end(), [&](const ParamControl* c) {
+            return c->spec().key == spec.enabledByKey;
+        });
+        if (by == controls.end()) continue;
+        ParamControl* controller = *by;
+        // Within half the controller's last decimal counts as the value.
+        const double tolerance = 0.5 * std::pow(10.0, -controller->spec().decimals);
+        const auto follow = [control, tolerance, want = spec.enabledByValue](double value) {
+            control->setEnabled(std::abs(value - want) < tolerance);
+        };
+        follow(controller->value());
+        QObject::connect(controller, &ParamControl::valueShown, control, follow);
     }
 }
 

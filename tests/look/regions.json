@@ -29,5 +29,169 @@
       {"name": "knob values", "rect": [211, 710, 486, 18], "text": true},
       {"name": "level scale", "rect": [211, 81, 24, 564], "text": true}
     ]
+  },
+  "eq": {
+    "_comment": [
+      "2.png (724x752) holds a 720x750 window at (2, 2). AetherRX has a row of filter widths",
+      "between the toolbar and the type icons, and this app does not: the icons sit 30 px",
+      "higher here and the curve is 30 px taller, so the icons are compared 30 px lower and",
+      "the curve with its 0 dB line on AetherRX's, 15 px lower; from the band plan down the",
+      "page lines up again."
+    ],
+    "reference": "2.png",
+    "offset": [2, 2],
+    "tolerance": 14,
+    "regions": [
+      {"name": "page", "rect": [203, 53, 502, 682]},
+      {"name": "toolbar", "rect": [203, 53, 502, 26]},
+      {"name": "icons", "rect": [211, 81, 486, 40], "shift": [0, 30]},
+      {"name": "plot", "rect": [211, 145, 486, 460], "shift": [0, 15]},
+      {"name": "band plan", "rect": [211, 606, 486, 29]},
+      {"name": "readings", "rect": [211, 645, 486, 45]},
+      {"name": "out", "rect": [211, 705, 486, 25]},
+      {"name": "rail", "rect": [15, 85, 180, 236], "shift": [0, -32]},
+      {"name": "rec/play", "rect": [15, 668, 180, 30]},
+      {"name": "footer", "rect": [15, 700, 180, 30]},
+      {"name": "ground", "tolerance": 1,
+       "points": [[100, 450], [100, 600], [40, 380], [199, 400], [715, 400], [400, 742]]}
+    ],
+    "masks": [
+      {"name": "header", "rect": [0, 0, 726, 53]},
+      {"name": "radio row", "rect": [15, 53, 180, 32]},
+      {"name": "frequency labels", "rect": [211, 606, 486, 15], "text": true},
+      {"name": "band readings", "rect": [211, 645, 486, 45], "text": true}
+    ]
+  },
+  "comp": {
+    "_comment": "3.png (726x750) holds the same 720x750 window at (5, 1), its last row cut off.",
+    "reference": "3.png",
+    "offset": [5, 1],
+    "tolerance": 14,
+    "regions": [
+      {"name": "page", "rect": [203, 53, 502, 682]},
+      {"name": "toolbar", "rect": [203, 53, 502, 24]},
+      {"name": "plot", "rect": [211, 81, 486, 564]},
+      {"name": "knobs", "rect": [211, 651, 486, 77]},
+      {"name": "rail", "rect": [15, 85, 180, 236], "shift": [0, -32]},
+      {"name": "rec/play", "rect": [15, 668, 180, 30]},
+      {"name": "footer", "rect": [15, 700, 180, 30]},
+      {"name": "ground", "tolerance": 1,
+       "points": [[100, 450], [100, 600], [40, 380], [199, 400], [715, 400], [400, 742]]}
+    ],
+    "masks": [
+      {"name": "header", "rect": [0, 0, 726, 53]},
+      {"name": "radio row", "rect": [15, 53, 180, 32]},
+      {"name": "knob values", "rect": [211, 710, 486, 18], "text": true},
+      {"name": "GR reading", "rect": [570, 628, 50, 14], "text": true}
+    ]
+  },
+  "tube": {
+    "_comment": "4.png (725x750) holds the same 720x750 window at (2, 1), its last row cut off.",
+    "reference": "4.png",
+    "offset": [2, 1],
+    "tolerance": 14,
+    "regions": [
+      {"name": "page", "rect": [203, 53, 502, 682]},
+      {"name": "toolbar", "rect": [203, 53, 502, 24]},
+      {"name": "plot", "rect": [211, 81, 486, 564]},
+      {"name": "knobs", "rect": [211, 651, 486, 77]},
+      {"name": "rail", "rect": [15, 85, 180, 236], "shift": [0, -32]},
+      {"name": "rec/play", "rect": [15, 668, 180, 30]},
+      {"name": "footer", "rect": [15, 700, 180, 30]},
+      {"name": "ground", "tolerance": 1,
+       "points": [[100, 450], [100, 600], [40, 380], [199, 400], [715, 400], [400, 742]]}
+    ],
+    "masks": [
+      {"name": "header", "rect": [0, 0, 726, 53]},
+      {"name": "radio row", "rect": [15, 53, 180, 32]},
+      {"name": "knob values", "rect": [211, 710, 486, 18], "text": true}
+    ]
+  },
+  "exciter": {
+    "_comment": [
+      "5.png (721x748) holds the same 720x750 window at (0, -1): it has lost the window's top",
+      "row and bottom row. The wordmark differs on purpose: this app draws AetherVoice",
+      "without the trade mark sign. The logo sizes its word to fill the same width, so",
+      "without the sign every letter is drawn about 12 % larger than in 5.png (the 'A' 49",
+      "px wide against 44); the region's score counts that as well as the missing sign."
+    ],
+    "reference": "5.png",
+    "offset": [0, -1],
+    "tolerance": 14,
+    "regions": [
+      {"name": "page", "rect": [203, 53, 502, 682]},
+      {"name": "wordmark", "rect": [211, 270, 486, 110]},
+      {"name": "modes", "rect": [370, 385, 170, 28]},
+      {"name": "knobs", "rect": [211, 420, 486, 105]},
+      {"name": "rail", "rect": [15, 85, 180, 236], "shift": [0, -32]},
+      {"name": "rec/play", "rect": [15, 668, 180, 30]},
+      {"name": "footer", "rect": [15, 700, 180, 30]},
+      {"name": "ground", "tolerance": 1,
+       "points": [[100, 450], [100, 600], [40, 380], [199, 400], [715, 400], [400, 742], [450, 150], [450, 650]]}
+    ],
+    "masks": [
+      {"name": "header", "rect": [0, 0, 726, 53]},
+      {"name": "radio row", "rect": [15, 53, 180, 32]},
+      {"name": "knob values", "rect": [211, 500, 486, 18], "text": true}
+    ]
+  },
+  "output": {
+    "_comment": "6.png is 724x751, holding the same 720x750 window at (4, 2), its last row cut off.",
+    "reference": "6.png",
+    "offset": [4, 2],
+    "tolerance": 14,
+    "regions": [
+      {"name": "page", "rect": [203, 53, 502, 682]},
+      {"name": "output", "rect": [203, 53, 502, 116]},
+      {"name": "knob", "rect": [209, 84, 86, 84]},
+      {"name": "meter", "rect": [295, 108, 254, 56]},
+      {"name": "readouts", "rect": [551, 92, 150, 68]},
+      {"name": "waveform", "rect": [203, 548, 502, 187]},
+      {"name": "scope", "rect": [211, 575, 486, 160]},
+      {"name": "rail", "rect": [15, 85, 180, 236], "shift": [0, -32]},
+      {"name": "rec/play", "rect": [15, 668, 180, 30]},
+      {"name": "footer", "rect": [15, 700, 180, 30]},
+      {"name": "ground", "tolerance": 1,
+       "points": [[100, 450], [100, 600], [40, 380], [199, 400], [715, 400], [400, 742], [450, 450]]}
+    ],
+    "masks": [
+      {"name": "header", "rect": [0, 0, 726, 53]},
+      {"name": "radio row", "rect": [15, 53, 180, 32]},
+      {"name": "station band", "rect": [203, 168, 502, 200]},
+      {"name": "knob label", "rect": [229, 114, 48, 22], "text": true},
+      {"name": "scope note", "rect": [360, 645, 160, 22], "text": true},
+      {"name": "scope footer", "rect": [211, 718, 220, 17], "text": true}
+    ]
+  },
+  "nr": {
+    "_comment": [
+      "Against the spike's render of AetherSDR's AetherNR page (spike/separability/out/D2/",
+      "dlg_AetherNR.png, 720x480): there is no AetherRX screenshot of it. Measured against an",
+      "offscreen render at 720x480. Our page and rail sit 1 px lower, under a header 1 px",
+      "taller, and the rail another 32 px for the Radio row. Our pickers are combo boxes where",
+      "AetherSDR has two rows of radio buttons, so our first frame is 12 px shorter and every",
+      "frame under it 11 px higher. At this height our parameters scroll where AetherSDR",
+      "squeezes its slider rows, so MASK is compared by its heading only. The status strip and",
+      "the rail's footer sit at the window's foot in both."
+    ],
+    "reference": "dlg_AetherNR.png",
+    "offset": [0, 0],
+    "tolerance": 14,
+    "regions": [
+      {"name": "tabs", "rect": [207, 57, 494, 32], "shift": [0, -1]},
+      {"name": "pickers", "rect": [207, 95, 494, 28], "shift": [0, -1]},
+      {"name": "post", "rect": [207, 174, 494, 62], "shift": [0, 11]},
+      {"name": "mask", "rect": [207, 242, 494, 30], "shift": [0, 10]},
+      {"name": "strip", "rect": [207, 431, 494, 31]},
+      {"name": "rail", "rect": [15, 85, 180, 236], "shift": [0, -33]},
+      {"name": "rec/play", "rect": [15, 398, 180, 30]},
+      {"name": "footer", "rect": [15, 430, 180, 30]},
+      {"name": "ground", "tolerance": 1,
+       "points": [[100, 360], [40, 350], [199, 360], [712, 300], [400, 470]]}
+    ],
+    "masks": [
+      {"name": "header", "rect": [0, 0, 720, 53]},
+      {"name": "radio row", "rect": [15, 53, 180, 32]}
+    ]
   }
 }

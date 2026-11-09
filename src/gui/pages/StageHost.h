@@ -9,6 +9,8 @@
 
 #include <functional>
 
+class QTimer;
+
 namespace AetherSDR {
 class AudioEngine;
 class ClientCompKnob;
@@ -29,11 +31,17 @@ struct StageSpec {
     // Redraws every control from the stage it is bound to: syncControlsFromEngine(), or
     // refreshFromEngine() for the EQ.
     std::function<void(QWidget* panel)> sync;
+    // Whether the panel needs `sync` to show a value changed elsewhere, such as in the
+    // exact-values window: its own tick redraws only some of its controls, or it has no
+    // tick. The host then redraws it after each change to the stage.
+    bool syncOnChange{false};
     // The keys the panel edits. Only these are read back from it; the rest of the stage's
     // keys go one way, from the settings to the page.
     QStringList owned;
     // The panel's knobs as its layout shows them, by the label each draws and the key it
-    // edits. Upstream gives them no names; these are set as their accessible names.
+    // edits. Upstream gives them no names; these are set as their accessible names, so
+    // where two knobs draw the same label the name adds the group the page shows them in.
+    // A knob that edits nothing on RX has an empty key.
     QList<QPair<QString, QString>> knobs;
     // For a key the page does not show exactly (DetailsWindow::keysNotOnPage), whether it
     // does show this value exactly after all. Empty: it never does.
@@ -76,11 +84,16 @@ private:
 
     StageSpec m_spec;
     QWidget* m_panel{nullptr};
+    QTimer* m_redraw{nullptr};
     DetailsWindow* m_details{nullptr};
     QList<QPair<QString, AetherSDR::ClientCompKnob*>> m_knobs;  // key, knob
 };
 
 // The pages built on StageHost, one function each.
 Page* makeGatePage(PageContext& context);
+Page* makeEqPage(PageContext& context);
+Page* makeCompPage(PageContext& context);
+Page* makeTubePage(PageContext& context);
+Page* makeExciterPage(PageContext& context);
 
 } // namespace esa

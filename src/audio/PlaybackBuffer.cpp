@@ -42,7 +42,10 @@ PlaybackBuffer::~PlaybackBuffer() = default;
 
 void PlaybackBuffer::setGainDb(double db)
 {
-    m_targetGain.store(float(std::pow(10.0, db / 20.0)), std::memory_order_relaxed);
+    // A NaN target would turn the gain ramp NaN for as long as this output lives, and NaN
+    // passes the clamp to full scale on its way to the device.
+    if (!std::isfinite(db)) return;
+    m_targetGain.store(outputGain(db), std::memory_order_relaxed);
 }
 
 void PlaybackBuffer::setTargetLatencyMs(int ms)

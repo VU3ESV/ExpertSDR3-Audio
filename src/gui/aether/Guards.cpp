@@ -11,12 +11,15 @@
 #include <QKeyEvent>
 #include <QLineEdit>
 #include <QLocale>
+#include <QMouseEvent>
 #include <QRegularExpression>
 #include <QSignalBlocker>
 #include <QTimer>
 #include <QWheelEvent>
 #include <QWidget>
 
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <utility>
 
@@ -26,6 +29,14 @@ namespace {
 
 // What one notch of a mouse wheel reports, and what the vendored widgets divide by.
 constexpr int kNotch = 120;
+
+// How ClientCompMeter lays out its Out meter when it paints (ClientCompMeter.cpp,
+// paintEvent): the label's line above the bar, the bar's 2 px inset at either end, the
+// level readout and the makeup readout below it.
+constexpr int kMeterLabelH = 12;
+constexpr int kMeterInsets = 4;
+constexpr int kMeterValueH = 14;
+constexpr int kMeterMakeupH = 13;
 
 } // namespace
 
@@ -148,6 +159,15 @@ QString ValueFieldGuard::readAsWritten(const QString& text)
     return locale.toString(value, 'f', QLocale::FloatingPointShortest);
 }
 
+bool ValueFieldGuard::readsAsNoFiniteNumber(const QString& text)
+{
+    const QString trimmed = text.trimmed();
+    bool ok = false;
+    double value = QLocale().toDouble(trimmed, &ok);
+    if (!ok) value = QLocale::c().toDouble(trimmed, &ok);
+    return ok && !std::isfinite(value);
+}
+
 void ValueFieldGuard::deliver(QLineEdit* field, QEvent* event, bool quiet)
 {
     QObject* const outer = m_delivering;
@@ -178,6 +198,8 @@ bool ValueFieldGuard::eventFilter(QObject* watched, QEvent* event)
         // A popup taking the keyboard for a moment, such as the field's own menu, is not
         // the end of the edit.
         if (static_cast<QFocusEvent*>(event)->reason() == Qt::PopupFocusReason) return true;
+        // No number: nothing is committed, and the widget has put its reading back.
+        if (readsAsNoFiniteNumber(text)) return true;
         if (text != m_shown.value(field)) {
             const QString read = readAsWritten(text);
             m_shown[field] = read;
@@ -201,7 +223,12 @@ bool ValueFieldGuard::eventFilter(QObject* watched, QEvent* event)
         }
         if (key != Qt::Key_Return && key != Qt::Key_Enter) return QObject::eventFilter(watched, event);
         const QString text = field->text();
-        if (text != m_shown.value(field)) {
+        if (readsAsNoFiniteNumber(text)) {
+            // Refused where it was typed: the field shows what it did before, ready to type over.
+            const QSignalBlocker blocker(field);
+            field->setText(m_shown.value(field));
+            field->selectAll();
+        } else if (text != m_shown.value(field)) {
             const QString read = readAsWritten(text);
             // Set first: a widget that takes the keyboard from its field on Return sees
             // nothing left to commit when it goes.
@@ -294,6 +321,47 @@ bool LitModeGuard::eventFilter(QObject* watched, QEvent* event)
         break;
     }
     if (!swallow) return QObject::eventFilter(watched, event);
+    event->accept();
+    return true;
+}
+
+// ── MakeupHitGuard ──────────────────────────────────────────────────────────
+
+MakeupHitGuard::MakeupHitGuard(AetherSDR::ClientCompMeter* meter)
+    : QObject(meter), m_meter(meter)
+{
+    meter->installEventFilter(this);
+}
+
+MakeupHitGuard* MakeupHitGuard::install(AetherSDR::ClientCompMeter* meter)
+{
+    return meter ? new MakeupHitGuard(meter) : nullptr;
+}
+
+int MakeupHitGuard::handleY() const
+{
+    using AetherSDR::ClientCompMeter;
+    const double top = kMeterLabelH + kMeterInsets / 2;
+    const double height = std::max(1, m_meter->height() - kMeterLabelH - kMeterInsets - kMeterValueH - kMeterMakeupH);
+    // In float, as the meter works it out.
+    const float norm = (m_meter->makeupDb() - ClientCompMeter::kMakeupMinDb)
+                       / (ClientCompMeter::kMakeupMaxDb - ClientCompMeter::kMakeupMinDb);
+    return static_cast<int>(top + height - norm * height);
+}
+
+bool MakeupHitGuard::eventFilter(QObject* watched, QEvent* event)
+{
+    if (watched != m_meter || event->type() != QEvent::MouseButtonPress) return QObject::eventFilter(watched, event);
+    // Only a press the meter would turn into makeup: the left button, on the Out meter.
+    const auto* press = static_cast<QMouseEvent*>(event);
+    if (press->button() != Qt::LeftButton || !m_meter->makeupControlEnabled()
+        || m_meter->mode() != AetherSDR::ClientCompMeter::Mode::Level) {
+        return QObject::eventFilter(watched, event);
+    }
+    // The meter reads the press at the pixel it falls in, and so does this.
+    if (std::abs(press->position().toPoint().y() - handleY()) <= kReachPx) return QObject::eventFilter(watched, event);
+    // Taken, so nothing under the meter acts on it instead. A real click has given the meter
+    // the keyboard before this runs, so its keys still work.
     event->accept();
     return true;
 }

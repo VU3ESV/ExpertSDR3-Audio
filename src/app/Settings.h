@@ -11,6 +11,10 @@ class QSettings;
 
 namespace esa {
 
+// Volume's range, as it has always been.
+inline constexpr double kMinOutputGainDb = -60.0;
+inline constexpr double kMaxOutputGainDb = 30.0;
+
 // Everything that describes how the app should run. The GUI edits this, `--flags`
 // override it, and the engine consumes it.
 struct AppConfig {

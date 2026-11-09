@@ -10,6 +10,10 @@ class QAbstractButton;
 class QLineEdit;
 class QWidget;
 
+namespace AetherSDR {
+class ClientCompMeter;
+}
+
 namespace esa {
 
 // Corrections to AetherSDR's widgets made from outside, by event filter, so the vendored
@@ -51,6 +55,9 @@ private:
 // Where '.' groups thousands, the bare "20.000" it shows is read as 20000.
 // This lets a field commit only text that differs from what it showed, once, on Return or
 // on losing the keyboard, and a plain number with a '.' point is read as the field wrote it.
+// The widgets also take "nan" and "inf" as numbers, and a NaN passes every clamp after them:
+// typed into Volume it would reach the speakers. Text that reads as no finite number is
+// never committed; Return puts back what the field showed.
 class ValueFieldGuard : public QObject {
     Q_OBJECT
 
@@ -68,6 +75,10 @@ public:
     // the field writes, so it means what it does in C, even where the locale would read
     // the '.' as grouping thousands; it is rewritten in the locale's own form if so.
     static QString readAsWritten(const QString& text);
+
+    // True if the widget would read `text` as a number that is not finite ("nan", "-inf"),
+    // in the locale or in C, as it tries them.
+    static bool readsAsNoFiniteNumber(const QString& text);
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -106,6 +117,37 @@ private:
     void releaseWhenDone(QAbstractButton* button);
 
     QSet<QAbstractButton*> m_held;
+};
+
+// The compressor's Out meter carries its makeup gain as a handle, and a press anywhere on
+// the meter jumps makeup to that height: one stray click near the top is +24 dB in the
+// operator's ears. This lets a press through only near the handle, where it grabs it, and
+// swallows the rest. Dragging the handle, the wheel, the keys and a double-click for 0 dB
+// work as upstream made them.
+class MakeupHitGuard : public QObject {
+    Q_OBJECT
+
+public:
+    // How far from the handle, up or down, a press still takes it.
+    static constexpr int kReachPx = 10;
+
+    explicit MakeupHitGuard(AetherSDR::ClientCompMeter* meter);
+
+    // Guards `meter`, the Out meter of AetherSDR's compressor panel; null if there is none.
+    // The guard is a child of the meter.
+    static MakeupHitGuard* install(AetherSDR::ClientCompMeter* meter);
+
+    // The row the meter draws the handle on, from the formula it paints with: a bar under
+    // the meter's label, above its level and makeup readouts, -12 dB at its foot and
+    // +24 dB at its head. That is the Out meter as the panel sets it up, labelled and
+    // showing its level; test_aether_gui checks the row against the meter's own drawing.
+    int handleY() const;
+
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override;
+
+private:
+    AetherSDR::ClientCompMeter* m_meter;
 };
 
 } // namespace esa

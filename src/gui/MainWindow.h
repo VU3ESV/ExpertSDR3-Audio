@@ -72,6 +72,10 @@ public:
     QString currentPage() const;
     void showPage(const QString& id);  // an unknown id changes nothing
 
+    // Final Output's Volume knob comes here, and nothing else changes the volume: rounded to
+    // the knob's tenths of a dB, kept with this computer's settings and handed to the engine.
+    void setVolumeDb(double db);
+
     // The chain's stage order, as the rail shows it, and the one way it changes: the rail's
     // grips, its tab menus and Alt+Up/Down, and Reset stage order all come here.
     QStringList stageOrder() const;
@@ -152,6 +156,8 @@ private:
     bool stageEnabled(int railId) const;
     void setStageEnabled(int railId, bool on);
     void selectNrMethod(const QString& id);
+    // The method the AetherNR box turns back on: the last that ran, else NR2.
+    QString lastNrMethod() const;
 
     // The chain stage the current page shows ("gate"); empty on Radio, AetherNR and Final Output.
     QString currentStage() const;
@@ -221,6 +227,7 @@ private:
     NrPage* m_nr{nullptr};
     QPushButton* m_bypass{nullptr};
     bool m_bypassShown{false};
+    bool m_outputMuted{false};  // Final Output's MUTE: this app's output, this session only
 
     // REC and PLAY, which show what the engine reports and never just the click.
     QPushButton* m_record{nullptr};

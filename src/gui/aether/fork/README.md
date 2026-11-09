@@ -25,6 +25,10 @@ commit hash, each in backticks.
   fills the same way and exists in every Qt 6.
 - The header is unchanged apart from its notice. It is kept here, not vendored, so the
   class has one home.
+- Used by the AetherNR page's status strip (`src/gui/pages/NrPage.cpp`). Where upstream
+  connects it to `AudioEngine::nrGainChanged`, the page calls `setGain()` from
+  `LiveTaps::nrGain` and `nrActive` every 16 ms while it is on screen; `reset()` when the
+  method running changes, as upstream does.
 
 The exact diff, upstream to ours:
 

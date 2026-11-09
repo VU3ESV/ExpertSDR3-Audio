@@ -16,4 +16,11 @@ inline float shapeOutput(float x, float gainLinear, bool boost)
     return std::clamp(x, -1.0f, 1.0f);
 }
 
+// Volume in dB as the gain shapeOutput() takes, worked out the one way for the speaker path
+// and the output meter alike.
+inline float outputGain(double db)
+{
+    return float(std::pow(10.0, db / 20.0));
+}
+
 } // namespace esa

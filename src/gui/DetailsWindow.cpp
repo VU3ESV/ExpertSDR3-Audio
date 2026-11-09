@@ -31,9 +31,6 @@ DetailsWindow::DetailsWindow(const QString& stage, const QString& title, QWidget
 
     auto* column = new QVBoxLayout(body);
     column->setContentsMargins(14, 12, 14, 14);
-    m_note = hintLabel();
-    m_note->hide();
-    column->addWidget(m_note);
     column->addWidget(scrollable(content));
 
     Appearance::apply(this);
@@ -83,12 +80,6 @@ void DetailsWindow::populate(const AddParam& add)
     section(QStringLiteral("On the page"), onPage);
     section(QStringLiteral("Not on the page"), offPage);
     m_grid->setRowStretch(nextRow(), 1);
-}
-
-void DetailsWindow::setNote(const QString& text)
-{
-    m_note->setText(text);
-    m_note->setVisible(!text.isEmpty());
 }
 
 int DetailsWindow::nextRow() const

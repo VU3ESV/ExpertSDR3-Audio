@@ -294,6 +294,29 @@ private slots:
         QVERIFY(std::abs(peakOf(feed.play(2400)) - 0.05f) < 0.002f);
     }
 
+    // A gain that is no number changes nothing. A NaN target turned the ramp NaN, and it stayed
+    // NaN, past the clamp to full scale, until the output was reopened.
+    void aGainThatIsNoNumberChangesNothing()
+    {
+        PlaybackBuffer buffer(48000, 48000, 2);
+        LiveFeed feed(buffer, sine(1000, 48000, 0.5));
+        feed.play(4800);
+        buffer.setGainDb(-20.0);
+        feed.play(kBufferFrames);  // the ramp
+
+        for (const double db : {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity(),
+                                -std::numeric_limits<double>::infinity()}) {
+            buffer.setGainDb(db);
+            const auto out = feed.play(2400);
+            QVERIFY(std::all_of(out.begin(), out.end(), [](float v) { return std::isfinite(v); }));
+            QVERIFY2(std::abs(peakOf(out) - 0.05f) < 0.002f, qPrintable(QString::number(db)));
+        }
+        // And a real one still takes.
+        buffer.setGainDb(0.0);
+        feed.play(kBufferFrames);
+        QVERIFY(std::abs(peakOf(feed.play(2400)) - 0.5f) < 0.01f);
+    }
+
     void gainChangesRampInsteadOfStepping()
     {
         PlaybackBuffer buffer(48000, 48000, 2);
