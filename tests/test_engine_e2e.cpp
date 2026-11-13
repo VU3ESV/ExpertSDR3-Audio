@@ -209,6 +209,7 @@ public:
     Recorder::Options recorderOptions;  // set before the first engine() call
     EngineStatus status;
     std::unique_ptr<Engine> m_engine;
+
 };
 
 constexpr int kTimeout = 5000;
@@ -489,12 +490,17 @@ private slots:
         Fixture f;
         f.start();
         QTRY_VERIFY_WITH_TIMEOUT(f.mock.muted, kTimeout);
+        // Held, so a late confirmation's retry, which a slow machine can cause and which is no
+        // fight, is behind us; from here on no MUTE:true may go out.
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.mutePhase, MuteController::Phase::Holding, kTimeout);
+        const int engaged = f.mock.muteCommandsSent(true);
+        QVERIFY(engaged >= 1);
         QTest::qWait(100);
 
         f.mock.operatorSetMute(false);
         QTRY_COMPARE_WITH_TIMEOUT(f.status.mutePhase, MuteController::Phase::OperatorOverride, kTimeout);
         QTest::qWait(700);
-        QCOMPARE(f.mock.muteCommandsSent(true), 1);  // not fought
+        QCOMPARE(f.mock.muteCommandsSent(true), engaged);  // not fought
         QVERIFY(!f.mock.muted);
 
         f.engine().shutdown();
@@ -508,12 +514,17 @@ private slots:
         Fixture f;
         f.start();
         QTRY_VERIFY_WITH_TIMEOUT(f.mock.muted, kTimeout);
+        // Held, so a late confirmation's retry, which a slow machine can cause and which is no
+        // fight, is behind us; from here on no MUTE:true may go out.
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.mutePhase, MuteController::Phase::Holding, kTimeout);
+        const int engaged = f.mock.muteCommandsSent(true);
+        QVERIFY(engaged >= 1);
         QTest::qWait(100);
         f.mock.operatorSetVolume(-12);
         QTRY_COMPARE_WITH_TIMEOUT(f.status.mutePhase, MuteController::Phase::OperatorOverride, kTimeout);
         QTest::qWait(600);
         QVERIFY(!f.mock.muted);
-        QCOMPARE(f.mock.muteCommandsSent(true), 1);
+        QCOMPARE(f.mock.muteCommandsSent(true), engaged);
         f.engine().shutdown();
     }
 
@@ -802,12 +813,17 @@ private slots:
         Fixture f;
         f.start();
         QTRY_VERIFY_WITH_TIMEOUT(f.mock.muted, kTimeout);
+        // Held, so a late confirmation's retry, which a slow machine can cause and which is no
+        // fight, is behind us; from here on no MUTE:true may go out.
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.mutePhase, MuteController::Phase::Holding, kTimeout);
+        const int engaged = f.mock.muteCommandsSent(true);
+        QVERIFY(engaged >= 1);
         const int opensBefore = f.sinkOpenCount;
         f.engine().setOutputDevice(QStringLiteral("another device"));
         QCOMPARE(f.sinkOpenCount, opensBefore + 1);
         QTest::qWait(300);
         QCOMPARE(f.mock.muteCommandsSent(false), 0);
-        QCOMPARE(f.mock.muteCommandsSent(true), 1);
+        QCOMPARE(f.mock.muteCommandsSent(true), engaged);
         QVERIFY(f.mock.muted);
         f.engine().shutdown();
     }
@@ -1630,8 +1646,16 @@ private slots:
         QThread thread;
         engine->moveToThread(&thread);
         thread.start();
-        // A failed check returns early. The engine and its thread are closed all the same, so
-        // the failure is reported rather than aborting the whole program.
+
+        // Delivered queued, on this thread, as the window gets them.
+        EngineStatus status;
+        QStringList failures;
+        QObject::connect(engine, &Engine::statusChanged, &mock, [&](const EngineStatus& s) { status = s; });
+        QObject::connect(engine, &Engine::recordingFailed, &mock, [&](const QString& r) { failures << r; });
+        QObject::connect(engine, &Engine::playbackFailed, &mock, [&](const QString& r) { failures << r; });
+        // A failed check returns early. The engine and its thread are closed all the same, so the
+        // failure is reported rather than aborting the whole program. Declared after what the
+        // engine's signals write to, so it runs before those go.
         bool closed = false;
         const auto closeOnFailure = qScopeGuard([&] {
             if (closed) return;
@@ -1640,13 +1664,6 @@ private slots:
             thread.quit();
             thread.wait(kTimeout);
         });
-
-        // Delivered queued, on this thread, as the window gets them.
-        EngineStatus status;
-        QStringList failures;
-        QObject::connect(engine, &Engine::statusChanged, &mock, [&](const EngineStatus& s) { status = s; });
-        QObject::connect(engine, &Engine::recordingFailed, &mock, [&](const QString& r) { failures << r; });
-        QObject::connect(engine, &Engine::playbackFailed, &mock, [&](const QString& r) { failures << r; });
         // A std::function keeps its target on the heap, written here and read on the engine's
         // thread. Qt's queue orders that, out of ThreadSanitizer's sight; a release once the
         // call is built and an acquire where it runs state the order where it can see it.
