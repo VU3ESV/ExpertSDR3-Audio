@@ -425,8 +425,9 @@ account, unless `ESA_TEST_NATIVE_SETTINGS=1` is set, as CI sets it.
 `test_look` draws seven pages and compares each with its approved picture in `tests/golden/`,
 drawn earlier on the same kind of computer. Every pixel must be within 3/255 of the picture on
 every channel, so a change to how a page looks fails there, down to a card losing its shade.
-It compares only where `tests/golden` has a set for your computer, today only macOS 27 on
-Apple Silicon with Qt 6.10; elsewhere it compares nothing and ctest lists it as skipped.
+It compares only where `tests/golden` has a set for your computer: every CI job (macOS 15,
+Windows Server 2025, and Debian 12 on x86-64 and arm64) and macOS 27 on Apple Silicon with Qt
+6.10. Elsewhere it compares nothing and ctest lists it as skipped.
 [docs/RELEASING.md](docs/RELEASING.md#look-goldens) says how to draw a set.
 
 ## Credits and licence

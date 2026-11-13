@@ -164,9 +164,9 @@ what differs. A sync is its own pull request, never mixed with other changes.
    scope's note). A failure names what moved: fix the lookup, the page's list of settings or
    the correction in the same pull request. `test_look` compares every page with its golden
    picture, so a sync that changes how a page draws fails there, but only on a computer that
-   has a set in `tests/golden`: today only macOS 27 on Apple Silicon with Qt 6.10, and none of
-   CI's jobs. Check that ctest lists it as Passed, not Skipped. Where it is skipped, look at
-   the renders in CI's `look-*` artifacts by eye. If the new look is upstream's intent,
+   has a set in `tests/golden`: every CI job, and macOS 27 on Apple Silicon with Qt 6.10.
+   Check that ctest lists it as Passed, not Skipped. Where it is skipped, look at the renders
+   in CI's `look-*` artifacts by eye. If the new look is upstream's intent,
    regenerate the goldens as [Look goldens](#look-goldens) says.
 6. Do not merge until CI's Debian Bookworm jobs pass. Bookworm and Raspberry Pi OS ship Qt
    6.4.2 and GCC 12, and upstream targets a newer Qt. Before the next release, rehearse the Mac
@@ -195,6 +195,9 @@ band with voices:
 - With Mute ExpertSDR3's own audio on, press Disconnect while the app plays: the status chip
   says Disconnecting… for a moment (at most about a second and a half), then Not connected,
   and ExpertSDR3's own audio is back.
+- On Windows: the button at the foot of the rail shows a gear (⚙), not an empty box. The
+  offscreen tests draw an empty box there, having no symbol font to fall back on; a desktop's
+  should come from Segoe UI Symbol. And Ctrl+Q quits.
 
 ### The rail and the knobs
 
@@ -447,9 +450,11 @@ NNR tabs available even in a build without them or on a virtual Mac. So the app'
 The key names the environment that drew the set, because text comes out a little different on
 each operating system release, processor and Qt version. The test prints it, for example
 `macos-27-arm64-qt6.10` or `debian-12-x86_64-qt6.4`. Where there is no folder for the key, the
-test compares nothing and ctest lists it as skipped. Today only `macos-27-arm64-qt6.10` has a
-set, so none of CI's jobs compares anything yet: after the first CI run of a pull request,
-commit each job's set from its artifact as below. Plain ctest shows only "Skipped"; run
+test compares nothing and ctest lists it as skipped. Sets exist for each CI job
+(`macos-15-arm64-qt6.10`, `windows-server2025-x86_64-qt6.10`, `debian-12-x86_64-qt6.4` and
+`debian-12-arm64-qt6.4`) and for `macos-27-arm64-qt6.10`. When a runner image moves to a new
+release its key changes, the test skips there, and its new set is committed from its artifact
+as below. Plain ctest shows only "Skipped"; run
 `ctest --test-dir build -R test_look -V` to see the key and the message. On CI the key is also
 the name of the folder inside the `look-*` artifact.
 
