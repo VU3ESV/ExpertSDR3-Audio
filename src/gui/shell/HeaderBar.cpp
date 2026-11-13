@@ -255,6 +255,9 @@ HeaderBar::HeaderBar(const QString& title, QWidget* parent)
     // Upstream keeps the title clear of a close button in the corner. Here whatever ends the
     // row, a close chip included, is in the row itself.
     m_title->setContentsMargins(0, 0, 0, 0);
+    // AetherRX's row height, the title's line on a Mac and on Linux. Windows draws the same
+    // font a pixel shorter, which would lift every page a pixel off AetherRX's.
+    m_title->setMinimumHeight(kRowHeight);
 
     auto* row = new QHBoxLayout;
     row->setContentsMargins(0, 0, 0, 0);

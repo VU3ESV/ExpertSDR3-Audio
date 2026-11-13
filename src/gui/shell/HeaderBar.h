@@ -26,6 +26,9 @@ class HeaderBar : public QWidget {
     Q_OBJECT
 
 public:
+    // The header row's height in AetherRX, which every page's position follows.
+    static constexpr int kRowHeight = 21;
+
     explicit HeaderBar(const QString& title, QWidget* parent = nullptr);
 
     QComboBox* profileList() const { return m_profiles; }

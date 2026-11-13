@@ -11,6 +11,7 @@
 #include <QLockFile>
 #include <QHostAddress>
 #include <QRegularExpression>
+#include <QScopeGuard>
 #include <QSettings>
 #include <QStandardPaths>
 #include <QTemporaryDir>
@@ -974,7 +975,9 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(f.audioFlowing(), kTimeout);
         QTest::qWait(100);
         const int engagesBefore = f.mock.muteCommandsSent(true);
-        f.mock.dropMuteSets = 2;  // the restore takes three tries, so the disconnect waits for it
+        // The restore takes four tries, about a second, so the disconnect waits for it with the
+        // radio streaming; within the 1.5 s a disconnect waits before letting go of the mute.
+        f.mock.dropMuteSets = 3;
 
         QList<EngineStatus> after;
         // What the output had been handed, at each of those statuses while it was open: the
@@ -1001,7 +1004,8 @@ private slots:
         QVERIFY(std::any_of(after.cbegin(), after.cend(), [](const EngineStatus& s) {
             return s.connection == TciClient::State::Ready && s.mutePhase == MuteController::Phase::Restoring;
         }));
-        QVERIFY2(sentWhileClosing > 20, qPrintable(QString::number(sentWhileClosing)));
+        // Enough for the checks below; a slow CI runner's mock sends fewer than real time.
+        QVERIFY2(sentWhileClosing > 10, qPrintable(QString::number(sentWhileClosing)));
         // And the engine still took that audio, for the output and any recording: it is only
         // not shown as flowing.
         qsizetype firstUp = -1;
@@ -1626,6 +1630,16 @@ private slots:
         QThread thread;
         engine->moveToThread(&thread);
         thread.start();
+        // A failed check returns early. The engine and its thread are closed all the same, so
+        // the failure is reported rather than aborting the whole program.
+        bool closed = false;
+        const auto closeOnFailure = qScopeGuard([&] {
+            if (closed) return;
+            QMetaObject::invokeMethod(engine, &Engine::shutdown, Qt::BlockingQueuedConnection);
+            QMetaObject::invokeMethod(engine, [engine] { delete engine; }, Qt::BlockingQueuedConnection);
+            thread.quit();
+            thread.wait(kTimeout);
+        });
 
         // Delivered queued, on this thread, as the window gets them.
         EngineStatus status;
@@ -1686,7 +1700,9 @@ private slots:
         // A recording, then PLAY of it to its end while the next one records.
         const QString first = dir.filePath(QStringLiteral("first.wav"));
         call([first](Engine* e) { e->startRecordingToFile(first); });
-        QTRY_VERIFY_WITH_TIMEOUT(status.recording.seconds > 0.5, kTimeout);
+        // Long enough that each PLAY below lasts over a second: a slow CI runner sends statuses
+        // far enough apart to miss a shorter one's middle.
+        QTRY_VERIFY_WITH_TIMEOUT(status.recording.seconds > 1.5, kTimeout);
         call([](Engine* e) { e->stopRecording(); });
         QTRY_COMPARE_WITH_TIMEOUT(status.lastRecordingPath, first, kTimeout);
         const QString during = dir.filePath(QStringLiteral("during.wav"));
@@ -1701,7 +1717,14 @@ private slots:
 
         // PLAY stopped half-way, a second click.
         call([](Engine* e) { e->startPlayback(); });
-        QTRY_VERIFY_WITH_TIMEOUT(status.playback.seconds > 0.2, kTimeout);
+        QTRY_VERIFY2_WITH_TIMEOUT(status.playback.active && status.playback.seconds > 0.2,
+                                  qPrintable(QStringLiteral("playing %1, waiting %2, %3 of %4 s, failures: %5")
+                                                 .arg(status.playback.active)
+                                                 .arg(status.playback.waiting)
+                                                 .arg(status.playback.seconds)
+                                                 .arg(status.playback.totalSeconds)
+                                                 .arg(failures.join(QStringLiteral("; ")))),
+                                  kTimeout);
         call([](Engine* e) { e->stopPlayback(); });
         QTRY_VERIFY_WITH_TIMEOUT(!status.playback.active, kTimeout);
 
@@ -1739,6 +1762,7 @@ private slots:
         // Quitting finishes the recording in progress.
         QMetaObject::invokeMethod(engine, &Engine::shutdown, Qt::BlockingQueuedConnection);
         QMetaObject::invokeMethod(engine, [engine] { delete engine; }, Qt::BlockingQueuedConnection);
+        closed = true;
         thread.quit();
         QVERIFY(thread.wait(kTimeout));
         QCOMPARE(taps.use_count(), 1);

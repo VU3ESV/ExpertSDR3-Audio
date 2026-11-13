@@ -575,7 +575,13 @@ void MainWindow::buildActions()
     // A Mac's application menu has its own; elsewhere the gear is where Quit lives. Through
     // close(), like every other way out, so closeEvent saves and the mute is restored.
     m_quitAction = new QAction(QStringLiteral("Quit"), this);
+#ifdef Q_OS_WIN
+    // Windows has no standard Quit key (Qt offers the Exit media key there), so Ctrl+Q as
+    // on Linux. Alt+F4 closes the window as always.
+    m_quitAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Q));
+#else
     m_quitAction->setShortcut(QKeySequence::Quit);
+#endif
     m_quitAction->setMenuRole(QAction::QuitRole);
     connect(m_quitAction, &QAction::triggered, this, &QWidget::close);
 #endif

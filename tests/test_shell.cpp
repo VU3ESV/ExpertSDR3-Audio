@@ -1167,8 +1167,10 @@ private slots:
         m_window->showNormal();
         QTRY_COMPARE(m_window->geometry(), before);
         QCOMPARE(m_quits, 0);
-        // One resizer however often the frame changes.
-        QCOMPARE(m_window->findChildren<AetherSDR::FramelessResizer*>().size(), frameless ? 1 : 0);
+        // One resizer however often the frame changes, where Custom is frameless: on Windows and
+        // Linux this platform's own Custom is.
+        const bool resizes = WindowChrome::customMode() == WindowChrome::Mode::Frameless;
+        QCOMPARE(m_window->findChildren<AetherSDR::FramelessResizer*>().size(), resizes ? 1 : 0);
     }
 
     // The frameless Custom of Windows and Linux, on any machine: minimise and close chips at
