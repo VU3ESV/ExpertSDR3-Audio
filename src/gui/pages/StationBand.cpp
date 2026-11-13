@@ -128,6 +128,10 @@ void StationBand::showDevices(const QList<AudioDeviceInfo>& devices)
     const int index = m_device->findData(selected);
     if (index >= 0) {
         m_device->setCurrentIndex(index);
+    } else if (selected == kNullDeviceKey) {
+        // --device null: no device at all, so never in the list, and nothing to plug back in.
+        m_device->addItem(QStringLiteral("No output (null device)"), selected);
+        m_device->setCurrentIndex(m_device->count() - 1);
     } else {
         // The saved device is not plugged in right now. Show it rather than silently
         // switching the setting, so plugging it back in restores it.

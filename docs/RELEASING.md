@@ -114,7 +114,100 @@ SMOKE_METHODS="nr2 nr4 mnr dfnr rn2 nnr" scripts/smoke-test.sh \
   dist/ExpertSDR3Audio.app/Contents/MacOS/ExpertSDR3Audio 0.1.0 native
 ```
 
-## Checking the custom window frame by hand
+## Updating AetherSDR
+
+`vendor/aethersdr` holds AetherSDR's files exactly as upstream has them, at the commit in
+`vendor/aethersdr/UPSTREAM_COMMIT`. Only `scripts/sync-aether.sh` writes there. A file that has
+to change to build here is forked into `src/gui/aether/fork/` instead, and
+[its README](../src/gui/aether/fork/README.md) records where each fork came from and exactly
+what differs. A sync is its own pull request, never mixed with other changes.
+
+1. Check out the AetherSDR commit to take, then, from this repository:
+
+   ```sh
+   scripts/sync-aether.sh /path/to/AetherSDR
+   ```
+
+   It replaces `vendor/aethersdr` with the DSP files, the theme, Inter and the setup scripts it
+   lists itself, and the GUI files listed in `scripts/aether-gui-files.txt`, and records the
+   commit. Then it checks that every quoted `#include` in those GUI files and in the forks
+   resolves to a vendored file, a shim in `src/gui/aether/shim/`, a fork or Qt, and runs the
+   fork diff below.
+2. If the include check names a file, upstream's pages need something new. Add it to
+   `scripts/aether-gui-files.txt` (its header says how the list was made), or give it a shim,
+   and sync again. Never edit a vendored file: one that will not build on Qt 6.4.2 is forked.
+3. Read the fork diff. For each fork it prints either "no upstream changes since the fork", or
+   upstream's commits and diff since the commit the fork was taken at. Carry over what applies,
+   then update that fork's `- Upstream:` commit, its line ranges and its exact diff in the fork
+   README. Each fork that takes only some of upstream's lines has `diff -u` commands to run in
+   the AetherSDR checkout. NrGainStrip is a whole-file fork: compare upstream's two files with
+   the fork's with a plain `diff -u`. Either way they must print exactly the diff the README
+   records. To see the fork diff again:
+
+   ```sh
+   scripts/aether-fork-diff.sh /path/to/AetherSDR
+   ```
+
+4. If the sync says upstream moved DeepFilterNet, run
+   `(cd vendor/aethersdr && bash scripts/setup/setup-deepfilter.sh)`.
+5. Build and run every test:
+
+   ```sh
+   cmake --build build && ctest --test-dir build --output-on-failure
+   ```
+
+   Two tests are there for a sync. `test_aether_gui` is the sync-safety contract: it renders
+   each vendored page against the shims, then checks in the real window every object the window
+   finds by name, every setting each page edits, in both directions, that opening every page
+   changes nothing, and each correction made from outside (the Volume knob, the makeup handle,
+   wheel steps, value fields, the lit mode buttons, the AetherVoice wordmark, the NR tabs, the
+   scope's note). A failure names what moved: fix the lookup, the page's list of settings or
+   the correction in the same pull request. `test_look` compares every page with its golden
+   picture, so a sync that changes how a page draws fails there, but only on a computer that
+   has a set in `tests/golden`: today only macOS 27 on Apple Silicon with Qt 6.10, and none of
+   CI's jobs. Check that ctest lists it as Passed, not Skipped. Where it is skipped, look at
+   the renders in CI's `look-*` artifacts by eye. If the new look is upstream's intent,
+   regenerate the goldens as [Look goldens](#look-goldens) says.
+6. Do not merge until CI's Debian Bookworm jobs pass. Bookworm and Raspberry Pi OS ship Qt
+   6.4.2 and GCC 12, and upstream targets a newer Qt. Before the next release, rehearse the Mac
+   build as above, which is the only place DFNR is tested, and go through the hand checks below
+   for every page whose vendored files changed.
+
+## Checking by hand before a release
+
+The tests run offscreen, against a simulated radio and outputs that play nothing. Some things
+only a person at a real screen, with a radio, can check: how it sounds, PLAY's pacing, a real
+drag of a rail grip, knobs on a Mac trackpad, the custom frame on each platform, the Documents
+prompt on a signed Mac build, and a Raspberry Pi's CPU and touchscreen. Go through the
+sections that cover what a release changes, on each platform, with a release build.
+
+### Listening
+
+Before a release that changes the chain, a stage page or the output path, with a radio on a
+band with voices:
+
+- Tick AetherNR and each stage in turn: each changes the sound as its page says, at once, with
+  no click or dropout, and unticking it takes the change away.
+- Turn a knob on each stage page while listening: the sound follows the knob as it turns, not
+  only when it is let go.
+- BYPASS gives the radio unprocessed at once, and a second click brings the chain back.
+- Switching between two saved profiles: each sounds as it did when it was saved.
+- With Mute ExpertSDR3's own audio on, press Disconnect while the app plays: the status chip
+  says Disconnecting… for a moment (at most about a second and a half), then Not connected,
+  and ExpertSDR3's own audio is back.
+
+### The rail and the knobs
+
+A rail grip starts a drag that offscreen tests cannot run, and they have no trackpad. Before a
+release that changes the rail or a page with knobs:
+
+- Drag a stage by its grip above and below the others: it lands where it is dropped, the sound
+  follows the new order, and the order is still there after restarting. Radio, AetherNR and
+  Final Output neither move nor take a stage dropped on them.
+- Every knob turns with a Mac trackpad, one notch per swipe, on each stage page and on Final
+  Output, and with a mouse wheel.
+
+### Checking the custom window frame by hand
 
 Gear > Window frame chooses between the system's frame, the default on every platform, and
 AetherRX's (Custom). Tests run offscreen, where windows have no frame at all, so they check the
@@ -162,6 +255,10 @@ Windows 10 and 11:
   casts a shadow on each.
 - At 100 %, 150 % and 200 % display scaling, and moved between screens scaled differently:
   the header, its chips and the resize band keep their size and stay sharp.
+- In Custom, drag the window to the top of the screen, then switch to System: the window moves
+  down so that its whole title bar is on the screen, a few pixels below the top edge (a window
+  as tall as the screen also gets a little shorter). Lower down, switching leaves it where it
+  was.
 
 Linux and the Raspberry Pi:
 
@@ -173,7 +270,7 @@ Linux and the Raspberry Pi:
   the window again, and Wayland lets the compositor place a window it shows.
 - On the Pi's touchscreen: dragging the header with a finger, and tapping both chips.
 
-## Checking REC, PLAY and Recordings by hand
+### Checking REC, PLAY and Recordings by hand
 
 Tests replace the file manager and the folder dialog, so neither has run for real. Before a
 release that changes recording or the Recordings menu, on each platform with a release build:
@@ -188,8 +285,11 @@ release that changes recording or the Recordings menu, on each platform with a r
   opens its dialog, macOS may ask once. Refuse it once, and check that REC says why it could
   not record, that its warning's Choose Folder... button opens the folder dialog, that REC
   then records into the folder chosen there, and that the window carries on.
+- By ear: record a minute of a voice, then PLAY it. It sounds as it did live, at the same speed
+  and pitch, with no dropouts, and stops by itself at the end; the header's ▶ time keeps pace
+  with a clock. The file also plays in another player.
 
-## Checking the EQ page by hand
+### Checking the EQ page by hand
 
 Tests drag the curve with synthetic mouse events and feed the analyser MockExpert's tone, so
 neither a hand on a mouse or trackpad nor a radio's audio has gone through them. Before a release
@@ -202,10 +302,8 @@ a release build and a radio:
   level. Both fall away within a moment when the stream stops or BYPASS is on.
 - A type icon, a handle's right-click menu (its type, and the slope of a high- or low-pass) and
   Reset each change the sound at once, and Modified follows.
-- On a Raspberry Pi, the window's CPU with the EQ page showing, against the Gate page, and
-  again while dragging a handle: each step of a drag restyles the band readings.
 
-## Checking Final Output by hand
+### Checking Final Output by hand
 
 Tests use outputs that play nothing, so nobody has listened. Before a release that changes the
 Final Output page or the output path, on each platform with a release build and a radio:
@@ -213,16 +311,82 @@ Final Output page or the output path, on each platform with a release build and 
 - By ear: the Volume knob turns from silence-quiet at -60 dB to +30 dB, with 0 dB at
   12 o'clock sounding as loud as the old 0 dB; BOOST lifts quiet audio without crackle on
   peaks; MUTE silences this app at once, and only this app: ExpertSDR3's own audio does what
-  the Radio page's Mute ExpertSDR3 says, and clicking MUTE again brings the sound back.
+  the Radio page's Mute ExpertSDR3's own audio setting says, and clicking MUTE again brings the
+  sound back.
 - The meter and the waveform follow what is heard: they rise with Volume and BOOST. Under
   MUTE they keep moving, as AetherSDR's do, showing what would play. With no radio the scope reads "Not connected", and with a radio sending no
   audio "No audio from radio", never "Enable PC Audio".
-- The knob turns with a Mac trackpad, one notch per swipe, and the waveform's footer shows the
-  radio's rate (48 kHz, or 24 kHz with `--rate 24000`).
+- The waveform's footer shows the radio's rate (48 kHz, or 24 kHz with `--rate 24000`).
 - Plug in a USB headset, press Refresh: it is listed, choosing it moves the sound there, and
   unplugging it leaves it in the list as "(not found)" until it comes back.
-- On the Pi: GUI CPU with Final Output on screen while audio plays (the waveform redraws at
-  30 Hz on Linux on ARM), and the page scrolls rather than cutting off the scope on its 480-line screen.
+
+### Measuring on a Raspberry Pi
+
+Upstream's pages redraw every 16 ms while they are on screen, so the window's own CPU matters
+on a Pi. This needs a Pi 4 or 5 running the 64-bit Raspberry Pi OS desktop, ideally on the
+7-inch touchscreen, the release `.deb`, and a radio. Before a release that changes a page, and
+before calling the Pi supported:
+
+1. Install `pidstat` once: `sudo apt install sysstat`.
+2. Start the app on the Pi's screen. It opens maximised on a small screen. Connect, choose the
+   Pi's output, tick AetherNR (NR2) and every stage, and let audio play throughout. Note the
+   underruns on Final Output's statistics line.
+3. Show each page in turn, wait a few seconds, then from another computer over SSH, so no
+   terminal is drawing on the Pi's screen, run:
+
+   ```sh
+   pidstat -t -p "$(pidof ExpertSDR3Audio)" 10 1
+   ```
+
+   It averages ten seconds. From its `Average:` lines write down two figures: the `%CPU` of the
+   thread whose TID is the program's PID (the window's thread, listed as `|__ExpertSDR3Audio`),
+   and the `%CPU` on the first line (TID `-`), which is the whole program. 100 % is one core.
+4. Do the same on the EQ page while dragging a handle the whole time, as each step of a drag
+   restyles the band readings.
+5. At the end, on Final Output, write down the DSP figure from its statistics line, and whether
+   the underruns rose.
+
+| Page | Window thread %CPU | Whole program %CPU |
+|---|---|---|
+| Radio | | |
+| AetherNR | | |
+| Gate | | |
+| EQ | | |
+| EQ, dragging a handle | | |
+| Compressor | | |
+| Tube | | |
+| Exciter | | |
+| Final Output | | |
+
+Underruns that rise while a page is on screen, or a window thread near 100 %, mean the Pi
+cannot keep up with that page. The waveform on Final Output redraws at 30 Hz on Linux on ARM,
+half upstream's rate, for this reason.
+
+On the touchscreen:
+
+- Each rail row opens its page with a tap, and each box ticks with a tap.
+- A knob on each page turns with a finger dragged up or down, and an EQ handle drags.
+- The gear menu, its submenus, REC, PLAY, BYPASS and the AetherNR tabs work with a tap.
+- Every page is usable on the 800x480 screen. Final Output scrolls rather than cutting the
+  scope off; note whether its scroll bar can be taken with a finger.
+- With the custom frame, the touch checks in the frame section above.
+
+## Regenerating the README screenshot
+
+`docs/screenshot.png` is the window on its EQ page, with a saved profile, connected to the
+test suite's simulated radio, which sends a tone, so the status chip is green and the analyser
+shows the tone. `test_gui`'s `aConnectedWindowShowsTheRadioAndItsAudio` draws it offscreen at
+720x750; it reaches no real radio and plays nothing. After a change to the look, from a build
+with the tests:
+
+```sh
+cmake --build build && mkdir -p build/readme-shot
+ESA_GUI_SHOT_DIR="$PWD/build/readme-shot" ctest --test-dir build -R test_gui --output-on-failure
+cp build/readme-shot/readme.png docs/screenshot.png
+```
+
+The current one was drawn on a Mac. Look at it before committing: the text is drawn by each
+platform's own font engine, so a picture from Linux or Windows differs a little.
 
 ## Choices worth knowing about
 
@@ -252,7 +416,68 @@ Final Output page or the output path, on each platform with a release build and 
   network, and quit.
 - **The DeepFilterNet library is AetherSDR's prebuilt one,** checked against the SHA-256 pinned in
   its setup script, and built from source if unavailable.
+- **Every package carries the licences** of what it is built from or ships with, from one list
+  in `CMakeLists.txt` (Licences): inside the Mac app, beside the program on Windows, and in
+  `/usr/share/doc/expertsdr3-audio/Licenses` on Linux. `test_licences` checks that each is
+  there. When a sync or a new dependency brings in another library, add its licence to that
+  list and to `tests/CheckLicences.cmake`. The libraries the deploy tools copy in beside Qt
+  (macdeployqt, windeployqt, linuxdeploy) have not been gone through one by one.
 - **A double-click on an Exciter knob lands on AetherSDR's default,** 6 dB for Body drive and 30 %
   for either mix, where this app's defaults are 0 dB and 50 %. The page is AetherSDR's own. Our
   defaults stay because a value left at its default is not stored: changing one would change the
   sound of everyone who never moved that knob.
+
+## Look goldens
+
+`test_look` holds the approved look still. It draws seven pages from the settings in
+`tests/look/<page>.ini`: Gate, EQ, Compressor, Tube, Exciter and Final Output at 720x750, and
+AetherNR at 720x480. It draws them as `--screenshot` does, with three things held fixed
+(below), and compares each with `tests/golden/<key>/<page>.png`. A page passes when every pixel
+is within 3/255 of the golden on every channel. That is strict on purpose: a computer draws
+its own set again pixel for pixel, a new colour for the title text alone changes only 0.3 % of
+the window, and the theme's ground and its raised and nested cards differ by only 4 to 12 per
+channel, so a wider tolerance would let a card lose its surface unnoticed.
+
+Nothing in the pictures moves: there is no radio and no audio, and every run paints the check
+boxes and arrows afresh. The three things held fixed: the numbers are written the US way, Final
+Output is given the same device list on every computer, and AetherNR shows the NR4, DFNR and
+NNR tabs available even in a build without them or on a virtual Mac. So the app's own
+`--screenshot` can differ from the golden in those places.
+
+The key names the environment that drew the set, because text comes out a little different on
+each operating system release, processor and Qt version. The test prints it, for example
+`macos-27-arm64-qt6.10` or `debian-12-x86_64-qt6.4`. Where there is no folder for the key, the
+test compares nothing and ctest lists it as skipped. Today only `macos-27-arm64-qt6.10` has a
+set, so none of CI's jobs compares anything yet: after the first CI run of a pull request,
+commit each job's set from its artifact as below. Plain ctest shows only "Skipped"; run
+`ctest --test-dir build -R test_look -V` to see the key and the message. On CI the key is also
+the name of the folder inside the `look-*` artifact.
+
+When a page fails, the message names a folder holding the render and a diff: the golden, the
+render, and the pixels past the tolerance in red, side by side. Set `ESA_LOOK_OUT=<folder>` to
+choose the folder. After an operating system, font or Qt update the text may come out a little
+different: if the diff shows only the edges of the letters in red, draw the set again as below.
+
+**After the user approves a change to the look,** draw this computer's set again:
+
+```sh
+ESA_UPDATE_GOLDENS=1 ctest --test-dir build -R test_look -V
+```
+
+It writes `tests/golden/<key>/*.png` and compares nothing: each page says which file it wrote
+(`-V` shows those lines), and ctest lists the test as skipped. Look at every picture before
+committing them. Run ctest again; it now passes. Never set `ESA_UPDATE_GOLDENS` in CI; the test
+fails if you do. The other environments' sets are now out of date too: replace them from CI as
+below.
+
+**To add or replace a CI environment's set:** every CI run that reaches `test_look` uploads the
+renders as an artifact, kept for a week: `look-macos-arm64`, `look-windows-x64`,
+`look-linux-x86_64` and `look-linux-arm64`. Each holds a folder named for its key, ready to
+commit:
+
+```sh
+gh run download <run id> -n look-linux-x86_64 -D look
+```
+
+Look at every picture in `look/<key>/`, copy that folder into `tests/golden/`, and commit it.
+From the next run on, that job compares against it.

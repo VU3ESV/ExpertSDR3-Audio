@@ -1232,6 +1232,104 @@ private slots:
         f.engine().shutdown();
     }
 
+    // The status says it is disconnecting from the moment Disconnect is pressed until the link
+    // is closed, while ExpertSDR3 takes its mute back, and at no other time: not while a connect
+    // fails, nor through a connection, a link that drops and comes back, a disconnect with
+    // nothing to give back, or the connection after one. Throughout it, audio is not flowing.
+    void theStatusSaysDisconnectingOnlyWhileTheMuteIsGivenBack()
+    {
+        Fixture f;
+        QList<EngineStatus> seen;
+        QObject::connect(&f.engine(), &Engine::statusChanged, &f.mock, [&](const EngineStatus& s) { seen.append(s); });
+        const auto disconnectingIn = [&](qsizetype from) {
+            qsizetype count = 0;
+            for (qsizetype i = from; i < seen.size(); ++i) count += seen[i].disconnecting ? 1 : 0;
+            return count;
+        };
+
+        // A connect that fails, then given up: nothing to give back, so it closes at once.
+        AppConfig nowhere = f.baseConfig();
+        nowhere.port = closedLocalPort();  // nothing listens there, and no radio could
+        QVERIFY(nowhere.port > 0);
+        f.start(nowhere);
+        QTRY_VERIFY_WITH_TIMEOUT(!f.status.connectionError.isEmpty(), kTimeout);
+        QTest::qWait(300);
+        QCOMPARE(f.status.connection, TciClient::State::Connecting);
+        f.engine().disconnectRadio();
+        QCOMPARE(f.status.connection, TciClient::State::Disconnected);
+
+        // Connected, muted, then the link drops and comes back by itself.
+        f.start();
+        QTRY_VERIFY_WITH_TIMEOUT(f.mock.muted, kTimeout);
+        QTRY_VERIFY_WITH_TIMEOUT(f.audioFlowing(), kTimeout);
+        const int startsBefore = f.mock.audioStartCount();
+        // Only what follows the drop: the failed connect above was Connecting too.
+        const qsizetype dropped = seen.size();
+        f.mock.dropClient();
+        QTRY_VERIFY_WITH_TIMEOUT(f.mock.audioStartCount() > startsBefore, 8000);
+        QTRY_VERIFY_WITH_TIMEOUT(f.audioFlowing() && f.mock.muted, kTimeout);
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.mutePhase, MuteController::Phase::Holding, kTimeout);
+        QTest::qWait(100);
+        QVERIFY(std::any_of(seen.cbegin() + dropped, seen.cend(),
+                            [](const EngineStatus& s) { return s.connection == TciClient::State::Connecting; }));
+        QCOMPARE(disconnectingIn(0), 0);
+
+        // Disconnect, with the restore taking three tries: disconnecting at once, and until closed.
+        f.mock.dropMuteSets = 2;
+        const qsizetype pressed = seen.size();
+        f.engine().disconnectRadio();
+        QVERIFY(seen.size() > pressed);  // said straight away, not at the next tick
+        QVERIFY(f.status.disconnecting);
+        QCOMPARE(f.status.connection, TciClient::State::Ready);
+        QTRY_COMPARE_WITH_TIMEOUT(f.status.connection, TciClient::State::Disconnected, kTimeout);
+        QVERIFY(!f.status.disconnecting);
+        QVERIFY(!f.mock.muted);
+        qsizetype closed = -1;
+        for (qsizetype i = pressed; i < seen.size(); ++i) {
+            const EngineStatus& s = seen[i];
+            QVERIFY2(!s.audioFlowing, qPrintable(QStringLiteral("status %1 after the press").arg(i - pressed + 1)));
+            if (s.connection == TciClient::State::Disconnected) {
+                if (closed < 0) closed = i;
+            } else {
+                // Up to the close, every status says so, and the link was up all along.
+                QVERIFY2(closed < 0 && s.disconnecting && s.connection == TciClient::State::Ready,
+                         qPrintable(QStringLiteral("status %1 after the press").arg(i - pressed + 1)));
+            }
+        }
+        QVERIFY(closed > pressed + 1);  // it did wait, through more than one status
+        QTest::qWait(300);
+        QCOMPARE(disconnectingIn(closed), 0);
+
+        // A connection after it, and a connect pressed during a disconnect: the old link says it
+        // is disconnecting until closed, and the new one never does.
+        f.engine().connectRadio();
+        QTRY_VERIFY_WITH_TIMEOUT(f.audioFlowing() && f.mock.muted, kTimeout);
+        QCOMPARE(disconnectingIn(closed), 0);
+        f.mock.dropMuteSets = 2;
+        f.engine().disconnectRadio();
+        QVERIFY(f.status.disconnecting);
+        const qsizetype switching = seen.size();
+        f.engine().connectRadio();
+        QTRY_VERIFY_WITH_TIMEOUT(!f.status.disconnecting, kTimeout);
+        QTRY_VERIFY_WITH_TIMEOUT(f.status.connection == TciClient::State::Ready && f.audioFlowing(), kTimeout);
+        qsizetype reopened = -1;
+        for (qsizetype i = switching; i < seen.size(); ++i) {
+            if (reopened < 0 && seen[i].connection != TciClient::State::Ready) reopened = i;
+        }
+        // The restore takes three tries, so statuses came between the press and the close, and
+        // every one of them still said disconnecting, Connect pressed or not.
+        QVERIFY(reopened > switching);
+        for (qsizetype i = switching; i < reopened; ++i) {
+            QVERIFY2(seen[i].disconnecting && seen[i].connection == TciClient::State::Ready,
+                     qPrintable(QStringLiteral("status %1 after the second press").arg(i - switching + 1)));
+        }
+        QCOMPARE(disconnectingIn(reopened), 0);
+
+        f.engine().shutdown();
+        QVERIFY(!f.mock.muted);
+        QVERIFY(!f.status.disconnecting);
+    }
+
     // ── Live data for the window ─────────────────────────────────────────────
 
     void theTapsAreOneObjectForTheEnginesLife()

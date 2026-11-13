@@ -94,6 +94,7 @@
 #include <QSpinBox>
 #include <QStandardPaths>
 #include <QStyle>
+#include <QStyleOptionButton>
 #include <QTemporaryDir>
 #include <QTextDocumentFragment>
 #include <QThread>
@@ -109,6 +110,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <utility>
 #include <vector>
 
 using namespace AetherSDR;
@@ -1668,7 +1670,7 @@ private slots:
         QCOMPARE(devices->itemData(0).toString(), QString());
         QCOMPARE(devices->itemText(1), QStringLiteral("Built-in  (Test)  *"));
         QCOMPARE(devices->itemText(2), QStringLiteral("USB  (Test)"));
-        QVERIFY(devices->itemText(3).endsWith(QLatin1String("(not found)")));
+        QCOMPARE(devices->itemText(3), QStringLiteral("No output (null device)"));
         QCOMPARE(devices->currentIndex(), 3);
         QCOMPARE(m_window->config().deviceKey, QStringLiteral("null"));
         QVERIFY(note->isHidden());
@@ -1729,6 +1731,44 @@ private slots:
         QVERIFY(buffered->text().isEmpty());
         QVERIFY(error->isVisibleTo(band));
         QVERIFY(error->text().contains(QLatin1String("Device unplugged")));
+    }
+
+    // The null device (--device null) discards audio and is never listed. Chosen, it is named
+    // for what it is, not shown as a device without a name that is not plugged in. A real
+    // device that is not plugged in is still kept by its name, as before.
+    void theNullDeviceIsNamedForWhatItIs()
+    {
+        make({}, silentSinks());  // the null device, as every test window has; nothing else opens
+        auto* page = m_window->findChild<esa::OutputPage*>();
+        QVERIFY(page);
+        QComboBox* devices = page->stationBand()->deviceList();
+        esa::AudioDeviceInfo built;
+        built.key = QStringLiteral("Test|Built-in");
+        built.name = QStringLiteral("Built-in");
+        built.hostApi = QStringLiteral("Test");
+        built.isDefault = true;
+        esa::AudioDeviceInfo usb = built;
+        usb.key = QStringLiteral("Test|USB Codec");
+        usb.name = QStringLiteral("USB Codec");
+        usb.isDefault = false;
+
+        for (const QList<esa::AudioDeviceInfo>& found : {QList<esa::AudioDeviceInfo>{built, usb},
+                                                         QList<esa::AudioDeviceInfo>{}}) {
+            page->showDevices(found);
+            QCOMPARE(devices->count(), int(found.size()) + 2);
+            QCOMPARE(devices->currentText(), QStringLiteral("No output (null device)"));
+            QCOMPARE(devices->currentData().toString(), QStringLiteral("null"));
+            QCOMPARE(m_window->config().deviceKey, QStringLiteral("null"));
+        }
+
+        page->showDevices({built, usb});
+        devices->setCurrentIndex(devices->findData(usb.key));
+        QCOMPARE(m_window->config().deviceKey, usb.key);
+        page->showDevices({built});  // unplugged
+        QCOMPARE(devices->count(), 3);
+        QCOMPARE(devices->currentText(), QStringLiteral("USB Codec (not found)"));
+        QCOMPARE(devices->currentData().toString(), usb.key);
+        QCOMPARE(m_window->config().deviceKey, usb.key);
     }
 
     // The ticks are images painted once, in colours written out as fixed values: they must
@@ -4443,6 +4483,57 @@ private slots:
         QVERIFY2(running->grab().toImage() == twin.grab().toImage(),
                  qPrintable(QStringLiteral("%1 px for \"%2\", shown as \"%3\"")
                                 .arg(running->contentsRect().width()).arg(running->text(), elided)));
+    }
+
+    // The method tabs share their row evenly. At the window's narrowest every label still fits
+    // the room its tab gives it, where the style cuts a label off; DFNR once lost both ends.
+    // At the reference width each tab, lit or not, is drawn on exactly the pixels it would be
+    // with AetherSDR's own padding.
+    void theNrTabsShowWholeLabelsAtTheNarrowestWindow()
+    {
+        make();
+        m_window->showPage(QStringLiteral("nr"));
+        nrPage()->showMethod(QStringLiteral("nr2"));  // one lit, which has a border of its own
+        // What the style keeps for a tab's label, and cuts it off at: the tab less its border
+        // and padding.
+        const auto room = [](QPushButton* tab) {
+            QStyleOptionButton option;
+            option.initFrom(tab);
+            option.features = QStyleOptionButton::Flat;
+            option.text = tab->text();
+            if (tab->isChecked()) option.state |= QStyle::State_On;
+            return tab->style()->subElementRect(QStyle::SE_PushButtonContents, &option, tab).width();
+        };
+        const auto label = [](QPushButton* tab) { return tab->fontMetrics().horizontalAdvance(tab->text()); };
+
+        m_window->resize(1, 750);  // as narrow as it goes
+        QTRY_COMPARE(m_window->width(), m_window->minimumWidth());
+        QTest::qWait(50);
+        for (const QString& id : esa::NrPage::tabIds()) {
+            QPushButton* tab = nrTab(id);
+            QVERIFY2(tab && tab->isVisible(), qPrintable(id));
+            QVERIFY2(label(tab) <= room(tab),
+                     qPrintable(QStringLiteral("%1 in a window %2 px wide: a %3 px label in %4 px of room")
+                                    .arg(tab->text()).arg(m_window->width()).arg(label(tab)).arg(room(tab))));
+        }
+
+        m_window->resize(720, 750);
+        QTRY_COMPARE(m_window->width(), 720);
+        QTest::qWait(50);
+        // AetherSDR's method tab padding (ModemChrome, dialog scale), on the tab alone.
+        const QString upstream = QStringLiteral("QPushButton[chrome=\"tab\"] { padding-left: 12px; padding-right: 12px; }");
+        for (const QString& id : esa::NrPage::tabIds()) {
+            QPushButton* tab = nrTab(id);
+            const QImage ours = tab->grab().toImage();
+            tab->setStyleSheet(upstream);
+            QVERIFY2(label(tab) <= room(tab), qPrintable(id));  // nothing cut off there either
+            const QImage theirs = tab->grab().toImage();
+            tab->setStyleSheet(QString());
+            QVERIFY2(!ours.isNull() && ours == theirs, qPrintable(QStringLiteral("%1, %2 px wide, %3")
+                                                                     .arg(tab->text()).arg(tab->width())
+                                                                     .arg(tab->isChecked() ? QStringLiteral("lit")
+                                                                                           : QStringLiteral("unlit"))));
+        }
     }
 
     // ── The machinery under every stage page ──────────────────────────────────

@@ -761,6 +761,7 @@ void Engine::disconnectRadio()
         m_closing = true;
         m_closeDeadlineMs = nowMs() + kShutdownWaitMs;
         m_closeTimer.start();
+        emitStatus();  // at once, so the window says it is disconnecting rather than that audio stopped
         return;
     }
     finishClosing();
@@ -1128,6 +1129,7 @@ void Engine::emitStatus()
     EngineStatus s;
     const RadioState& radio = m_tci->radio();
     s.connection = m_tci->state();
+    s.disconnecting = m_closing;
     s.connectionError = m_tci->lastError();
     s.serverName = radio.serverName;
     s.serverVersion = radio.serverVersion;

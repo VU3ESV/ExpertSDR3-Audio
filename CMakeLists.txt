@@ -63,6 +63,8 @@ else()
     FetchContent_MakeAvailable(portaudio)
     add_library(esa_portaudio INTERFACE)
     target_link_libraries(esa_portaudio INTERFACE portaudio_static)
+    # Built in, so its MIT notice goes with every copy (Licences, below).
+    set(ESA_PORTAUDIO_LICENSE ${portaudio_SOURCE_DIR}/LICENSE.txt)
 endif()
 
 # ── RNNoise (RN2) ────────────────────────────────────────────────────────────
@@ -309,6 +311,8 @@ target_link_libraries(esa_gui PUBLIC esa_core aether_gui Qt6::Gui Qt6::Widgets)
 target_sources(esa_gui PRIVATE src/gui/pages/EqPage.cpp src/gui/binding/EqFeed.cpp)
 # Final Output: this computer's output settings on its page, and the feed of its meter and scope.
 target_sources(esa_gui PRIVATE src/gui/pages/StationBand.cpp src/gui/binding/OutputFeed.cpp)
+# What --screenshot saves, here so test_look renders its goldens through the same code.
+target_sources(esa_gui PRIVATE src/gui/Screenshot.cpp)
 
 # ── The window's frame (ui/frame): the platform's own, or AetherRX's ─────────
 # Its own block, so it re-applies onto a restructured build. A Mac hides the system's title
@@ -327,20 +331,52 @@ qt_add_resources(esa_gui "app_icon"
     BASE ${CMAKE_SOURCE_DIR}/packaging/icons
     FILES ${CMAKE_SOURCE_DIR}/packaging/icons/ExpertSDR3Audio-256.png)
 
+# ── Licences ─────────────────────────────────────────────────────────────────
+# The GPL, and the licences of what the app is built from or ships with, which ask that their
+# text go with every copy: the Inter typeface built into it, the code built into it, and the
+# libraries the packages bundle (Qt, FFTW). Each is copied into <build>/Licenses under a name
+# that says whose it is, and every package carries that folder: Contents/Resources/Licenses in
+# the Mac app, Licenses beside the program on Windows, and
+# /usr/share/doc/expertsdr3-audio/Licenses on Linux. packaging/licenses holds the two the
+# source tree has no other copy of.
+set(ESA_LICENSE_DIR ${CMAKE_BINARY_DIR}/Licenses)
+set(ESA_LICENSES "")
+function(esa_add_license source name)
+    configure_file(${source} ${ESA_LICENSE_DIR}/${name} COPYONLY)
+    set(ESA_LICENSES ${ESA_LICENSES} ${ESA_LICENSE_DIR}/${name} PARENT_SCOPE)
+endfunction()
+esa_add_license(${CMAKE_SOURCE_DIR}/LICENSE GPL-3.0.txt)
+esa_add_license(${AETHER_DIR}/THIRD_PARTY_LICENSES AetherSDR-THIRD_PARTY_LICENSES.txt)
+esa_add_license(${AETHER_TP}/inter/LICENSE.txt Inter-OFL.txt)
+esa_add_license(${AETHER_TP}/rnnoise/COPYING RNNoise-BSD-3-Clause.txt)
+esa_add_license(${AETHER_TP}/r8brain/LICENSE r8brain-MIT.txt)
+esa_add_license(${AETHER_TP}/libspecbleach/LICENSE libspecbleach-LGPL-2.1.txt)
+esa_add_license(${AETHER_TP}/wdsp/LICENSE WDSP-GPL-2.0.txt)
+esa_add_license(${AETHER_TP}/deepfilter/LICENSE-MIT DeepFilterNet-MIT.txt)
+esa_add_license(${AETHER_TP}/deepfilter/LICENSE-APACHE DeepFilterNet-Apache-2.0.txt)
+esa_add_license(${CMAKE_SOURCE_DIR}/packaging/licenses/FFTW-COPYRIGHT.txt FFTW-COPYRIGHT.txt)
+esa_add_license(${CMAKE_SOURCE_DIR}/packaging/licenses/LGPL-3.0.txt Qt-LGPL-3.0.txt)
+if(ESA_PORTAUDIO_LICENSE)
+    esa_add_license(${ESA_PORTAUDIO_LICENSE} PortAudio-MIT.txt)
+endif()
+set_source_files_properties(${ESA_LICENSES} PROPERTIES MACOSX_PACKAGE_LOCATION Resources/Licenses)
+
 # ── The application ──────────────────────────────────────────────────────────
 set(ESA_ICON_ICNS ${CMAKE_SOURCE_DIR}/packaging/icons/ExpertSDR3Audio.icns)
 set_source_files_properties(${ESA_ICON_ICNS} PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
-# The Inter typeface is built in (aether_fonts above), and its licence, the SIL OFL, asks that
-# its text go with every copy. The Linux and Windows packages carry it too.
-set(ESA_INTER_LICENSE ${AETHER_TP}/inter/LICENSE.txt)
-set_source_files_properties(${ESA_INTER_LICENSE} PROPERTIES MACOSX_PACKAGE_LOCATION Resources/Inter)
 
 qt_add_executable(ExpertSDR3Audio MACOSX_BUNDLE WIN32
     src/main.cpp
     $<$<BOOL:${APPLE}>:${ESA_ICON_ICNS}>
-    $<$<BOOL:${APPLE}>:${ESA_INTER_LICENSE}>
     $<$<BOOL:${WIN32}>:packaging/windows/app.rc>)
 target_link_libraries(ExpertSDR3Audio PRIVATE esa_gui)
+if(APPLE)
+    target_sources(ExpertSDR3Audio PRIVATE ${ESA_LICENSES})
+elseif(WIN32)
+    # Beside the program, where scripts/package-windows.ps1 takes them from.
+    add_custom_command(TARGET ExpertSDR3Audio POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory ${ESA_LICENSE_DIR} $<TARGET_FILE_DIR:ExpertSDR3Audio>/Licenses)
+endif()
 target_compile_definitions(ExpertSDR3Audio PRIVATE ESA_VERSION="${ESA_VERSION}")
 
 # The model is embedded so one binary works everywhere; DeepFilterFilter
@@ -375,7 +411,7 @@ if(UNIX AND NOT APPLE)
     install(FILES packaging/icons/ExpertSDR3Audio.svg
         DESTINATION share/icons/hicolor/scalable/apps RENAME expertsdr3-audio.svg)
     install(FILES LICENSE DESTINATION share/doc/expertsdr3-audio RENAME copyright)
-    install(FILES ${ESA_INTER_LICENSE} DESTINATION share/doc/expertsdr3-audio RENAME Inter-OFL.txt)
+    install(FILES ${ESA_LICENSES} DESTINATION share/doc/expertsdr3-audio/Licenses)
 
     set(CPACK_GENERATOR DEB)
     set(CPACK_PACKAGE_NAME expertsdr3-audio)
@@ -447,6 +483,26 @@ if(BUILD_TESTS)
     # second and logs the first difference, as a debug build always does.
     set_tests_properties(test_gui test_shell test_aether_gui PROPERTIES ENVIRONMENT
         "${esa_test_env};HOME=${esa_test_home};CFFIXED_USER_HOME=${esa_test_home};ESA_CHECK_MIRROR=1")
+    # The approved look: each page as --screenshot draws it from its tests/look fixture, against
+    # the goldens drawn in this same environment (tests/golden/<key>/, docs/RELEASING.md). Where
+    # there are none yet it compares nothing, and exits 77 so ctest lists it as skipped.
+    esa_test(test_look)
+    target_link_libraries(test_look PRIVATE esa_gui)
+    target_compile_definitions(test_look PRIVATE ESA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    set_tests_properties(test_look PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT
+        "${esa_test_env};HOME=${esa_test_home};CFFIXED_USER_HOME=${esa_test_home};ESA_CHECK_MIRROR=1")
+    # Every licence a package must carry, in the folder this platform's packaging takes them
+    # from: inside the Mac app, beside the program on Windows, and on Linux the build's own,
+    # which install() puts into the .deb and the AppImage.
+    if(APPLE)
+        set(esa_licences_at "$<TARGET_BUNDLE_CONTENT_DIR:ExpertSDR3Audio>/Resources/Licenses")
+    elseif(WIN32)
+        set(esa_licences_at "$<TARGET_FILE_DIR:ExpertSDR3Audio>/Licenses")
+    else()
+        set(esa_licences_at "${ESA_LICENSE_DIR}")
+    endif()
+    add_test(NAME test_licences COMMAND ${CMAKE_COMMAND} "-DDIR=${esa_licences_at}"
+        "-DPORTAUDIO=$<BOOL:${ESA_PORTAUDIO_LICENSE}>" -P ${CMAKE_SOURCE_DIR}/tests/CheckLicences.cmake)
     if(ENABLE_DFNR AND EXISTS ${DF_DIR}/models/DeepFilterNet3_onnx.tar.gz)
         qt_add_resources(test_rx_chain "dfnr_model_test"
             PREFIX "/models"

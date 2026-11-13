@@ -2,10 +2,13 @@
 
 #include <QObject>
 #include <QPointer>
+#include <QRect>
 #include <QString>
 #include <Qt>
 
+#include <functional>
 #include <optional>
+#include <utility>
 
 class QAction;
 class QMainWindow;
@@ -65,8 +68,14 @@ public:
     QMenu* menu() const { return m_menu; }
 
     // Applies `frame` at once. Changing a window's frame hides it, so a visible window is
-    // shown again where it was, at the same size and in the same state.
+    // shown again where it was (or where the placer puts it), in the same state.
     void setFrame(Frame frame);
+
+    // Where a visible window goes back to after its frame changed, from where its content was
+    // (its normal geometry), with mode() already the new frame's. A new frame can add a title
+    // bar above the content, which must stay on the screen. Unset, exactly where it was.
+    using Placer = std::function<QRect(const QRect& normal)>;
+    void setPlacer(Placer placer) { m_placer = std::move(placer); }
 
 signals:
     // The operator picked `frame` from the menu. It is already applied; the window saves it.
@@ -91,6 +100,7 @@ private:
     QAction* m_customAction{nullptr};
     QPointer<QWindow> m_followed;  // the native window whose safe area the content follows
     bool m_resizer{false};         // the edge resizer, once installed, stays for good
+    Placer m_placer;
 };
 
 } // namespace esa

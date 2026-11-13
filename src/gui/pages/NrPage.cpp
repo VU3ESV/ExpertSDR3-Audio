@@ -74,6 +74,10 @@ QDoubleSpinBox:focus {
 QDoubleSpinBox:disabled { color: {{color.text.disabled}}; }
 QLabel#NrAbout { color: {{color.text.label}}; font-size: 12px; }
 QPushButton#nrReset { padding: 3px 12px; font-size: 12px; }
+/* The method tabs share their row evenly, and a label is cut off at the padding, so at the
+   window's narrowest DFNR lost both ends. Without side padding it shows whole. Each label is
+   centred either way, so wherever it fitted it is drawn on the same pixels as before. */
+QPushButton[chrome="tab"] { padding-left: 0px; padding-right: 0px; }
 )");
 }
 

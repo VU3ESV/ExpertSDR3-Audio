@@ -64,7 +64,10 @@ QString radio(const EngineStatus& s)
         }
         if (s.transmitting) line += QStringLiteral("  ·  TX");
         radio = colored(kSuccess, line);
-        if (!s.receiverEnabled) {
+        if (s.disconnecting) {
+            // The audio still arriving is the ended session's: nothing to wait for.
+            radio += QStringLiteral("<br>") + colored(kWarning, QStringLiteral("Disconnecting..."));
+        } else if (!s.receiverEnabled) {
             radio += QStringLiteral("<br>") + colored(kWarning, QStringLiteral("This receiver is switched off in ExpertSDR3, so it has no audio."));
         } else if (!s.audioFlowing) {
             radio += QStringLiteral("<br>") + colored(kWarning, QStringLiteral("Waiting for audio. Is ExpertSDR3 started?"));
@@ -163,6 +166,9 @@ StatusChip::Summary StatusChip::summarize(const EngineStatus& s, bool recordingF
     if (!s.recording.error.isEmpty() && !s.recording.refused && !recordingFailureAnswered) {
         return {QStringLiteral("Recording stopped: %1").arg(s.recording.error), QStringLiteral("danger"), QString()};
     }
+    // Until ExpertSDR3 has its mute back the link is up and its audio plays, but neither is
+    // this session's any more: the radio is going, not silent.
+    if (s.disconnecting) return {QStringLiteral("Disconnecting…"), QStringLiteral("warning"), radioPage};
     switch (s.connection) {
     case TciClient::State::Disconnected:
         return {QStringLiteral("Not connected"), QStringLiteral("idle"), radioPage};

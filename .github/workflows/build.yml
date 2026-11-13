@@ -5,7 +5,8 @@ name: Build all platforms
 # therefore what a release will do.
 #
 # Artifacts are kept for only three days: the release is the permanent copy, and a private
-# repository's storage allowance is small enough for one run to nearly fill it.
+# repository's storage allowance is small enough for one run to nearly fill it. The look renders,
+# about 1 MB a platform, are kept a week: long enough to commit a golden set from.
 
 on:
   workflow_call:
@@ -94,7 +95,22 @@ jobs:
           QT_QPA_PLATFORM: offscreen
           # The settings tests that write this user's own store: a runner's user is throwaway.
           ESA_TEST_NATIVE_SETTINGS: '1'
+          # Where test_look writes its renders: build/look, as ctest runs each test in the build folder.
+          ESA_LOOK_OUT: look
         run: ctest --test-dir build --output-on-failure --test-output-size-failed 100000 --stop-on-failure --timeout 240
+
+      # test_look's renders: the golden set for this runner's environment, ready to commit when
+      # none is (docs/RELEASING.md, Look goldens), and a diff for each page that changed. Never
+      # what stops a build.
+      - name: Upload the look renders
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: look-macos-arm64
+          path: build/look
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Package, sign and notarize
         env:
@@ -179,7 +195,22 @@ jobs:
           QT_LOGGING_TO_CONSOLE: '1'
           # The settings tests that write this user's own store: a runner's user is throwaway.
           ESA_TEST_NATIVE_SETTINGS: '1'
+          # Where test_look writes its renders: build/look, as ctest runs each test in the build folder.
+          ESA_LOOK_OUT: look
         run: ctest --test-dir build -C Release --output-on-failure --test-output-size-failed 100000 --stop-on-failure --timeout 240
+
+      # test_look's renders: the golden set for this runner's environment, ready to commit when
+      # none is (docs/RELEASING.md, Look goldens), and a diff for each page that changed. Never
+      # what stops a build.
+      - name: Upload the look renders
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: look-windows-x64
+          path: build/look
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Package
         run: scripts/package-windows.ps1 -Version $env:VERSION -BuildDir build\Release
@@ -261,7 +292,22 @@ jobs:
           QT_QPA_PLATFORM: offscreen
           # The settings tests that write this user's own store: a runner's user is throwaway.
           ESA_TEST_NATIVE_SETTINGS: '1'
+          # Where test_look writes its renders: build/look, as ctest runs each test in the build folder.
+          ESA_LOOK_OUT: look
         run: ctest --test-dir build --output-on-failure --test-output-size-failed 100000 --stop-on-failure --timeout 240
+
+      # test_look's renders: the golden set for this runner's environment, ready to commit when
+      # none is (docs/RELEASING.md, Look goldens), and a diff for each page that changed. Never
+      # what stops a build.
+      - name: Upload the look renders
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: look-linux-${{ runner.arch == 'ARM64' && 'arm64' || 'x86_64' }}
+          path: build/look
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Package
         run: scripts/package-linux.sh "$VERSION" build

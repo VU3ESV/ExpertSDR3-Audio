@@ -28,7 +28,8 @@ public:
     void showStatus(const EngineStatus& s);
     // The devices the engine found: "System default" first, the system's own marked "*",
     // and a saved device that is not plugged in kept as "(not found)", so plugging it back
-    // in restores it.
+    // in restores it. The null device that discards audio is never listed; chosen, it is
+    // named for what it is.
     void showDevices(const QList<AudioDeviceInfo>& devices);
 
     QComboBox* deviceList() const { return m_device; }

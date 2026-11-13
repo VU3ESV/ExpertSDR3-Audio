@@ -44,7 +44,7 @@ AboutDialog::AboutDialog(QWidget* parent)
         "AetherSDR's AetherRX chain and GUI widgets (GPL-3.0), the Inter typeface (SIL Open Font License 1.1), "
         "WDSP by NR0V (GPL-2.0+), RNNoise (BSD), "
         "DeepFilterNet (MIT, Apache-2.0), libspecbleach (LGPL-2.1), r8brain (MIT), FFTW (GPL-2.0+), "
-        "PortAudio (MIT) and Qt %1 (LGPL-3.0).</p>"
+        "PortAudio (MIT) and Qt %1 (LGPL-3.0). Their licences come with the app, in its Licenses folder.</p>"
         "<p>Free software under the GNU General Public License, version 3, "
         "with no warranty of any kind. "
         "<a href='%2/blob/main/LICENSE'>Read the license</a>.</p>")

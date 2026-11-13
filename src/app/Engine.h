@@ -27,6 +27,9 @@ namespace esa {
 // A snapshot for display, emitted several times a second.
 struct EngineStatus {
     TciClient::State connection{TciClient::State::Disconnected};
+    // Disconnect was pressed and the link stays up until ExpertSDR3 has its mute back. The
+    // radio's audio still plays meanwhile, but it is no longer this session's.
+    bool disconnecting{false};
     QString connectionError;
     QString serverName, serverVersion, device;
     bool receiveOnly{false};

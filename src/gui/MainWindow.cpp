@@ -54,6 +54,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
 #include <utility>
 
 namespace esa {
@@ -98,6 +99,31 @@ QRect parseRect(const QString& text)
         if (!ok) return {};
     }
     return v[2] > 0 && v[3] > 0 ? QRect(v[0], v[1], v[2], v[3]) : QRect();
+}
+
+// The screens' available areas, the main screen first.
+QList<QRect> availableScreens()
+{
+    QList<QRect> screens;
+    QScreen* primary = QGuiApplication::primaryScreen();
+    if (primary) screens.append(primary->availableGeometry());
+    const auto all = QGuiApplication::screens();
+    for (QScreen* screen : all) {
+        if (screen != primary) screens.append(screen->availableGeometry());
+    }
+    return screens;
+}
+
+// Room for the title bar of a frame in `mode`: none for Custom, which keeps its title inside the window.
+int titleAllowance(WindowChrome::Mode mode)
+{
+    return mode == WindowChrome::Mode::System ? MainWindow::systemTitleAllowance() : 0;
+}
+
+std::optional<bool>& placesTitleBarOverride()
+{
+    static std::optional<bool> places;  // the GUI thread only
+    return places;
 }
 
 const PageEntry* pageOfRail(int railId)
@@ -224,6 +250,10 @@ MainWindow::MainWindow(Engine* engine, std::shared_ptr<LiveTaps> taps, Settings*
     connect(m_chrome, &WindowChrome::frameChosen, this, [this](WindowChrome::Frame frame) {
         m_window.frame = WindowChrome::name(frame);
         saveSettings();
+    });
+    m_chrome->setPlacer([this](const QRect& normal) {
+        return placementAfterFrameChange(normal, availableScreens(), titleAllowance(m_chrome->mode()),
+                                         placesTitleBar());
     });
 
     buildDetails();
@@ -665,25 +695,8 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event)
 
 void MainWindow::restoreWindowGeometry()
 {
-    QList<QRect> screens;
-    QScreen* primary = QGuiApplication::primaryScreen();
-    if (primary) screens.append(primary->availableGeometry());
-    const auto all = QGuiApplication::screens();
-    for (QScreen* screen : all) {
-        if (screen != primary) screens.append(screen->availableGeometry());
-    }
-
-    // The saved geometry is the content's. With the system's frame its title bar sits above
-    // that, and how tall it is is known only once the window is on screen, so room is left
-    // for the tallest usual one: about 28 px on a Mac, 31 on Windows, 37 under GNOME.
-    constexpr int kSystemTitleAllowance = 38;
-    const int title = m_chrome->mode() == WindowChrome::Mode::System ? kSystemTitleAllowance : 0;
-#ifdef Q_OS_WIN
-    constexpr bool kPlaceTitle = true;  // Windows leaves a window where it is put, title bar and all
-#else
-    constexpr bool kPlaceTitle = false;  // a Mac and GNOME move it down themselves
-#endif
-    const Placement place = placement(m_window.geometry, screens, title, kPlaceTitle);
+    const Placement place =
+        placement(m_window.geometry, availableScreens(), titleAllowance(m_chrome->mode()), placesTitleBar());
     if (place.positioned) {
         setGeometry(place.geometry);
     } else {
@@ -733,6 +746,40 @@ MainWindow::Placement MainWindow::placement(const QString& savedGeometry, const 
     }
     place.maximised = !home.isEmpty() && isSmallScreen(home.size());
     return place;
+}
+
+QRect MainWindow::placementAfterFrameChange(const QRect& normal, const QList<QRect>& screens, int titleHeight,
+                                            bool placeTitle)
+{
+    // The system keeps its title bar on the screen itself, or the new frame has none.
+    if (!placeTitle || titleHeight <= 0) return normal;
+    // Opening there, the window would be moved down to make room for the title bar: it would be
+    // out of reach. Anywhere else the window stays exactly where the operator put it.
+    const Placement place = placement(rectText(normal), screens, titleHeight, placeTitle);
+    return place.positioned && place.geometry.top() > normal.top() ? place.geometry : normal;
+}
+
+// The window's geometry is the content's. With the system's frame its title bar sits above
+// that, and how tall it is is known only once the window is on screen, so room is left for
+// the tallest usual one: about 28 px on a Mac, 31 on Windows, 37 under GNOME.
+int MainWindow::systemTitleAllowance()
+{
+    return 38;
+}
+
+bool MainWindow::placesTitleBar()
+{
+    if (placesTitleBarOverride()) return *placesTitleBarOverride();
+#ifdef Q_OS_WIN
+    return true;  // Windows leaves a window where it is put, title bar and all
+#else
+    return false;  // a Mac and GNOME move it down themselves
+#endif
+}
+
+void MainWindow::overridePlacesTitleBar(std::optional<bool> places)
+{
+    placesTitleBarOverride() = places;
 }
 
 bool MainWindow::isSmallScreen(const QSize& available)
@@ -1090,7 +1137,7 @@ void MainWindow::onImportProfiles()
     if (!result.renamed.isEmpty()) {
         message += QStringLiteral("\n\nRenamed, because the name was taken:\n") + result.renamed.join(QLatin1Char('\n'));
     }
-    message += QStringLiteral("\n\nChoose one from the Profile list to use it.");
+    message += QStringLiteral("\n\nChoose one from the profile list in the header to use it.");
     QMessageBox::information(this, QStringLiteral("Profiles imported"), message);
 }
 

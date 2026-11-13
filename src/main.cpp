@@ -5,7 +5,7 @@
 #include "dsp/NrProcessor.h"
 #include "dsp/RxChain.h"
 #include "gui/MainWindow.h"
-#include "gui/aether/Appearance.h"
+#include "gui/Screenshot.h"
 #include "gui/pages/Pages.h"
 #include "tci/TciDiscovery.h"
 
@@ -14,7 +14,6 @@
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QFileInfo>
-#include <QIcon>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -531,18 +530,19 @@ int main(int argc, char** argv)
                            parser.isSet(durationOpt) ? parser.value(durationOpt).toDouble() : 0.0);
     }
 
-    Appearance::install();
-    QApplication::setWindowIcon(QIcon(QStringLiteral(":/icons/ExpertSDR3Audio-256.png")));
-    MainWindow window(host.engine(), host.engine()->taps(), &settings, &profiles, config);
-    // The page and size a screenshot shows are its own, not where the operator left things.
-    if (parser.isSet(screenshotOpt)) window.setSavesWindowState(false);
-    if (!screenshotPage.isEmpty()) window.showPage(screenshotPage);
-    if (screenshotSize.isValid()) {
-        // Exactly this size: no saved geometry, and not maximised on a small screen.
-        window.setWindowState(Qt::WindowNoState);
-        window.resize(screenshotSize);
+    // Opened as test_look opens it, so its goldens see the same window.
+    const std::unique_ptr<MainWindow> opened = openMainWindow(host.engine(), &settings, &profiles, config);
+    MainWindow& window = *opened;
+    if (parser.isSet(screenshotOpt)) {
+        // The same path test_look renders its goldens through.
+        const QString path = parser.value(screenshotOpt);
+        showForScreenshot(window, screenshotPage, screenshotSize, [&window, path](const QImage& shot) {
+            shot.save(path);
+            window.close();
+        });
+    } else {
+        window.show();
     }
-    window.show();
     if (parser.isSet(connectOpt)) window.connectNow();
 
     QTimer poll;
@@ -550,14 +550,6 @@ int main(int argc, char** argv)
         if (g_stopRequested.load()) window.close();
     });
     poll.start(100);
-
-    if (parser.isSet(screenshotOpt)) {
-        const QString path = parser.value(screenshotOpt);
-        QTimer::singleShot(2000, &window, [&window, path] {
-            window.grab().save(path);
-            window.close();
-        });
-    }
 
     const int result = QApplication::exec();
     host.stop();

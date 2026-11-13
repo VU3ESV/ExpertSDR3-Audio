@@ -21,8 +21,11 @@ New-Item -ItemType Directory -Force -Path $stage | Out-Null
 # Named, not build\Release\*: the test executables are in there too.
 Copy-Item (Join-Path $BuildDir 'ExpertSDR3Audio.exe') $stage
 Copy-Item LICENSE (Join-Path $stage 'LICENSE.txt')
-# The built-in Inter typeface's licence (SIL OFL), which asks to go with every copy.
-Copy-Item vendor\aethersdr\third_party\inter\LICENSE.txt (Join-Path $stage 'Inter-OFL.txt')
+# The licences that go with every copy: the built-in Inter typeface's, and those of the code
+# built in and the DLLs shipped here, Qt's among them. The build puts them beside the exe.
+$licenses = Join-Path $BuildDir 'Licenses'
+if (-not (Test-Path $licenses)) { throw "Licenses is missing from $BuildDir, so the package would go out without them" }
+Copy-Item -Recurse $licenses (Join-Path $stage 'Licenses')
 foreach ($dll in 'fftw3.dll', 'fftw3f.dll', 'deepfilter.dll') {
     $path = Join-Path $BuildDir $dll
     if (-not (Test-Path $path)) { throw "$dll is missing from $BuildDir, so the package would not run" }

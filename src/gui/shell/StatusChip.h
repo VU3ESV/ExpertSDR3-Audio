@@ -34,8 +34,8 @@ public:
     };
     // The first that applies, most serious first: the output failing, ExpertSDR3's mute
     // failing, the computer not keeping up, NR failing, a recording that stopped early (until
-    // its warning is answered), the connection, no audio from the radio, a recording losing
-    // audio, NR's state, and then the frequency.
+    // its warning is answered), the connection (disconnecting first), no audio from the radio,
+    // a recording losing audio, NR's state, and then the frequency.
     static Summary summarize(const EngineStatus& s, bool recordingFailureAnswered = false);
 
     explicit StatusChip(QWidget* parent = nullptr);

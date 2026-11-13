@@ -10,6 +10,8 @@
 #include "gui/ParamWidgets.h"
 #include "gui/RadioDiscoveryDialog.h"
 #include "gui/aether/Appearance.h"
+#include "gui/binding/EqFeed.h"
+#include "gui/shell/StatusChip.h"
 
 #include "ClientCompKnob.h"
 
@@ -32,6 +34,8 @@
 #include <QtTest>
 
 #include <algorithm>
+#include <utility>
+#include <vector>
 
 using namespace esa;
 
@@ -542,6 +546,69 @@ private slots:
         QTRY_VERIFY_WITH_TIMEOUT(second.audioStartCount() == 1, 6000);
         QTRY_VERIFY_WITH_TIMEOUT(!first.muted, 6000);  // given back before moving on
         QTRY_VERIFY_WITH_TIMEOUT(second.muted, 6000);
+    }
+
+    // The window as the README shows it: a saved profile, the EQ page, and a radio (the mock,
+    // sending its tone) connected and heard, so the chip is green and the analyser moves. With
+    // ESA_GUI_SHOT_DIR set it is saved there as readme.png; docs/RELEASING.md says how that
+    // becomes docs/screenshot.png.
+    void aConnectedWindowShowsTheRadioAndItsAudio()
+    {
+        MockExpert radio;
+        QVERIFY(radio.listen());
+        AppConfig config;
+        config.deviceKey = QStringLiteral("null");  // never the real speakers
+        config.host = QStringLiteral("127.0.0.1");
+        config.port = radio.port();
+        config.fallbackPorts.clear();  // never the real radio's ports
+        config.muteExpert = false;
+        config.nrMethod = QStringLiteral("nr2");
+        for (const char* key : {"gate.enabled", "eq.enabled", "comp.enabled"}) {
+            config.params.insert(QLatin1String(key), 1);
+        }
+        // An SSB voice curve: a high-pass, less mud, more presence, a low-pass. Types: 0
+        // high-pass, 2 peak, 4 low-pass.
+        const QList<QPair<QString, double>> curve = {
+            {QStringLiteral("eq.b0.type"), 0},    {QStringLiteral("eq.b0.freq"), 150},
+            {QStringLiteral("eq.b2.type"), 2},    {QStringLiteral("eq.b2.freq"), 300},
+            {QStringLiteral("eq.b2.gain"), -3},   {QStringLiteral("eq.b5.type"), 2},
+            {QStringLiteral("eq.b5.freq"), 1800}, {QStringLiteral("eq.b5.gain"), 4},
+            {QStringLiteral("eq.b9.type"), 4},    {QStringLiteral("eq.b9.freq"), 3200},
+        };
+        for (const auto& [key, value] : curve) config.params.insert(key, value);
+        for (int band : {0, 2, 5, 9}) config.params.insert(QStringLiteral("eq.b%1.on").arg(band), 1);
+        make(config);
+        QVERIFY(m_window->saveProfileAs(QStringLiteral("Weak SSB")));
+        // AetherRX's own size, not the maximised window a small offscreen screen gets.
+        m_window->setWindowState(Qt::WindowNoState);
+        m_window->resize(720, 750);
+        m_window->showPage(QStringLiteral("eq"));
+        m_window->connectNow();
+
+        auto* chip = m_window->findChild<StatusChip*>();
+        QVERIFY(chip);
+        QTRY_VERIFY_WITH_TIMEOUT(chip->summary().tone == QLatin1String("success"), 8000);
+        QVERIFY2(chip->summary().text.contains(QStringLiteral("MHz")), qPrintable(chip->summary().text));
+        auto* feed = m_window->findChild<EqFeed*>();
+        QVERIFY(feed && feed->isRunning());
+        std::vector<float> heard(2048);
+        QTRY_VERIFY_WITH_TIMEOUT(feed->copyRecent(heard.data(), int(heard.size()))
+                                     && *std::max_element(heard.begin(), heard.end()) > 0.01f,
+                                 8000);
+        QTest::qWait(1500);  // long enough for the analyser to draw the tone
+        QVERIFY(!m_window->chainModified());
+
+        // 720x750 where the fonts allow; Windows' are wider, and so is its narrowest window.
+        const QPixmap shot = m_window->grab();
+        QVERIFY(!shot.isNull());
+        const QString shots = qEnvironmentVariable("ESA_GUI_SHOT_DIR");
+        if (!shots.isEmpty()) QVERIFY(shot.save(QDir(shots).filePath(QStringLiteral("readme.png"))));
+        // Listening sends the radio nothing that changes it.
+        for (const QString& command : std::as_const(radio.commands)) {
+            for (const char* changing : {"trx", "volume", "mute", "rx_volume", "rx_mute"}) {
+                QVERIFY2(!command.startsWith(QLatin1String(changing)), qPrintable(command));
+            }
+        }
     }
 
     void theWindowCanShrinkForASmallScreen()

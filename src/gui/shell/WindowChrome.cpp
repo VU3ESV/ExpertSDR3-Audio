@@ -187,14 +187,15 @@ void WindowChrome::setFrame(Frame frame)
             m_window->setWindowFlags(flags);  // before the first show: nothing else to keep
         } else {
             // New flags hide the window. It comes back with its content where it was, the
-            // same size, maximised or not as it was, and the keyboard where it was.
+            // same size, maximised or not as it was, and the keyboard where it was; unless the
+            // placer moves it so that a title bar the new frame adds stays on the screen.
             const Qt::WindowStates state = m_window->windowState() & ~Qt::WindowActive;
             const QRect normal = m_window->normalGeometry();
             const bool active = m_window->isActiveWindow();
             const QPointer<QWidget> focus = m_window->focusWidget();
             m_window->setWindowFlags(flags);
             m_window->setWindowState(Qt::WindowNoState);
-            m_window->setGeometry(normal);
+            m_window->setGeometry(m_placer ? m_placer(normal) : normal);
             m_window->setWindowState(state);
             m_window->show();
             if (active) m_window->activateWindow();

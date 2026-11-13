@@ -16,6 +16,7 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 #include <utility>
 
 class QAction;
@@ -119,6 +120,21 @@ public:
     };
     static Placement placement(const QString& savedGeometry, const QList<QRect>& screens, int titleHeight = 0,
                                bool placeTitle = false);
+    // Where the window goes back to when its frame changes while it is shown: where its content
+    // `normal` was, unless a title bar the new frame adds, `titleHeight` tall, would be left
+    // above the top of the screen, out of reach, by a system that leaves it where it is put
+    // (`placeTitle`). Then it is placed as when it opens, by placement().
+    static QRect placementAfterFrameChange(const QRect& normal, const QList<QRect>& screens, int titleHeight,
+                                           bool placeTitle);
+    // The room the window leaves for the system frame's title bar: its `titleHeight` above
+    // while the frame is the system's.
+    static int systemTitleAllowance();
+    // Whether this system leaves a window's title bar where the window is put, as Windows does.
+    // The window passes the answer to the two functions above as `placeTitle`.
+    static bool placesTitleBar();
+    // Tests only: answer placesTitleBar() as another system would, so Windows' path runs on any
+    // machine. Set before the window is made; nullopt goes back to this system's answer.
+    static void overridePlacesTitleBar(std::optional<bool> places);
 
 protected:
     void closeEvent(QCloseEvent* event) override;

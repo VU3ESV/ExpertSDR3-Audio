@@ -201,6 +201,17 @@ struct FramelessCustom {
     FramelessCustom& operator=(const FramelessCustom&) = delete;
 };
 
+// While it lives, the window places its title bar as a system that `places` it would: Windows
+// leaves a title bar where the window is put, and a Mac and GNOME move the window down
+// themselves. nullopt leaves this system's way. A test makes and uses its window within its
+// lifetime.
+struct PlacesTitleBar {
+    explicit PlacesTitleBar(std::optional<bool> places) { MainWindow::overridePlacesTitleBar(places); }
+    ~PlacesTitleBar() { MainWindow::overridePlacesTitleBar(std::nullopt); }
+    PlacesTitleBar(const PlacesTitleBar&) = delete;
+    PlacesTitleBar& operator=(const PlacesTitleBar&) = delete;
+};
+
 // A main window's flags as Qt gives them, frame and all.
 Qt::WindowFlags plainFlags()
 {
@@ -691,17 +702,30 @@ private slots:
         QCOMPARE(savedWindow().geometry, QStringLiteral("80,90,700,650"));
     }
 
+    // Centred on the main screen. Where the system leaves the title bar where it is put, the
+    // window is centred whole, title bar and all, so its content sits half a title bar lower.
+    void aWindowFromAScreenThatHasGoneIsCentred_data()
+    {
+        QTest::addColumn<std::optional<bool>>("places");
+        QTest::newRow("this system") << std::optional<bool>();
+        QTest::newRow("a system that leaves the title bar where it is put") << std::optional<bool>(true);
+        QTest::newRow("a system that moves the window down itself") << std::optional<bool>(false);
+    }
     void aWindowFromAScreenThatHasGoneIsCentred()
     {
+        QFETCH(std::optional<bool>, places);
+        const PlacesTitleBar titleBar(places);
         Settings::WindowState window;
         window.geometry = QStringLiteral("-30000,-30000,700,500");  // no screen is there
-        make(window);
+        make(window);  // with the system's frame, the default
         const QRect normal = m_window->normalGeometry();
         const QRect screen = QGuiApplication::primaryScreen()->availableGeometry();
         QCOMPARE(normal.size(), QSize(700, 500).boundedTo(screen.size()));
-        QVERIFY2(qAbs(normal.center().x() - screen.center().x()) <= 1 && qAbs(normal.center().y() - screen.center().y()) <= 1,
+        const QPoint centre =
+            screen.center() + QPoint(0, MainWindow::placesTitleBar() ? MainWindow::systemTitleAllowance() / 2 : 0);
+        QVERIFY2(qAbs(normal.center().x() - centre.x()) <= 1 && qAbs(normal.center().y() - centre.y()) <= 1,
                  qPrintable(QStringLiteral("%1,%2 against %3,%4").arg(normal.center().x()).arg(normal.center().y())
-                                .arg(screen.center().x()).arg(screen.center().y())));
+                                .arg(centre.x()).arg(centre.y())));
     }
 
     void aSmallScreenOpensMaximised()
@@ -805,6 +829,111 @@ private slots:
         QCOMPARE(place.positioned, positioned);
         QCOMPARE(positioned ? place.geometry : QRect(QPoint(), place.geometry.size()), geometry);
         QCOMPARE(place.maximised, maximised);
+    }
+
+    // A frame changed while the window is shown puts it back where its content was. Windows
+    // leaves a title bar where it is put, so a system frame added to a window at the top of the
+    // screen would have its title bar above the screen, out of reach: there the window is placed
+    // as when it opens. Anywhere else, and wherever the system moves it down itself, it stays.
+    void whereTheWindowGoesWhenItsFrameChanges_data()
+    {
+        QTest::addColumn<QRect>("normal");
+        QTest::addColumn<QList<QRect>>("screens");
+        QTest::addColumn<int>("title");
+        QTest::addColumn<bool>("placeTitle");
+        QTest::addColumn<QRect>("geometry");
+        const QRect work(0, 0, 1920, 1040);     // a Windows desktop over its taskbar
+        const QRect right(1920, 0, 1280, 984);  // a second screen to its right
+        QTest::newRow("at the top, a system that leaves the title bar where it is put: moved under it")
+            << QRect(300, 0, 724, 752) << QList<QRect>{work} << 38 << true << QRect(300, 38, 724, 752);
+        QTest::newRow("its title bar half above the top: moved under it")
+            << QRect(300, 20, 724, 752) << QList<QRect>{work} << 38 << true << QRect(300, 38, 724, 752);
+        QTest::newRow("at the top of a second screen: moved under the title there")
+            << QRect(2000, 0, 724, 752) << QList<QRect>{work, right} << 38 << true << QRect(2000, 38, 724, 752);
+        QTest::newRow("as tall as the screen at its top: kept whole under the title")
+            << QRect(300, 0, 724, 1040) << QList<QRect>{work} << 38 << true << QRect(300, 38, 724, 1002);
+        QTest::newRow("dragged above every screen: centred whole on the main one, as when it opens")
+            << QRect(300, -200, 724, 752) << QList<QRect>{work} << 38 << true << QRect(598, 163, 724, 752);
+        QTest::newRow("room for the title bar: left exactly where it was")
+            << QRect(300, 38, 724, 752) << QList<QRect>{work} << 38 << true << QRect(300, 38, 724, 752);
+        QTest::newRow("room for the title bar, hanging off the right and the bottom: left where it was")
+            << QRect(1500, 600, 724, 752) << QList<QRect>{work} << 38 << true << QRect(1500, 600, 724, 752);
+        QTest::newRow("at the top, a system that moves the title bar down itself: left to it")
+            << QRect(300, 0, 724, 752) << QList<QRect>{work} << 38 << false << QRect(300, 0, 724, 752);
+        QTest::newRow("at the top, a new frame with no title bar: left where it was")
+            << QRect(300, 0, 724, 752) << QList<QRect>{work} << 0 << true << QRect(300, 0, 724, 752);
+        QTest::newRow("no screen at all: left where it was")
+            << QRect(300, 0, 724, 752) << QList<QRect>{} << 38 << true << QRect(300, 0, 724, 752);
+    }
+
+    void whereTheWindowGoesWhenItsFrameChanges()
+    {
+        QFETCH(QRect, normal);
+        QFETCH(QList<QRect>, screens);
+        QFETCH(int, title);
+        QFETCH(bool, placeTitle);
+        QFETCH(QRect, geometry);
+        QCOMPARE(MainWindow::placementAfterFrameChange(normal, screens, title, placeTitle), geometry);
+    }
+
+    // The frame change goes through the window's placer, with the new frame's mode already set.
+    void aFrameChangeGoesThroughThePlacer()
+    {
+        const FramelessCustom asOnWindows(true);
+        make();
+        auto* chrome = m_window->findChild<WindowChrome*>();
+        QVERIFY(chrome);
+        atReferenceSize();
+        m_window->move(30, 40);
+        QTRY_COMPARE(m_window->pos(), QPoint(30, 40));
+        const QRect before = m_window->geometry();
+        QList<WindowChrome::Mode> modes;
+        chrome->setPlacer([&](const QRect& normal) {
+            modes << chrome->mode();
+            return normal.translated(0, 25);
+        });
+        chrome->setFrame(WindowChrome::Frame::Custom);
+        QVERIFY(QTest::qWaitForWindowExposed(m_window.get()));
+        QTRY_COMPARE(m_window->geometry(), before.translated(0, 25));
+        chrome->setFrame(WindowChrome::Frame::System);
+        QVERIFY(QTest::qWaitForWindowExposed(m_window.get()));
+        QTRY_COMPARE(m_window->geometry(), before.translated(0, 50));
+        QCOMPARE(modes, (QList<WindowChrome::Mode>{WindowChrome::Mode::Frameless, WindowChrome::Mode::System}));
+        chrome->setFrame(WindowChrome::Frame::System);  // no change of frame: nothing moves
+        QCOMPARE(modes.size(), 2);
+    }
+
+    // The window's own placer, end to end: switching from Custom to System with the window at
+    // the top of the screen. Where the system leaves the title bar where it is put, the window
+    // moves down far enough for it; where the system moves the window itself, it stays.
+    void aFrameChangeAtTheTopOfTheScreenKeepsTheTitleBarOnIt_data()
+    {
+        QTest::addColumn<bool>("places");
+        QTest::newRow("a system that leaves the title bar where it is put") << true;
+        QTest::newRow("a system that moves the window down itself") << false;
+    }
+    void aFrameChangeAtTheTopOfTheScreenKeepsTheTitleBarOnIt()
+    {
+        QFETCH(bool, places);
+        const FramelessCustom asOnWindows(true);
+        const PlacesTitleBar titleBar(places);
+        Settings::WindowState window;
+        window.frame = QStringLiteral("Custom");
+        make(window);
+        atReferenceSize();
+        const QRect screen = m_window->screen()->availableGeometry();
+        m_window->move(30, screen.top());
+        QTRY_COMPARE(m_window->pos(), QPoint(30, screen.top()));
+        const QRect before = m_window->geometry();
+        QVERIFY(before.height() + MainWindow::systemTitleAllowance() <= screen.height());  // so nothing shrinks
+
+        QMenu* gear = m_window->findChild<QMenu*>(QStringLiteral("gearMenu"));
+        QAction* system = actionNamed(gear, QStringLiteral("System"));
+        QVERIFY(system);
+        system->trigger();
+        QVERIFY(QTest::qWaitForWindowExposed(m_window.get()));
+        const QRect expected = places ? before.translated(0, MainWindow::systemTitleAllowance()) : before;
+        QTRY_COMPARE(m_window->geometry(), expected);
     }
 
     // AetherRX's 600x400 minimum: its height, and the layout's own width, which is wider.
@@ -985,8 +1114,10 @@ private slots:
             QSKIP("this build's Qt has no custom frame on this platform");
         }
         atReferenceSize();
-        m_window->move(30, 20);
-        QTRY_COMPARE(m_window->pos(), QPoint(30, 20));
+        // Room above for a title bar, which Windows would otherwise move it down for when the
+        // system frame comes back (whereTheWindowGoesWhenItsFrameChanges).
+        m_window->move(30, 40);
+        QTRY_COMPARE(m_window->pos(), QPoint(30, 40));
         m_window->showPage(QStringLiteral("gate"));
         activate();
         railTab(QStringLiteral("Gate"))->setFocus();
@@ -1685,6 +1816,51 @@ private slots:
         chip->showStatus(quiet);
         chip->click();
         QCOMPARE(m_window->currentPage(), QStringLiteral("radio"));
+    }
+
+    // After Disconnect the link stays up until ExpertSDR3 has its mute back, and its audio still
+    // plays, though it is not shown as flowing. The radio is going, not silent: the chip says
+    // so, in amber, opening Radio, and nothing on its tooltip asks whether ExpertSDR3 is started.
+    void theStatusChipSaysDisconnectingWhileTheMuteIsGivenBack()
+    {
+        using Chip = StatusChip;
+        EngineStatus s;
+        s.connection = TciClient::State::Ready;
+        s.serverName = QStringLiteral("ExpertSDR3");
+        s.frequencyHz = 14200000;
+        s.modulation = QStringLiteral("USB");
+        s.mutePhase = MuteController::Phase::Restoring;
+        s.disconnecting = true;
+        QCOMPARE(Chip::summarize(s).text, QStringLiteral("Disconnecting…"));
+        QCOMPARE(Chip::summarize(s).tone, QStringLiteral("warning"));
+        QCOMPARE(Chip::summarize(s).page, QStringLiteral("radio"));
+        s.nrPreparing = true;  // less serious, like everything below the connection
+        s.recording.active = true;
+        s.recording.droppedFrames = 480;
+        QCOMPARE(Chip::summarize(s).text, QStringLiteral("Disconnecting…"));
+        s.connection = TciClient::State::Connecting;  // the link dropped meanwhile
+        QCOMPARE(Chip::summarize(s).text, QStringLiteral("Disconnecting…"));
+        s.connection = TciClient::State::Ready;
+
+        make();
+        auto* chip = m_window->findChild<StatusChip*>();
+        QVERIFY(chip);
+        chip->showStatus(s);
+        QCOMPARE(chip->summary().text, QStringLiteral("Disconnecting…"));
+        QCOMPARE(chip->property("tone").toString(), QStringLiteral("warning"));
+        QVERIFY2(chip->toolTip().contains(QStringLiteral("Disconnecting...")), qPrintable(chip->toolTip()));
+        QVERIFY2(chip->toolTip().contains(QStringLiteral("Restoring ExpertSDR3...")), qPrintable(chip->toolTip()));
+        QVERIFY2(!chip->toolTip().contains(QStringLiteral("Waiting for audio")), qPrintable(chip->toolTip()));
+        chip->click();
+        QCOMPARE(m_window->currentPage(), QStringLiteral("radio"));
+
+        // Still more serious: ExpertSDR3 not taking its mute back.
+        s.mutePhase = MuteController::Phase::Failed;
+        QCOMPARE(Chip::summarize(s).text, QStringLiteral("ExpertSDR3 mute failed"));
+        // Closed: not connected.
+        EngineStatus closed;
+        chip->showStatus(closed);
+        QCOMPARE(chip->summary().text, QStringLiteral("Not connected"));
     }
 
     // A recording that stopped early is red, above everything from the connection down, until
@@ -2673,6 +2849,8 @@ private slots:
         const QString all = text.join(u' ');
         QVERIFY2(all.contains(QStringLiteral("Inter typeface (SIL Open Font License 1.1)")), qPrintable(all));
         QVERIFY2(all.contains(QStringLiteral("AetherRX chain and GUI widgets (GPL-3.0)")), qPrintable(all));
+        // Where to find their texts, which every package carries (test_licences).
+        QVERIFY2(all.contains(QStringLiteral("in its Licenses folder")), qPrintable(all));
     }
 
     // Rounded to the spec's decimals before clamping, so float noise from a drag never
