@@ -1712,6 +1712,9 @@ private slots:
         });
         QTRY_VERIFY_WITH_TIMEOUT(status.playback.active, kTimeout);
         QTRY_VERIFY_WITH_TIMEOUT(!status.playback.active, kTimeout);
+        // As long as the first, so the PLAYs of it below last over a second however fast the
+        // radio streamed meanwhile.
+        QTRY_VERIFY_WITH_TIMEOUT(status.recording.path == during && status.recording.seconds > 1.5, kTimeout);
         call([](Engine* e) { e->stopRecording(); });
         QTRY_COMPARE_WITH_TIMEOUT(status.lastRecordingPath, during, kTimeout);
 

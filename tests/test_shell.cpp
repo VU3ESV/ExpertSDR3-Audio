@@ -1453,7 +1453,12 @@ private slots:
         QAction* quit = actionNamed(gear, QStringLiteral("Quit"));
         QVERIFY(quit);
         if (!quit->shortcut().isEmpty()) {
+            // A desktop gives the window back its activation when the dialog above closes;
+            // offscreen does not, and a window that is not active gets no shortcuts.
+            activate();
+            QSignalSpy quitting(quit, &QAction::triggered);
             QTest::keySequence(m_window.get(), quit->shortcut());
+            QCOMPARE(quitting.count(), 1);
             QTRY_COMPARE(m_quits, 1);
         }
 #endif

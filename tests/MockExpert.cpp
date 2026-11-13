@@ -161,8 +161,13 @@ void MockExpert::onText(const QString& text)
         } else if (name == QLatin1String("audio_start")) {
             m_receiver = args.toInt();
             if (sendAudio) {
-                // Block period from the real samples per block, in stereo.
-                const int intervalMs = std::max(1, (blockSamples / 2) * 1000 / m_sampleRate);
+                // Block period from the real samples per block, in stereo. It stays as it is
+                // if the rate changes later (operatorSetStreamRate).
+                m_streamPeriodNs = qint64(blockSamples / 2) * 1000000000LL / m_sampleRate;
+                m_streamBlocks = 0;
+                m_streamClock.start();
+                const int intervalMs = std::max(1, int(m_streamPeriodNs / 1000000));
+                m_stream.setTimerType(Qt::PreciseTimer);
                 m_stream.start(intervalMs);
             }
             push(QStringLiteral("audio_start:%1;").arg(m_receiver));
@@ -175,7 +180,22 @@ void MockExpert::onText(const QString& text)
 
 void MockExpert::onStream()
 {
-    if (!m_client || m_receiver < 0) return;
+    if (!m_client || m_receiver < 0 || m_streamPeriodNs <= 0) return;
+    // Real time, as a radio streams: each tick sends what the clock says is due, so a tick
+    // that comes late is made up for, up to a few blocks. Further behind than that, the time
+    // is let go, as a stalled radio's would be. A busy test machine once got a third of
+    // real time from one block a tick.
+    constexpr qint64 kMaxBurst = 4;
+    const qint64 due = m_streamClock.nsecsElapsed() / m_streamPeriodNs;
+    m_streamBlocks = std::max(m_streamBlocks, due - kMaxBurst);
+    while (m_streamBlocks < due && m_client && m_receiver >= 0) {
+        sendBlock();
+        ++m_streamBlocks;
+    }
+}
+
+void MockExpert::sendBlock()
+{
     const int samples = blockSamples;
     QByteArray frame(64 + samples * int(sizeof(float)), '\0');
     const auto put = [&](int index, quint32 value) { qToLittleEndian(value, frame.data() + index * 4); };

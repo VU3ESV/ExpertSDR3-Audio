@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QElapsedTimer>
 #include <QList>
 #include <QObject>
 #include <QPointer>
@@ -63,11 +64,16 @@ private slots:
 
 private:
     void sendInitBurst();
+    void sendBlock();
     void push(const QString& text);
 
     QPointer<QWebSocket> m_client;
     QTimer m_tick;
     QTimer m_stream;
+    // The stream keeps time by this clock, not by its timer's ticks.
+    QElapsedTimer m_streamClock;
+    qint64 m_streamPeriodNs{0};
+    qint64 m_streamBlocks{0};
     QStringList m_pending;
     int m_sampleRate{48000};
     int m_receiver{-1};
