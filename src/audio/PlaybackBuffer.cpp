@@ -1,5 +1,7 @@
 #include "audio/PlaybackBuffer.h"
 
+#include "audio/OutputShape.h"
+
 #include "Resampler.h"
 
 #include <algorithm>
@@ -40,7 +42,10 @@ PlaybackBuffer::~PlaybackBuffer() = default;
 
 void PlaybackBuffer::setGainDb(double db)
 {
-    m_targetGain.store(float(std::pow(10.0, db / 20.0)), std::memory_order_relaxed);
+    // A NaN target would turn the gain ramp NaN for as long as this output lives, and NaN
+    // passes the clamp to full scale on its way to the device.
+    if (!std::isfinite(db)) return;
+    m_targetGain.store(outputGain(db), std::memory_order_relaxed);
 }
 
 void PlaybackBuffer::setTargetLatencyMs(int ms)
@@ -175,14 +180,8 @@ void PlaybackBuffer::render(float* out, unsigned long frames)
         m_currentGain += gainStep;
         m_fade = std::min(m_fade + fadeStep, 1.0f);
         const float gain = m_currentGain * m_fade;
-        float left = stereo[i * 2] * gain;
-        float right = stereo[i * 2 + 1] * gain;
-        if (boost) {  // upstream's soft boost: about 2x when quiet, never past full scale
-            left = std::tanh(left * 2.0f);
-            right = std::tanh(right * 2.0f);
-        }
-        left = std::clamp(left, -1.0f, 1.0f);
-        right = std::clamp(right, -1.0f, 1.0f);
+        const float left = shapeOutput(stereo[i * 2], gain, boost);
+        const float right = shapeOutput(stereo[i * 2 + 1], gain, boost);
         peak = std::max({peak, std::fabs(left), std::fabs(right)});
         if (m_deviceChannels == 1) {
             out[i] = 0.5f * (left + right);

@@ -1,0 +1,100 @@
+# The AetherRX page family: the files scripts/sync-aether.sh copies from AetherSDR's
+# src/gui/ into vendor/aethersdr/src/gui/, unmodified. One path per line, relative to
+# src/gui/. Lines starting with # are comments. CMake builds every .cpp listed here.
+#
+# How this list was made: start from the seven stage panels (Strip{Gate,Eq,Comp,Tube,
+# Pudu,RxOutput,Waveform}Panel), the rail (StageTabBar) and the page wrapper (StagePage),
+# follow every quoted #include, and take each reached header's .cpp along with it.
+# FramelessResizer is a root of its own: nothing here includes it, but the custom frame
+# of Windows and Linux (src/gui/shell/WindowChrome.cpp) uses its resize edges, and
+# FramelessMoveHelper.h to move the window by its header.
+#
+# Left out on purpose: AetherRxDialog, AetherRxSettingsDialog, AetherDspWidget and
+# CanonWindow (never opened here; CanonWindow needs Qt 6.12), and NrGainStrip, which
+# is forked into src/gui/aether/fork/ because it uses Qt 6.6 API. ClientEqApplet.h and
+# PanadapterMessageOverlay.h are headers only: what is used from them is an enum and a
+# plain struct, and their .cpp files would bring whole widgets nobody shows.
+#
+# To change it: edit this list, run sync-aether.sh (its include check names anything
+# still missing), and build against Qt 6.4.2.
+CanonIndicators.h
+ClientCompCurveWidget.cpp
+ClientCompCurveWidget.h
+ClientCompEditorCanvas.cpp
+ClientCompEditorCanvas.h
+ClientCompKnob.cpp
+ClientCompKnob.h
+ClientCompLimiterButton.cpp
+ClientCompLimiterButton.h
+ClientCompMeter.cpp
+ClientCompMeter.h
+ClientCompThresholdFader.cpp
+ClientCompThresholdFader.h
+ClientEqApplet.h
+ClientEqCurveWidget.cpp
+ClientEqCurveWidget.h
+ClientEqEditorCanvas.cpp
+ClientEqEditorCanvas.h
+ClientEqFftAnalyzer.cpp
+ClientEqFftAnalyzer.h
+ClientEqIconRow.cpp
+ClientEqIconRow.h
+ClientEqOutputFader.cpp
+ClientEqOutputFader.h
+ClientEqParamRow.cpp
+ClientEqParamRow.h
+ClientGateCurveWidget.cpp
+ClientGateCurveWidget.h
+ClientGateLevelView.cpp
+ClientGateLevelView.h
+ClientLevelMeter.cpp
+ClientLevelMeter.h
+ClientTubeCurveWidget.cpp
+ClientTubeCurveWidget.h
+ComboStyle.h
+CompactMetrics.cpp
+CompactMetrics.h
+EditorFramelessTitleBar.cpp
+EditorFramelessTitleBar.h
+FramelessMoveHelper.h
+FramelessResizer.cpp
+FramelessResizer.h
+InteractionSettings.h
+MeterExtremes.h
+MeterSmoother.h
+ModemChrome.cpp
+ModemChrome.h
+NativeWidgetTopology.h
+PanadapterMessageOverlay.h
+PanelTick.h
+PooDooLogo.cpp
+PooDooLogo.h
+RxStageReorder.h
+SmartMtrGeometry.h
+SmartMtrStyle.h
+SoftwareOpenGlRequest.h
+SpectrumRhiFailureState.h
+StagePage.cpp
+StagePage.h
+StageTabBar.cpp
+StageTabBar.h
+StripCompPanel.cpp
+StripCompPanel.h
+StripEqPanel.cpp
+StripEqPanel.h
+StripGatePanel.cpp
+StripGatePanel.h
+StripPuduPanel.cpp
+StripPuduPanel.h
+StripRxOutputPanel.cpp
+StripRxOutputPanel.h
+StripTubePanel.cpp
+StripTubePanel.h
+StripWaveformPanel.cpp
+StripWaveformPanel.h
+Theme.h
+ThemedImageCache.h
+WaveformScopeModel.cpp
+WaveformScopeModel.h
+WaveformWidget.cpp
+WaveformWidget.h

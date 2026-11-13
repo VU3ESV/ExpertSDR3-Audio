@@ -19,6 +19,13 @@ struct ParamSpec {
     QString unit{};
     QStringList choices{};  // non-empty: a combo box whose value is the index
     bool toggle{false};     // a checkbox; value 0 or 1
+
+    // Display hints only. They change how a page lays a control out, never the value,
+    // the range or what is saved.
+    QString section{};       // heading of the frame the control sits in; empty: none
+    QString enabledByKey{};  // non-empty: the control is usable only while that key...
+    double enabledByValue{1.0};  // ...holds this value
+    bool percent{false};     // a 0..1 value shown as 0..100 %
 };
 
 inline ParamSpec toggleParam(const QString& key, const QString& label, bool def)

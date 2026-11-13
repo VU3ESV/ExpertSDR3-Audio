@@ -8,3 +8,5 @@ dist/
 .DS_Store
 # Fetched per platform by vendor/aethersdr/scripts/setup/setup-deepfilter.*
 vendor/aethersdr/third_party/deepfilter/lib/
+# Python writes these beside scripts/compare-aetherrx.py when something imports it
+__pycache__/

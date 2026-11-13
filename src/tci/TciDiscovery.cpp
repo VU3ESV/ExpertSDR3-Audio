@@ -1,7 +1,9 @@
 #include "tci/TciDiscovery.h"
 
+#include "app/TestSandbox.h"
 #include "tci/TciProtocol.h"
 
+#include <QLoggingCategory>
 #include <QNetworkInterface>
 #include <QSet>
 #include <QTcpSocket>
@@ -12,6 +14,8 @@
 #include <algorithm>
 #include <functional>
 #include <utility>
+
+Q_LOGGING_CATEGORY(lcDiscovery, "esa.discovery")
 
 namespace esa {
 
@@ -117,6 +121,14 @@ public:
     {
         m_timer.setSingleShot(true);
         connect(&m_timer, &QTimer::timeout, this, [this] { finish(false); });
+
+        if (testSandbox() && isExpertSdrPort(m_radio.port)) {
+            // Nothing there, as far as a test is concerned; a moment later, as a refusal would be.
+            // Said, so a scan that finds nothing says why.
+            qCWarning(lcDiscovery) << "Test sandbox: refused to probe" << m_radio.host << m_radio.port;
+            QTimer::singleShot(0, this, [this] { finish(false); });
+            return;
+        }
 
         m_tcp = new QTcpSocket(this);
         connect(m_tcp, &QTcpSocket::connected, this, [this] { identify(); });

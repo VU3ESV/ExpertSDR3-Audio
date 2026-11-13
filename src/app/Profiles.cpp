@@ -146,10 +146,14 @@ bool sameChain(const ChainSettings& a, const ChainSettings& b)
         || RxChain::normalizedOrder(a.stageOrder) != RxChain::normalizedOrder(b.stageOrder)) {
         return false;
     }
+    // Each value as it shows, at the table's decimals. A control holds no more than those, so
+    // a default kept with more (EQ's Q of 0.707) and the 0.71 a Reset sets are the same value,
+    // and a page's Reset leaves the window unmodified.
     for (const ParamSpec& spec : allParamSpecs()) {
-        const double left = a.params.value(spec.key, spec.def);
-        const double right = b.params.value(spec.key, spec.def);
-        if (std::abs(left - right) > 1e-6) return false;
+        const double scale = std::pow(10.0, spec.decimals);
+        const double left = std::round(a.params.value(spec.key, spec.def) * scale);
+        const double right = std::round(b.params.value(spec.key, spec.def) * scale);
+        if (left != right) return false;
     }
     return true;
 }

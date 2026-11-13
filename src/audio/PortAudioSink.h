@@ -16,6 +16,10 @@ namespace audio {
 // Every output-capable device PortAudio can see. Rescans the system, so it must
 // not be called while a PortAudioSink is open.
 QList<AudioDeviceInfo> listOutputDevices();
+
+// Why no real output may open here, or empty if one may. Under the test sandbox
+// (app/TestSandbox.h) none may. PortAudioSink::open() asks this before anything else.
+QString realOutputRefusal();
 } // namespace audio
 
 // Plays through a PortAudio device. Keeps the chain's rate if the device accepts it.

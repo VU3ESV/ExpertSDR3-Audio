@@ -1,11 +1,63 @@
 #include "MockExpert.h"
 
+#include "app/TestSandbox.h"
+
 #include <QHostAddress>
+#include <QTcpServer>
 #include <QtEndian>
 
 #include <algorithm>
 #include <cmath>
+#include <memory>
 #include <utility>
+#include <vector>
+
+using esa::isExpertSdrPort;
+
+namespace {
+
+template <typename Server>
+bool listenOff(Server& server)
+{
+    // Those turned down stay taken until one will do, so none is handed out again.
+    std::vector<std::unique_ptr<QTcpServer>> skipped;
+    for (int i = 0; i < 64; ++i) {
+        if (!server.listen(QHostAddress::LocalHost, 0)) return false;
+        const int port = server.serverPort();
+        if (!isExpertSdrPort(port)) return true;
+        server.close();
+        auto hold = std::make_unique<QTcpServer>();
+        hold->listen(QHostAddress::LocalHost, quint16(port));
+        skipped.push_back(std::move(hold));
+    }
+    return false;
+}
+
+} // namespace
+
+int closedLocalPort()
+{
+    // Those turned down stay taken until one will do, so none is handed out twice.
+    std::vector<std::unique_ptr<QTcpServer>> skipped;
+    for (int i = 0; i < 64; ++i) {
+        auto probe = std::make_unique<QTcpServer>();
+        if (!probe->listen(QHostAddress::LocalHost, 0)) return 0;
+        const int port = probe->serverPort();
+        if (!isExpertSdrPort(port)) return port;  // and closed, as `probe` goes
+        skipped.push_back(std::move(probe));
+    }
+    return 0;
+}
+
+bool listenOffExpertPorts(QTcpServer& server)
+{
+    return listenOff(server);
+}
+
+bool listenOffExpertPorts(QWebSocketServer& server)
+{
+    return listenOff(server);
+}
 
 MockExpert::MockExpert(QObject* parent)
     : QObject(parent),
@@ -19,7 +71,9 @@ MockExpert::MockExpert(QObject* parent)
 
 bool MockExpert::listen()
 {
-    return m_server.listen(QHostAddress::LocalHost, 0);
+    // Never on one of ExpertSDR3's ports, as closedLocalPort() explains: an engine still
+    // trying this port once the mock is gone would reach the real radio there.
+    return listenOffExpertPorts(m_server);
 }
 
 void MockExpert::stopListening()
@@ -107,8 +161,13 @@ void MockExpert::onText(const QString& text)
         } else if (name == QLatin1String("audio_start")) {
             m_receiver = args.toInt();
             if (sendAudio) {
-                // Block period from the real samples per block, in stereo.
-                const int intervalMs = std::max(1, (blockSamples / 2) * 1000 / m_sampleRate);
+                // Block period from the real samples per block, in stereo. It stays as it is
+                // if the rate changes later (operatorSetStreamRate).
+                m_streamPeriodNs = qint64(blockSamples / 2) * 1000000000LL / m_sampleRate;
+                m_streamBlocks = 0;
+                m_streamClock.start();
+                const int intervalMs = std::max(1, int(m_streamPeriodNs / 1000000));
+                m_stream.setTimerType(Qt::PreciseTimer);
                 m_stream.start(intervalMs);
             }
             push(QStringLiteral("audio_start:%1;").arg(m_receiver));
@@ -121,7 +180,22 @@ void MockExpert::onText(const QString& text)
 
 void MockExpert::onStream()
 {
-    if (!m_client || m_receiver < 0) return;
+    if (!m_client || m_receiver < 0 || m_streamPeriodNs <= 0) return;
+    // Real time, as a radio streams: each tick sends what the clock says is due, so a tick
+    // that comes late is made up for, up to a few blocks. Further behind than that, the time
+    // is let go, as a stalled radio's would be. A busy test machine once got a third of
+    // real time from one block a tick.
+    constexpr qint64 kMaxBurst = 4;
+    const qint64 due = m_streamClock.nsecsElapsed() / m_streamPeriodNs;
+    m_streamBlocks = std::max(m_streamBlocks, due - kMaxBurst);
+    while (m_streamBlocks < due && m_client && m_receiver >= 0) {
+        sendBlock();
+        ++m_streamBlocks;
+    }
+}
+
+void MockExpert::sendBlock()
+{
     const int samples = blockSamples;
     QByteArray frame(64 + samples * int(sizeof(float)), '\0');
     const auto put = [&](int index, quint32 value) { qToLittleEndian(value, frame.data() + index * 4); };
@@ -176,6 +250,11 @@ void MockExpert::operatorRestartDsp()
     m_receiver = -1;
     push(QStringLiteral("stop;"));
     push(QStringLiteral("start;"));
+}
+
+void MockExpert::operatorSetStreamRate(int hz)
+{
+    m_sampleRate = hz;
 }
 
 void MockExpert::dropClient()

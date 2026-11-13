@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QElapsedTimer>
 #include <QList>
 #include <QObject>
 #include <QPointer>
@@ -8,6 +9,8 @@
 #include <QTimer>
 #include <QWebSocket>
 #include <QWebSocketServer>
+
+class QTcpServer;
 
 // A stand-in for ExpertSDR3's TCI server, modelled on behaviour measured from the
 // real one (ExpertSDR3 2.1, ColibriDDC): the same init burst in the same order,
@@ -45,6 +48,9 @@ public:
     void operatorSetModulation(const QString& mode);
     void operatorSetTransmit(bool transmitting);
     void operatorRestartDsp();
+    // The stream changes rate on its own, whatever the client asked for: a server that ignores
+    // the request. The block period stays as it was.
+    void operatorSetStreamRate(int hz);
 
     void sendBinary(const QByteArray& frame);
     void dropClient();
@@ -58,15 +64,35 @@ private slots:
 
 private:
     void sendInitBurst();
+    void sendBlock();
     void push(const QString& text);
 
-    QWebSocketServer m_server;
     QPointer<QWebSocket> m_client;
     QTimer m_tick;
     QTimer m_stream;
+    // The stream keeps time by this clock, not by its timer's ticks.
+    QElapsedTimer m_streamClock;
+    qint64 m_streamPeriodNs{0};
+    qint64 m_streamBlocks{0};
     QStringList m_pending;
     int m_sampleRate{48000};
     int m_receiver{-1};
     quint32 m_counter{0};
     qint64 m_phase{0};
+    // Last, so it goes first: it deletes any socket still open, whose disconnected handler
+    // (onNewConnection) still uses the timers above. macOS's Qt 6.4.2 emits there and crashed.
+    QWebSocketServer m_server;
 };
+
+// A port on this machine that nothing listens on, for a radio that is not there; 0 if none
+// could be found. Never one of ExpertSDR3's own ports (40001, 50001, 60001): the system can
+// hand those out as free here while ExpertSDR3 listens on every address, and a test pointed
+// at one would then reach the real radio.
+int closedLocalPort();
+
+// Listens on this machine, on a port the system picks that is not one of ExpertSDR3's: a test
+// pointed there could reach the real radio once the server is gone, and the test sandbox
+// refuses those ports on any host anyway, so a client would never reach this server. Every
+// server a test listens with goes through one of these. False if none could be had.
+bool listenOffExpertPorts(QTcpServer& server);
+bool listenOffExpertPorts(QWebSocketServer& server);

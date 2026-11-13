@@ -109,6 +109,7 @@ private:
     AudioRequest m_audio;
     int m_activeAudioReceiver{-1};
     QString m_lastError;
+    quint64 m_attempt{0};  // counts connection attempts, so a refusal posted for one ends only that one
 };
 
 } // namespace esa

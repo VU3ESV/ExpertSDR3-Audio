@@ -1,5 +1,7 @@
 #include "tci/TciClient.h"
 
+#include "app/TestSandbox.h"
+
 #include <QLoggingCategory>
 #include <QUrl>
 
@@ -76,6 +78,17 @@ void TciClient::attemptConnection()
     m_radio = RadioState{};
     m_activeAudioReceiver = -1;
     setState(State::Connecting);
+    const quint64 attempt = ++m_attempt;
+    if (testSandbox() && isExpertSdrPort(m_port)) {
+        // Fail as a refused connection does, a moment later, so the port list moves on as usual.
+        m_lastError = QStringLiteral("Port %1 is ExpertSDR3's, and tests never connect to it (ESA_TEST_SANDBOX)")
+                          .arg(m_port);
+        qCWarning(lcTci) << "Test sandbox: refused to connect to" << m_host << m_port;
+        QTimer::singleShot(0, this, [this, attempt] {
+            if (attempt == m_attempt && m_state == State::Connecting) onDisconnected();
+        });
+        return;
+    }
     QUrl url;
     url.setScheme(QStringLiteral("ws"));
     url.setHost(m_host);

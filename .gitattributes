@@ -1,4 +1,7 @@
 # Upstream's files stay byte-identical on every platform, including a Windows checkout.
 vendor/** -text
 packaging/icons/** binary
+src/gui/aether/fork/*.png binary
 *.sh text eol=lf
+# Read line by line by sync-aether.sh and CMake, so no carriage returns.
+scripts/aether-gui-files.txt text eol=lf

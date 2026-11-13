@@ -1,10 +1,13 @@
+#include "audio/OutputShape.h"
 #include "audio/PlaybackBuffer.h"
 
 #include <QtTest>
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <functional>
+#include <limits>
 #include <vector>
 
 using esa::PlaybackBuffer;
@@ -291,6 +294,29 @@ private slots:
         QVERIFY(std::abs(peakOf(feed.play(2400)) - 0.05f) < 0.002f);
     }
 
+    // A gain that is no number changes nothing. A NaN target turned the ramp NaN, and it stayed
+    // NaN, past the clamp to full scale, until the output was reopened.
+    void aGainThatIsNoNumberChangesNothing()
+    {
+        PlaybackBuffer buffer(48000, 48000, 2);
+        LiveFeed feed(buffer, sine(1000, 48000, 0.5));
+        feed.play(4800);
+        buffer.setGainDb(-20.0);
+        feed.play(kBufferFrames);  // the ramp
+
+        for (const double db : {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity(),
+                                -std::numeric_limits<double>::infinity()}) {
+            buffer.setGainDb(db);
+            const auto out = feed.play(2400);
+            QVERIFY(std::all_of(out.begin(), out.end(), [](float v) { return std::isfinite(v); }));
+            QVERIFY2(std::abs(peakOf(out) - 0.05f) < 0.002f, qPrintable(QString::number(db)));
+        }
+        // And a real one still takes.
+        buffer.setGainDb(0.0);
+        feed.play(kBufferFrames);
+        QVERIFY(std::abs(peakOf(feed.play(2400)) - 0.5f) < 0.01f);
+    }
+
     void gainChangesRampInsteadOfStepping()
     {
         PlaybackBuffer buffer(48000, 48000, 2);
@@ -364,6 +390,39 @@ private slots:
         QCOMPARE(stats.overruns, quint64(0));
         QVERIFY2(std::abs(stats.driftPpm - ppm) < 30.0, qPrintable(QString::number(stats.driftPpm)));
         QVERIFY2(std::abs(stats.bufferedMs - 60.0) < 15.0, qPrintable(QString::number(stats.bufferedMs)));
+    }
+
+    // shapeOutput() took over the per-sample code in render(), and anything that shows
+    // the output level uses it too. It must be that code exactly: volume, boost, clamp,
+    // in that order and in float, bit for bit, including at and past the edges.
+    void theOutputShapeIsExactlyTheCodeItReplaced()
+    {
+        const auto before = [](float x, float gain, bool boost) {  // render() in v0.1.1
+            float v = x * gain;
+            if (boost) v = std::tanh(v * 2.0f);
+            return std::clamp(v, -1.0f, 1.0f);
+        };
+        std::vector<float> inputs = {0.0f, -0.0f, 1e-40f, -1e-40f, 1e-8f, 0.25f, 0.5f, 0.999f, 1.0f, -1.0f,
+                                     1.0001f, 2.0f, 10.0f, 1e30f, -1e30f,
+                                     std::numeric_limits<float>::infinity(),
+                                     -std::numeric_limits<float>::infinity(),
+                                     std::numeric_limits<float>::quiet_NaN()};
+        for (int i = -4096; i <= 4096; ++i) inputs.push_back(float(i) / 1024.0f);
+        const float gains[] = {0.0f, 1e-6f, 0.001f, 0.0631f, 0.5f, 0.99f, 1.0f, 1.0116f, 2.0f, 31.62f};
+        int checked = 0;
+        for (float x : inputs) {
+            for (float gain : gains) {
+                for (bool boost : {false, true}) {
+                    const float got = esa::shapeOutput(x, gain, boost);
+                    const float want = before(x, gain, boost);
+                    QVERIFY2(std::memcmp(&got, &want, sizeof(float)) == 0,
+                             qPrintable(QStringLiteral("x %1, gain %2, boost %3: %4 against %5")
+                                            .arg(x).arg(gain).arg(boost).arg(got).arg(want)));
+                    ++checked;
+                }
+            }
+        }
+        QVERIFY(checked > 100000);
     }
 };
 

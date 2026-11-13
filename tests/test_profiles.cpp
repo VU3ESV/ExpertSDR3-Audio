@@ -1,14 +1,25 @@
+#include "ReferenceChain.h"
+
 #include "app/Profiles.h"
 #include "dsp/NrProcessor.h"
 #include "dsp/RxChain.h"
+
+#include "SpectralNR.h"
 
 #include <QDir>
 #include <QFile>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QSettings>
 #include <QTemporaryDir>
 #include <QtTest>
+
+#include <cmath>
+#include <cstring>
+#include <functional>
+#include <memory>
+#include <random>
 
 using namespace esa;
 
@@ -38,6 +49,66 @@ QByteArray profileFile(const QJsonArray& profiles, int version = 1)
     return QJsonDocument(QJsonObject{{QStringLiteral("format"), QStringLiteral("ExpertSDR3Audio.profiles")},
                                      {QStringLiteral("version"), version},
                                      {QStringLiteral("profiles"), profiles}}).toJson();
+}
+
+// The NR2 keys a v0.1.1 profile held, in its table's order: everything but the fill
+// character, added later. The noise fill stays off, because its noise generator is
+// seeded from the filter's address, as upstream's is: two NR2s never fill alike, not
+// even two from the same build, so a comparison with it on could not be exact.
+QList<QPair<QString, double>> v011Nr2Settings()
+{
+    return {
+        {QStringLiteral("nr2.gainMax"), 1.2}, {QStringLiteral("nr2.gainFloor"), 0.1},
+        {QStringLiteral("nr2.qspp"), 0.25}, {QStringLiteral("nr2.smooth"), 0.8},
+        {QStringLiteral("nr2.gainMethod"), 2}, {QStringLiteral("nr2.npe"), 1},
+        {QStringLiteral("nr2.ae"), 1}, {QStringLiteral("nr2.post2"), 0},
+        {QStringLiteral("nr2.post2Level"), 0.3}, {QStringLiteral("nr2.post2Taper"), 4000},
+    };
+}
+
+// A profile as v0.1.1 exported it: every key it had, and none it did not.
+QJsonObject v011Profile(const QString& name)
+{
+    QJsonObject params;
+    const QHash<QString, double> stages = reference::OldChain::v011Settings();
+    for (const QString& key : reference::OldChain::keys()) {
+        params.insert(key, stages.value(key, findParamSpec(key)->def));
+    }
+    for (const auto& [key, value] : v011Nr2Settings()) params.insert(key, value);
+    return QJsonObject{{QStringLiteral("name"), name},
+                       {QStringLiteral("createdBy"), QStringLiteral("ExpertSDR3 Audio 0.1.1")},
+                       {QStringLiteral("nr"), QJsonObject{{QStringLiteral("method"), QStringLiteral("nr2")},
+                                                          {QStringLiteral("autoBypass"), true}}},
+                       {QStringLiteral("order"), QJsonArray{QStringLiteral("eq"), QStringLiteral("gate"),
+                                                            QStringLiteral("comp"), QStringLiteral("tube"),
+                                                            QStringLiteral("pudu")}},
+                       {QStringLiteral("params"), params}};
+}
+
+// Steady noise with a little tone: enough for NR2 to find something to remove.
+QByteArray testSignal(int rate, double seconds)
+{
+    const int frames = int(rate * seconds);
+    QByteArray pcm(qsizetype(frames) * 2 * qsizetype(sizeof(float)), Qt::Uninitialized);
+    auto* samples = reinterpret_cast<float*>(pcm.data());
+    std::mt19937 rng(42);
+    std::normal_distribution<double> noise(0.0, 0.02);
+    for (int i = 0; i < frames; ++i) {
+        const double tone = 0.1 * std::sin(2.0 * 3.14159265358979323846 * 700.0 * i / rate);
+        samples[i * 2] = float(tone + noise(rng));
+        samples[i * 2 + 1] = float(tone + noise(rng));
+    }
+    return pcm;
+}
+
+QByteArray inBlocks(const QByteArray& pcm, const std::function<QByteArray(const QByteArray&)>& process)
+{
+    QByteArray out;
+    const int blockBytes = 512 * 2 * int(sizeof(float));
+    for (qsizetype offset = 0; offset + blockBytes <= pcm.size(); offset += blockBytes) {
+        out += process(pcm.mid(offset, blockBytes));
+    }
+    return out;
 }
 
 } // namespace
@@ -365,6 +436,26 @@ private slots:
         QVERIFY(!sameChain(base, value));
     }
 
+    // Values compare as they show. EQ's Q defaults to 0.707, which its control, at 2 decimals,
+    // can only hold as 0.71: that is still the default. One step away is not.
+    void aValueComparesAtItsShownDecimals()
+    {
+        const QString q = QStringLiteral("eq.b0.q");
+        const ParamSpec* spec = findParamSpec(q);
+        QVERIFY(spec);
+        QCOMPARE(spec->decimals, 2);
+        QVERIFY(std::abs(spec->def - 0.707) < 1e-6);
+        ChainSettings shown = defaultChain();
+        shown.params.insert(q, 0.71);
+        QVERIFY(sameChain(shown, defaultChain()));
+        ChainSettings stepAway = defaultChain();
+        stepAway.params.insert(q, 0.72);
+        QVERIFY(!sameChain(stepAway, defaultChain()));
+        ChainSettings justBelow = defaultChain();
+        justBelow.params.insert(q, 0.70);
+        QVERIFY(!sameChain(justBelow, defaultChain()));
+    }
+
     void anUnsetValueMeansItsDefault()
     {
         ChainSettings implicit;
@@ -446,6 +537,181 @@ private slots:
     void testRunsKeepAwayFromRealProfiles()
     {
         QCOMPARE(ProfileLibrary::defaultPath(QStringLiteral("/tmp/run.ini")), QStringLiteral("/tmp/run.ini.profiles.json"));
+    }
+
+    // ── Profiles saved by an older version ───────────────────────────────────
+
+    // A v0.1.1 profile holds no band types, slopes or fill character. Loaded here, as
+    // the engine loads one, it must sound exactly as it did, sample for sample.
+    void aProfileFromTheLastReleaseSoundsExactlyAsItDid()
+    {
+        writeFile(path("old.json"), profileFile({v011Profile(QStringLiteral("From 0.1.1"))}));
+        ProfileLibrary library(path("p.json"));
+        QVERIFY(library.importFile(path("old.json")).error.isEmpty());
+        AppConfig config;
+        applyChain(config, library.find(QStringLiteral("From 0.1.1"))->chain);
+        QCOMPARE(config.nrMethod, QStringLiteral("nr2"));
+
+        // What Engine::rebuildChain and startNrBuild do with that configuration.
+        constexpr int kRate = 48000;
+        RxChain chain(kRate);
+        chain.setStageOrder(config.stageOrder);
+        for (const ParamSpec& spec : RxChain::stageParams()) chain.setStageParam(spec.key, paramValue(config, spec));
+        const NrMethod* nr2 = findNrMethod(QStringLiteral("nr2"));
+        std::shared_ptr<NrProcessor> nr(nr2->create(kRate).release());
+        for (const ParamSpec& spec : nr2->params) nr->setParam(spec.key, paramValue(config, spec));
+        chain.setNrProcessor(nr);
+
+        // v0.1.1's chain with exactly the keys it knew, and an NR2 told only those.
+        reference::OldChain old(kRate);
+        old.setOrder(config.stageOrder);
+        const QHash<QString, double> stages = reference::OldChain::v011Settings();
+        for (const QString& key : reference::OldChain::keys()) old.set(key, stages.value(key, findParamSpec(key)->def));
+        std::shared_ptr<NrProcessor> oldNr(nr2->create(kRate).release());
+        for (const auto& [key, value] : v011Nr2Settings()) oldNr->setParam(key, value);
+        old.setNr(oldNr);
+
+        const QByteArray in = testSignal(kRate, 3.0);
+        const QByteArray out = inBlocks(in, [&](const QByteArray& block) { return chain.process(block); });
+        const QByteArray expected = inBlocks(in, [&](const QByteArray& block) { return old.process(block); });
+        QVERIFY(!out.isEmpty());
+        QCOMPARE(out.size(), expected.size());
+        QVERIFY2(std::memcmp(out.constData(), expected.constData(), size_t(out.size())) == 0,
+                 "a v0.1.1 profile no longer sounds the same");
+    }
+
+    // The fill character is the one new key that reaches a filter which had a value for
+    // it all along. Its default must be that value, or adding the key changes the sound
+    // of every profile that has the noise fill on.
+    void theFillCharactersDefaultIsTheFiltersOwn()
+    {
+        const AetherSDR::SpectralNR filter(1024, 24000, 4);
+        QCOMPARE(float(findParamSpec(QStringLiteral("nr2.post2Factor"))->def), filter.post2Factor());
+        QCOMPARE(float(findParamSpec(QStringLiteral("nr2.post2Taper"))->def), filter.post2TaperHz());
+
+        // And the band's new range is what the filter always accepted.
+        AetherSDR::SpectralNR clamped(1024, 24000, 4);
+        clamped.setPost2TaperHz(8000.0f);
+        QCOMPARE(float(findParamSpec(QStringLiteral("nr2.post2Taper"))->max), clamped.post2TaperHz());
+        clamped.setPost2TaperHz(100.0f);
+        QCOMPARE(float(findParamSpec(QStringLiteral("nr2.post2Taper"))->min), clamped.post2TaperHz());
+    }
+
+    void aProfileWithoutBandTypesKeepsTheLayoutItHad()
+    {
+        writeFile(path("old.json"), profileFile({v011Profile(QStringLiteral("Old"))}));
+        ProfileLibrary library(path("p.json"));
+        QVERIFY(library.importFile(path("old.json")).error.isEmpty());
+        AppConfig config;
+        applyChain(config, library.find(QStringLiteral("Old"))->chain);
+        StageSet stages;
+        stages.prepare(48000);
+        stages.initialiseBands();
+        for (const ParamSpec& spec : RxChain::stageParams()) RxChain::applyStageParam(stages, spec.key, paramValue(config, spec));
+        for (int band = 0; band < AetherSDR::ClientEq::kDefaultBandCount; ++band) {
+            QVERIFY(stages.eq.band(band).type == AetherSDR::ClientEq::defaultBand(band).type);
+            QCOMPARE(stages.eq.band(band).slopeDbPerOct, 12);
+        }
+    }
+
+    // An older version keeps keys it does not know through an import and an export
+    // (fromJson and completed() above), so a profile with band types can pass through
+    // it and come back whole. The same code does that here, for keys from the future.
+    void keysThisVersionDoesNotKnowSurviveARoundTrip()
+    {
+        QJsonObject profile = v011Profile(QStringLiteral("Future"));
+        QJsonObject params = profile.value(QStringLiteral("params")).toObject();
+        params.insert(QStringLiteral("eq.b4.futureShape"), 3.0);
+        params.insert(QStringLiteral("gate.futureKnob"), 0.25);
+        profile.insert(QStringLiteral("params"), params);
+        writeFile(path("future.json"), profileFile({profile}));
+
+        ProfileLibrary here(path("here.json"));
+        QVERIFY(here.importFile(path("future.json")).error.isEmpty());
+        QVERIFY(here.exportFile(path("back.json"), {QStringLiteral("Future")}));
+        ProfileLibrary there(path("there.json"));
+        QVERIFY(there.importFile(path("back.json")).error.isEmpty());
+        const Profile* returned = there.find(QStringLiteral("Future"));
+        QCOMPARE(returned->chain.params.value(QStringLiteral("eq.b4.futureShape")), 3.0);
+        QCOMPARE(returned->chain.params.value(QStringLiteral("gate.futureKnob")), 0.25);
+    }
+
+    // What an older version reads from a new export: the new keys as plain numbers.
+    void anExportCarriesTheNewKeysAsPlainNumbers()
+    {
+        ChainSettings chain = sampleChain();
+        chain.params.insert(QStringLiteral("eq.b3.type"), 1.0);
+        chain.params.insert(QStringLiteral("eq.b0.slope"), 2.0);
+        chain.params.insert(QStringLiteral("nr2.post2Factor"), 0.6);
+        ProfileLibrary library(path("p.json"));
+        QVERIFY(library.save(QStringLiteral("New"), chain));
+        const QJsonObject params = QJsonDocument::fromJson(library.exportDocument({QStringLiteral("New")}))
+                                       .object().value(QStringLiteral("profiles")).toArray().first().toObject()
+                                       .value(QStringLiteral("params")).toObject();
+        QCOMPARE(params.value(QStringLiteral("eq.b3.type")).toDouble(-1), 1.0);
+        QCOMPARE(params.value(QStringLiteral("eq.b0.slope")).toDouble(-1), 2.0);
+        QCOMPARE(params.value(QStringLiteral("nr2.post2Factor")).toDouble(-1), 0.6);
+        QVERIFY(params.value(QStringLiteral("eq.b9.type")).isDouble());  // every band's, as every key is stored
+    }
+
+    // Both ranges shrank to what the DSP had always clamped to, so a stored value beyond
+    // them loads clamped and plays exactly as before.
+    void valuesPastWhatTheDspAcceptedClampToItsLimit_data()
+    {
+        QTest::addColumn<QString>("key");
+        QTest::addColumn<double>("stored");
+        QTest::addColumn<double>("loaded");
+        QTest::newRow("tube output") << QStringLiteral("tube.output") << 20.0 << 12.0;
+        QTest::newRow("noise fill band") << QStringLiteral("nr2.post2Taper") << 7000.0 << 6000.0;
+    }
+
+    void valuesPastWhatTheDspAcceptedClampToItsLimit()
+    {
+        QFETCH(QString, key);
+        QFETCH(double, stored);
+        QFETCH(double, loaded);
+
+        writeFile(path("wide.json"), profileFile({QJsonObject{{QStringLiteral("name"), QStringLiteral("Wide")},
+                                                              {QStringLiteral("params"), QJsonObject{{key, stored}}}}}));
+        ProfileLibrary library(path("p.json"));
+        QVERIFY(library.importFile(path("wide.json")).error.isEmpty());
+        AppConfig config;
+        applyChain(config, library.find(QStringLiteral("Wide"))->chain);
+        QCOMPARE(paramValue(config, *findParamSpec(key)), loaded);
+
+        // The settings store too, where the last session's values live.
+        const QString ini = path("s.ini");
+        {
+            QSettings raw(ini, QSettings::IniFormat);
+            raw.setValue(QStringLiteral("params/") + key, stored);
+        }
+        QCOMPARE(Settings(ini).load().params.value(key), loaded);
+    }
+
+    // The Volume a file holds comes back as a Volume the knob can show: within its range, and
+    // a "nan", which would pass every clamp on its way to the speakers, as the default.
+    void aSavedVolumeLoadsWithinItsRange_data()
+    {
+        QTest::addColumn<QString>("stored");
+        QTest::addColumn<double>("loaded");
+        QTest::newRow("in range") << QStringLiteral("-6.5") << -6.5;
+        QTest::newRow("nan") << QStringLiteral("nan") << 0.0;
+        QTest::newRow("inf") << QStringLiteral("inf") << 0.0;
+        QTest::newRow("-inf") << QStringLiteral("-inf") << 0.0;
+        QTest::newRow("too loud") << QStringLiteral("45") << 30.0;
+        QTest::newRow("too quiet") << QStringLiteral("-80") << -60.0;
+    }
+
+    void aSavedVolumeLoadsWithinItsRange()
+    {
+        QFETCH(QString, stored);
+        QFETCH(double, loaded);
+        const QString ini = path("volume.ini");
+        {
+            QSettings raw(ini, QSettings::IniFormat);
+            raw.setValue(QStringLiteral("output/gainDb"), stored);
+        }
+        QCOMPARE(Settings(ini).load().outputGainDb, loaded);
     }
 };
 

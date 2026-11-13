@@ -44,6 +44,11 @@ struct NrMethod {
 const QList<NrMethod>& nrMethods();
 const NrMethod* findNrMethod(const QString& id);
 
+// Why a method AetherSDR offers is not in nrMethods() here, for showing it disabled:
+// not compiled in, not this platform, or unsafe on this machine. Empty when it is
+// available. Takes upstream's ids too, such as "bnr", which this app never has.
+QString nrMethodUnavailableReason(const QString& id);
+
 // Whether upstream's policy bypasses client NR for this TCI modulation. CW and
 // digital signals are not speech: a neural speech model reads a steady carrier
 // as noise, and AetherSDR measured a 28 dB hole where the signal was.

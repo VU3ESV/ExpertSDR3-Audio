@@ -5,10 +5,15 @@
 #include <QHash>
 #include <QString>
 #include <QStringList>
+#include <QVariant>
 
 class QSettings;
 
 namespace esa {
+
+// Volume's range, as it has always been.
+inline constexpr double kMinOutputGainDb = -60.0;
+inline constexpr double kMaxOutputGainDb = 30.0;
 
 // Everything that describes how the app should run. The GUI edits this, `--flags`
 // override it, and the engine consumes it.
@@ -62,6 +67,40 @@ public:
     };
     MuteOwnership loadMuteOwnership(const QString& radioHost) const;
     void saveMuteOwnership(const QString& radioHost, const MuteOwnership& ownership);
+
+    // The window's own state (ui/*). Outside AppConfig and every profile: it says how this
+    // computer's window was left, not how the audio sounds. Empty means never saved.
+    struct WindowState {
+        QString page;      // ui/page: the page it showed last
+        QString geometry;  // ui/geometry: "x,y,w,h" of the window when not maximised
+        // ui/frame: "System" or "Custom", as last chosen from the gear's Window frame menu
+        // (WindowChrome). Empty means the platform's default, so a later change of default
+        // still reaches it.
+        QString frame;
+    };
+    WindowState loadWindowState() const;
+    void saveWindowState(const WindowState& state);
+
+    // The method the AetherNR rail box turns back on (nr/lastMethod); empty if none was ever
+    // chosen, or it is not in this build. Outside every profile, like the window's state.
+    QString lastNrMethod() const;
+    void setLastNrMethod(const QString& id);
+
+    // Where REC saves its files (recording/folder). Outside AppConfig and every profile: it says
+    // where files go on this computer, not how the audio sounds. Unset or empty means the default.
+    QString recordingFolder() const;
+    // An empty folder goes back to the default.
+    void setRecordingFolder(const QString& folder);
+    // Documents/<kAppDisplayName>/Recordings, or the home folder's when the system names no
+    // Documents folder.
+    static QString defaultRecordingFolder();
+
+    // Display choices the AetherSDR pages keep under their own names, such as the EQ's
+    // reference curve, stored as ui/aether/<name>. Outside AppConfig and every profile, like
+    // the window's state. An invalid QVariant means never stored.
+    QVariant aetherValue(const QString& name) const;
+    void setAetherValue(const QString& name, const QVariant& value);
+    void removeAetherValue(const QString& name);
 
     QString filePath() const;
 
