@@ -2772,7 +2772,10 @@ private slots:
         QVERIFY(f.status.playback.active);
         QTRY_VERIFY_WITH_TIMEOUT(!f.status.playback.active, kTimeout);
         QVERIFY2(loudest > fileDb - 1.0f, qPrintable(QStringLiteral("%1 against %2").arg(loudest).arg(fileDb)));
-        QVERIFY(taps->outBlocks.load() > outBefore + 20);  // a second at a 10 ms pump: about 100
+        // One hand-over per pump tick: about 100 in a second at 10 ms, but a busy machine ticks
+        // less often and hands over more audio each time (PLAY keeps time by the clock). So this
+        // only shows the counter moving for PLAY; the loudness above shows what played.
+        QVERIFY2(taps->outBlocks.load() > outBefore + 5, qPrintable(QString::number(taps->outBlocks.load() - outBefore)));
 
         // No radio: only PLAY feeds the output, and the counter moves for it alone.
         f.engine().disconnectRadio();
@@ -2787,7 +2790,7 @@ private slots:
         QVERIFY(f.status.playback.active);
         QTRY_VERIFY_WITH_TIMEOUT(!f.status.playback.active, kTimeout);
         QCOMPARE(taps->blocks.load(), blocks);  // no radio, so no chain
-        QVERIFY2(taps->outBlocks.load() > still + 20, qPrintable(QString::number(taps->outBlocks.load() - still)));
+        QVERIFY2(taps->outBlocks.load() > still + 5, qPrintable(QString::number(taps->outBlocks.load() - still)));
         QVERIFY2(loudest > fileDb - 1.0f, qPrintable(QStringLiteral("%1 against %2").arg(loudest).arg(fileDb)));
         f.engine().shutdown();
     }
