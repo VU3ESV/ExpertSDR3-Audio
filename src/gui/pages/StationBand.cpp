@@ -117,9 +117,14 @@ void StationBand::showDevices(const QList<AudioDeviceInfo>& devices)
 {
     const QSignalBlocker block(m_device);
     const QString selected = m_context.config->deviceKey;
+    // A USB radio's own codec is never an output: with DATA VOX on, the radio can transmit
+    // what is played into it.
+    const QString radioCodec =
+        m_context.config->radioKind == QLatin1String("usb") ? m_context.config->usbInput : QString();
     m_device->clear();
     m_device->addItem(QStringLiteral("System default"), QString());
     for (const AudioDeviceInfo& device : devices) {
+        if (audio::samePhysicalDevice(device.key, radioCodec)) continue;
         QString label = QStringLiteral("%1  (%2)").arg(device.name, device.hostApi);
         if (device.isDefault) label += QStringLiteral("  *");
         m_device->addItem(label, device.key);
@@ -128,6 +133,11 @@ void StationBand::showDevices(const QList<AudioDeviceInfo>& devices)
     const int index = m_device->findData(selected);
     if (index >= 0) {
         m_device->setCurrentIndex(index);
+    } else if (audio::samePhysicalDevice(selected, radioCodec)) {
+        m_device->addItem(QStringLiteral("%1 (the radio's own audio: choose another)")
+                              .arg(selected.section(QLatin1Char('|'), 1)),
+                          selected);
+        m_device->setCurrentIndex(m_device->count() - 1);
     } else if (selected == kNullDeviceKey) {
         // --device null: no device at all, so never in the list, and nothing to plug back in.
         m_device->addItem(QStringLiteral("No output (null device)"), selected);

@@ -283,9 +283,10 @@ qt_add_resources(aether_gui "canon_ticks"
 # ── Application core (everything except the GUI, shared with tests) ──────────
 add_library(esa_core STATIC
     src/tci/TciProtocol.cpp src/tci/TciClient.cpp src/tci/TciDiscovery.cpp src/tci/MuteController.cpp
-    src/radio/RadioBackend.h src/radio/TciBackend.cpp
+    src/radio/RadioBackend.h src/radio/TciBackend.cpp src/radio/UsbBackend.cpp src/radio/UsbModels.cpp
     src/dsp/RxChain.cpp src/dsp/NrRegistry.cpp
-    src/audio/PlaybackBuffer.cpp src/audio/PortAudioSink.cpp
+    src/audio/PlaybackBuffer.cpp src/audio/PortAudioSink.cpp src/audio/PortAudioSource.cpp
+    src/audio/MicrophonePermission.cpp
     src/app/Engine.cpp src/app/Profiles.cpp src/app/Settings.cpp)
 target_include_directories(esa_core PUBLIC src)
 target_link_libraries(esa_core PUBLIC
@@ -322,6 +323,9 @@ target_sources(esa_gui PRIVATE src/gui/Screenshot.cpp)
 target_sources(esa_gui PRIVATE src/gui/shell/WindowChrome.cpp)
 if(APPLE)
     enable_language(OBJCXX)
+    # macOS asks before any audio input opens, a USB radio's codec included.
+    target_sources(esa_core PRIVATE src/audio/mac/MicrophonePermission.mm)
+    target_link_libraries(esa_core PRIVATE "-framework AVFoundation" "-framework Foundation")
     target_sources(esa_gui PRIVATE src/gui/shell/mac/WindowChromeMac.mm)
     target_link_libraries(esa_gui PRIVATE "-framework AppKit")
 elseif(WIN32)
@@ -456,6 +460,9 @@ if(BUILD_TESTS)
     esa_test(test_engine_e2e tests/MockExpert.cpp)
     esa_test(test_discovery tests/MockExpert.cpp)
     esa_test(test_profiles)
+    # A USB radio's audio, from a fake codec through the engine: channels, rates, a codec that
+    # goes away, and the rule that the radio's own codec is never an output.
+    esa_test(test_capture)
     # Recording: the core, which re-runs itself as a child for the disk-full and crash cases, and
     # the app run headless with --record and --capture against an in-process MockExpert.
     esa_test(test_recorder tests/MockExpert.cpp)

@@ -14,6 +14,9 @@ namespace esa {
 // Volume's range, as it has always been.
 inline constexpr double kMinOutputGainDb = -60.0;
 inline constexpr double kMaxOutputGainDb = 30.0;
+// A USB radio's input trim.
+inline constexpr double kMinUsbTrimDb = -20.0;
+inline constexpr double kMaxUsbTrimDb = 20.0;
 
 // Everything that describes how the app should run. The GUI edits this, `--flags`
 // override it, and the engine consumes it.
@@ -21,6 +24,11 @@ struct AppConfig {
     // How the radio is reached: "tci" (ExpertSDR3 over the network) or "usb" (a radio's own
     // USB audio codec, with CAT on its serial port).
     QString radioKind{QStringLiteral("tci")};
+    // A USB radio: which model (UsbModels), the input device its codec appears as, and a
+    // trim for its level. `receiver` picks Main or Sub where the model has both.
+    QString usbModel{QStringLiteral("ts990s")};
+    QString usbInput;  // an input device key; empty: none chosen yet, so nothing is opened
+    double usbTrimDb{0.0};
     QString host{QStringLiteral("127.0.0.1")};
     int port{40001};
     // Tried if nothing answers on `port`: the ports ExpertSDR3 installs commonly use.

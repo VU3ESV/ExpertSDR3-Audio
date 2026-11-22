@@ -40,8 +40,42 @@ QString colored(const QString& token, const QString& text)
 
 namespace statusText {
 
+namespace {
+
+// A radio heard through its own USB codec: there is no server, and silence is the radio off.
+QString usbRadio(const EngineStatus& s)
+{
+    QString radio;
+    switch (s.connection) {
+    case RadioBackend::Link::Disconnected:
+        return colored(kLabel, QStringLiteral("Not connected"));
+    case RadioBackend::Link::Connecting:
+    case RadioBackend::Link::Initializing:
+        radio = colored(kWarning, QStringLiteral("Waiting for the %1's audio...").arg(s.device));
+        if (!s.connectionError.isEmpty()) radio += QStringLiteral(" ") + colored(kLabel, QStringLiteral("(%1)").arg(s.connectionError));
+        return radio;
+    case RadioBackend::Link::Ready:
+        break;
+    }
+    QString line = QStringLiteral("%1 %2").arg(s.serverName, s.device).trimmed();
+    if (!s.receiverName.isEmpty()) line += QStringLiteral(" %1").arg(s.receiverName);
+    if (s.frequencyHz > 0) line += QStringLiteral("  ·  %1 %2").arg(formatFrequency(s.frequencyHz), s.modulation);
+    if (!s.inputDevice.isEmpty()) line += QStringLiteral("  ·  %1").arg(s.inputDevice);
+    radio = colored(kSuccess, line);
+    if (s.disconnecting) {
+        radio += QStringLiteral("<br>") + colored(kWarning, QStringLiteral("Disconnecting..."));
+    } else if (!s.audioFlowing) {
+        radio += QStringLiteral("<br>")
+                 + colored(kWarning, QStringLiteral("No sound from the radio. Is it switched on, with its USB audio output turned up?"));
+    }
+    return radio;
+}
+
+} // namespace
+
 QString radio(const EngineStatus& s)
 {
+    if (s.radioKind == QLatin1String("usb")) return usbRadio(s);
     QString radio;
     switch (s.connection) {
     case RadioBackend::Link::Disconnected:
@@ -189,12 +223,13 @@ StatusChip::Summary StatusChip::summarize(const EngineStatus& s, bool recordingF
     }
 
     QStringList parts;
+    if (s.radioKind == QLatin1String("usb") && s.frequencyHz <= 0 && s.modulation.isEmpty()) parts << s.device;
     if (s.frequencyHz > 0) {
         parts << QStringLiteral("%1 %2").arg(formatFrequency(s.frequencyHz), s.modulation).trimmed();
     } else if (!s.modulation.isEmpty()) {
         parts << s.modulation;
     }
-    parts << QStringLiteral("RX%1").arg(s.receiver + 1);
+    parts << (s.receiverName.isEmpty() ? QStringLiteral("RX%1").arg(s.receiver + 1) : s.receiverName);
     if (s.transmitting) parts << QStringLiteral("TX");
     return {QStringLiteral("● ") + parts.join(QStringLiteral(" · ")), QStringLiteral("success"), radioPage};
 }

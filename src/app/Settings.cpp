@@ -1,5 +1,7 @@
 #include "app/Settings.h"
 
+#include "radio/UsbModels.h"
+
 #include "app/AppInfo.h"
 #include "dsp/NrProcessor.h"
 #include "dsp/RxChain.h"
@@ -86,6 +88,13 @@ AppConfig Settings::load() const
 {
     AppConfig c;
     QSettings& s = *m_settings;
+    // Absent in files from before USB radios: those were all ExpertSDR3 over TCI.
+    const QString kind = s.value(QStringLiteral("radio/kind"), c.radioKind).toString();
+    if (kind == QLatin1String("tci") || kind == QLatin1String("usb")) c.radioKind = kind;
+    c.usbModel = usb::model(s.value(QStringLiteral("radio/usb/model"), c.usbModel).toString()).id;
+    c.usbInput = s.value(QStringLiteral("radio/usb/input")).toString();
+    const double trimDb = s.value(QStringLiteral("radio/usb/trimDb"), c.usbTrimDb).toDouble();
+    if (std::isfinite(trimDb)) c.usbTrimDb = std::clamp(trimDb, kMinUsbTrimDb, kMaxUsbTrimDb);
     c.host = s.value(QStringLiteral("radio/host"), c.host).toString();
     c.port = s.value(QStringLiteral("radio/port"), c.port).toInt();
     c.receiver = s.value(QStringLiteral("radio/receiver"), c.receiver).toInt();
@@ -120,6 +129,10 @@ AppConfig Settings::load() const
 void Settings::save(const AppConfig& c)
 {
     QSettings& s = *m_settings;
+    s.setValue(QStringLiteral("radio/kind"), c.radioKind);
+    s.setValue(QStringLiteral("radio/usb/model"), c.usbModel);
+    s.setValue(QStringLiteral("radio/usb/input"), c.usbInput);
+    s.setValue(QStringLiteral("radio/usb/trimDb"), c.usbTrimDb);
     s.setValue(QStringLiteral("radio/host"), c.host);
     s.setValue(QStringLiteral("radio/port"), c.port);
     s.setValue(QStringLiteral("radio/receiver"), c.receiver);

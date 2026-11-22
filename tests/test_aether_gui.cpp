@@ -1640,6 +1640,167 @@ private slots:
 
     // The output device, Refresh and the buffer work as they always have: "System default"
     // first, the system's own device marked, a missing one kept, and each choice kept.
+    // A USB radio is chosen at the top of the Radio page. The page then shows its input,
+    // receiver and trim in place of ExpertSDR3's host and port, and no ExpertSDR3 mute.
+    void aUsbRadioIsChosenOnTheRadioPage()
+    {
+        make(esa::AppConfig{}, silentSinks());
+        // Only the lists given here: this computer's own may hold a real radio's codec.
+        QObject::disconnect(m_core.get(), &esa::Engine::inputDevicesChanged, nullptr, nullptr);
+        QObject::disconnect(m_core.get(), &esa::Engine::devicesChanged, nullptr, nullptr);
+        m_window->showPage(QStringLiteral("radio"));
+        auto* page = m_window->findChild<esa::RadioPage*>();
+        QVERIFY(page);
+        auto* kind = page->findChild<QComboBox*>(QStringLiteral("radioKind"));
+        auto* host = page->findChild<QLineEdit*>(QStringLiteral("host"));
+        auto* input = page->findChild<QComboBox*>(QStringLiteral("usbInput"));
+        auto* receiver = page->findChild<QComboBox*>(QStringLiteral("usbReceiver"));
+        auto* usbConnect = page->findChild<QPushButton*>(QStringLiteral("usbConnect"));
+        QCheckBox* muteExpert = nullptr;
+        for (QCheckBox* box : page->findChildren<QCheckBox*>()) {
+            if (box->text().startsWith(QLatin1String("Mute ExpertSDR3"))) muteExpert = box;
+        }
+        QVERIFY(kind && host && input && receiver && usbConnect && muteExpert);
+        page->showInputDevices({});  // whatever this computer listed at the start is gone
+        QCOMPARE(kind->currentData().toString(), QStringLiteral("tci"));
+        QVERIFY(host->isVisibleTo(page));
+        QVERIFY(muteExpert->isVisibleTo(page));
+        QVERIFY(!input->isVisibleTo(page));
+
+        kind->setCurrentIndex(kind->findData(QStringLiteral("usb:ts990s")));
+        QCOMPARE(m_window->config().radioKind, QStringLiteral("usb"));
+        QCOMPARE(m_window->config().usbModel, QStringLiteral("ts990s"));
+        QVERIFY(!host->isVisibleTo(page));
+        QVERIFY(!muteExpert->isVisibleTo(page));
+        QVERIFY(input->isVisibleTo(page));
+        QVERIFY(usbConnect->isVisibleTo(page));
+        QCOMPARE(receiver->count(), 2);
+        QCOMPARE(receiver->itemText(0), QStringLiteral("Main"));
+        QCOMPARE(receiver->itemText(1), QStringLiteral("Sub"));
+        receiver->setCurrentIndex(1);
+        QCOMPARE(m_window->config().receiver, 1);
+
+        // With nothing chosen, the one input that looks like the TS-990S's codec is suggested;
+        // it is only ever listened to. Never the microphone.
+        esa::AudioDeviceInfo mic;
+        mic.key = QStringLiteral("Test|Built-in Microphone");
+        mic.name = QStringLiteral("Built-in Microphone");
+        mic.hostApi = QStringLiteral("Test");
+        mic.isDefault = true;
+        esa::AudioDeviceInfo codec = mic;
+        codec.key = QStringLiteral("Test|USB Audio CODEC");
+        codec.name = QStringLiteral("USB Audio CODEC");
+        codec.isDefault = false;
+        page->showInputDevices({mic, codec});
+        QCOMPARE(m_window->config().usbInput, codec.key);
+        QCOMPARE(input->currentData().toString(), codec.key);
+        // Switched off or unplugged: kept by name, so switching it on picks it up again.
+        page->showInputDevices({mic});
+        QCOMPARE(input->currentText(), QStringLiteral("USB Audio CODEC (not found)"));
+        QCOMPARE(m_window->config().usbInput, codec.key);
+        // Back to ExpertSDR3: its box returns.
+        kind->setCurrentIndex(kind->findData(QStringLiteral("tci")));
+        QCOMPARE(m_window->config().radioKind, QStringLiteral("tci"));
+        QVERIFY(host->isVisibleTo(page));
+        QVERIFY(!input->isVisibleTo(page));
+    }
+
+    // Two inputs that look like the radio's codec: neither is chosen for the operator.
+    void aLookAlikeCodecIsNeverChosenForTheOperator()
+    {
+        make(esa::AppConfig{}, silentSinks());
+        QObject::disconnect(m_core.get(), &esa::Engine::inputDevicesChanged, nullptr, nullptr);
+        QObject::disconnect(m_core.get(), &esa::Engine::devicesChanged, nullptr, nullptr);
+        auto* page = m_window->findChild<esa::RadioPage*>();
+        auto* input = page->findChild<QComboBox*>(QStringLiteral("usbInput"));
+        auto* kind = page->findChild<QComboBox*>(QStringLiteral("radioKind"));
+        QVERIFY(page && input && kind);
+        page->showInputDevices({});
+        kind->setCurrentIndex(kind->findData(QStringLiteral("usb:ts990s")));
+        QCOMPARE(m_window->config().usbInput, QString());
+        esa::AudioDeviceInfo codec;
+        codec.key = QStringLiteral("Test|USB Audio CODEC");
+        codec.name = QStringLiteral("USB Audio CODEC");
+        codec.hostApi = QStringLiteral("Test");
+        esa::AudioDeviceInfo second = codec;
+        second.key = QStringLiteral("Test|USB Audio CODEC 2");
+        second.name = QStringLiteral("USB Audio CODEC 2");
+        page->showInputDevices({codec, second});
+        QCOMPARE(m_window->config().usbInput, QString());
+        QCOMPARE(input->currentData().toString(), QString());
+        QCOMPARE(input->currentText(), QStringLiteral("Choose the radio's audio input"));
+    }
+
+    // With a USB radio chosen its own codec is left out of the outputs: with DATA VOX on,
+    // the radio can transmit what is played into it.
+    void theRadiosCodecIsNotOfferedAsAnOutput()
+    {
+        make(esa::AppConfig{}, silentSinks());
+        QObject::disconnect(m_core.get(), &esa::Engine::inputDevicesChanged, nullptr, nullptr);
+        QObject::disconnect(m_core.get(), &esa::Engine::devicesChanged, nullptr, nullptr);
+        auto* output = m_window->findChild<esa::OutputPage*>();
+        auto* radio = m_window->findChild<esa::RadioPage*>();
+        QVERIFY(output && radio);
+        QComboBox* devices = output->stationBand()->deviceList();
+        auto* kind = radio->findChild<QComboBox*>(QStringLiteral("radioKind"));
+        QVERIFY(kind);
+        radio->showInputDevices({});
+        esa::AudioDeviceInfo speakers;
+        speakers.key = QStringLiteral("Test|Speakers");
+        speakers.name = QStringLiteral("Speakers");
+        speakers.hostApi = QStringLiteral("Test");
+        esa::AudioDeviceInfo codec = speakers;
+        codec.key = QStringLiteral("Test|USB Audio CODEC");
+        codec.name = QStringLiteral("USB Audio CODEC");
+
+        // For ExpertSDR3 the codec is an output like any other, and it is chosen.
+        output->showDevices({speakers, codec});
+        QVERIFY(devices->findData(codec.key) >= 0);
+        devices->setCurrentIndex(devices->findData(codec.key));
+        QCOMPARE(m_window->config().deviceKey, codec.key);
+
+        // Then the TS-990S is chosen, and that codec is its audio.
+        kind->setCurrentIndex(kind->findData(QStringLiteral("usb:ts990s")));
+        radio->showInputDevices({codec});
+        QCOMPARE(m_window->config().usbInput, codec.key);
+        output->showDevices({speakers, codec});
+        QVERIFY(devices->findData(speakers.key) >= 0);
+        // Not offered: named as what it is.
+        QCOMPARE(devices->currentText(), QStringLiteral("USB Audio CODEC (the radio's own audio: choose another)"));
+        for (int i = 0; i < devices->count(); ++i) {
+            if (i == devices->currentIndex()) continue;
+            QVERIFY2(devices->itemData(i).toString() != codec.key, qPrintable(devices->itemText(i)));
+        }
+        devices->setCurrentIndex(devices->findData(speakers.key));
+        output->showDevices({speakers, codec});
+        QCOMPARE(devices->findData(codec.key), -1);
+    }
+
+    // What the window says about a USB radio: its name and input, and silence as the radio off.
+    void aUsbRadioIsDescribedAsOne()
+    {
+        esa::EngineStatus s;
+        s.radioKind = QStringLiteral("usb");
+        s.serverName = QStringLiteral("Kenwood");
+        s.device = QStringLiteral("TS-990S");
+        s.connection = esa::RadioBackend::Link::Connecting;
+        s.connectionError = QStringLiteral("USB Audio CODEC is not connected");
+        QVERIFY(esa::statusText::radio(s).contains(QLatin1String("Waiting for the TS-990S")));
+        QVERIFY(esa::statusText::radio(s).contains(QLatin1String("USB Audio CODEC is not connected")));
+        QVERIFY(!esa::statusText::radio(s).contains(QLatin1String("TCI")));
+        s.connection = esa::RadioBackend::Link::Ready;
+        s.receiverName = QStringLiteral("Main");
+        s.inputDevice = QStringLiteral("USB Audio CODEC");
+        s.audioFlowing = false;
+        const QString silent = esa::statusText::radio(s);
+        QVERIFY(silent.contains(QLatin1String("Kenwood TS-990S Main")));
+        QVERIFY(silent.contains(QLatin1String("Is it switched on")));
+        QVERIFY(!silent.contains(QLatin1String("ExpertSDR3")));
+        QCOMPARE(esa::StatusChip::summarize(s, false).text, QStringLiteral("No audio from radio"));
+        s.audioFlowing = true;
+        QCOMPARE(esa::StatusChip::summarize(s, false).text, QStringLiteral("● TS-990S · Main"));
+    }
+
     void theDeviceListRefreshAndBufferWorkAsBefore()
     {
         esa::AppConfig config;

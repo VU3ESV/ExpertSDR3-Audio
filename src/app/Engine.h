@@ -37,6 +37,7 @@ struct EngineStatus {
     int trxCount{0};
     int connectedPort{0};
     int receiver{0};
+    QString receiverName;  // "Main", "Sub" where the radio names its receivers; empty otherwise
     qint64 frequencyHz{0};
     QString modulation;
     bool receiverEnabled{true};
@@ -49,6 +50,11 @@ struct EngineStatus {
     bool nrFailed{false};     // construction failed; running dry
     bool nrBypassedByMode{false};
     float nrGainDb{0.0f};
+
+    // A radio heard through this computer's sound hardware: the device its audio comes in on.
+    QString inputDevice;
+    int inputRate{0};
+    quint64 inputOverflows{0};
 
     QString outputDevice;
     QString outputError;
@@ -141,6 +147,8 @@ public slots:
     // meanwhile takes effect straight after that, so switching radios cannot lose its way.
     void disconnectRadio();
     void setReceiver(int receiver);
+    // A USB radio's input trim, applied at once.
+    void setUsbTrimDb(double db);
     void setOutputDevice(const QString& deviceKey);
     void setBufferMs(int ms);
     void setOutputGainDb(double db);
@@ -186,6 +194,8 @@ public slots:
 signals:
     void statusChanged(const esa::EngineStatus& status);
     void devicesChanged(const QList<esa::AudioDeviceInfo>& devices);
+    // The input devices, after the same rescan: where a USB radio's codec is chosen.
+    void inputDevicesChanged(const QList<esa::AudioDeviceInfo>& devices);
     void connectedPortChanged(int port);
     // Once each time REC is refused or a recording stops early (disk full, folder not writable).
     // The same text is in EngineStatus::recording.error. Whatever reached the disk is kept, and
@@ -257,6 +267,7 @@ private:
     AppConfig m_config;
 
     RadioBackend* m_radio{nullptr};
+    RadioBackend::Capabilities m_caps;
     std::unique_ptr<MuteController> m_mute;
     QString m_muteHost;
     std::unique_ptr<RxChain> m_chain;
@@ -295,6 +306,9 @@ private:
     QString m_outputError;
     QString m_outputDeviceName;
     qint64 m_lastBlockMs{-1};
+    // The last block above the silence floor. A USB codec streams whether or not the radio is
+    // on, so for it only sound, not blocks, shows the radio is there.
+    qint64 m_lastSoundMs{-1};
     qint64 m_nextSinkRetryMs{0};
 
     QString m_modulation;

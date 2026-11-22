@@ -21,6 +21,7 @@ struct RadioState {
         QString modulation;
         bool transmitting{false};
         bool enabled{true};
+        QString name;  // as the radio's front panel calls it ("Main", "Sub"); empty: "RX n"
     };
     QHash<int, Receiver> receivers;
 };
@@ -75,6 +76,20 @@ public:
     virtual QString lastError() const = 0;
     // The TCI port that answered; 0 where there is none.
     virtual int connectedPort() const { return 0; }
+
+    // Where the audio comes in, for a radio heard through this computer's sound hardware.
+    struct Input {
+        QString device;       // empty while none is open
+        int sampleRate{0};
+        quint64 overflows{0};  // times audio was lost on the way in
+    };
+    virtual Input input() const { return {}; }
+    // PortAudio rescans only once every holder lets go. Around a rescan a backend holding a
+    // sound device closes it, and opens it again after.
+    virtual void releaseAudioDevices() {}
+    virtual void reacquireAudioDevices() {}
+    // A gain on the incoming audio, in dB, for a radio whose level is fixed at its end.
+    virtual void setInputTrimDb(double db) { Q_UNUSED(db); }
 
 signals:
     void stateChanged(esa::RadioBackend::Link state);

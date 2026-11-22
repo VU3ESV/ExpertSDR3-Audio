@@ -27,9 +27,12 @@ class PortAudioSink final : public AudioSink {
 public:
     // Null with `*error` set on failure. An empty or unknown key uses the system
     // default device. A non-zero `forcedDeviceRate` overrides rate negotiation, for
-    // hardware that claims to support rates it handles badly.
-    static std::unique_ptr<PortAudioSink> open(const QString& deviceKey, int chainRate,
-                                               int targetLatencyMs, int forcedDeviceRate, QString* error);
+    // hardware that claims to support rates it handles badly. A device that is
+    // `radioCodec` (audio::samePhysicalDevice) is refused, however it was chosen: with
+    // DATA VOX on, a radio can transmit what is played into its own codec.
+    static std::unique_ptr<PortAudioSink> open(const QString& deviceKey, int chainRate, int targetLatencyMs,
+                                               int forcedDeviceRate, QString* error,
+                                               const QString& radioCodec = QString());
     ~PortAudioSink() override;
 
     QString deviceName() const override { return m_deviceName; }

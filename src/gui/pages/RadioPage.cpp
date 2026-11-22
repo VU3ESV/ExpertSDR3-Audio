@@ -1,6 +1,7 @@
 #include "gui/pages/RadioPage.h"
 
 #include "gui/shell/StatusChip.h"
+#include "radio/UsbModels.h"
 
 #include "CanonIndicators.h"
 #include "ClientEqOutputFader.h"
@@ -8,6 +9,7 @@
 
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDoubleSpinBox>
 #include <QFrame>
 #include <QGridLayout>
 #include <QHBoxLayout>
@@ -83,9 +85,11 @@ RadioPage::RadioPage(PageContext& ctx)
     auto* column = new QVBoxLayout(content);
     column->setContentsMargins(0, 0, 0, 0);
     column->setSpacing(8);
-    column->addWidget(buildConnection());
+    column->addWidget(buildKind());
+    column->addWidget(m_tciBox = buildConnection());
+    column->addWidget(m_usbBox = buildUsb());
     column->addWidget(buildLevel());
-    column->addWidget(buildMute());
+    column->addWidget(m_muteBox = buildMute());
     column->addStretch(1);
 
     auto* layout = new QVBoxLayout(this);
@@ -93,6 +97,178 @@ RadioPage::RadioPage(PageContext& ctx)
     layout->addWidget(scrollable(content));
 
     AetherSDR::applyCanonSheet(this, radioSheet);
+    showKind();
+}
+
+QWidget* RadioPage::buildKind()
+{
+    QGridLayout* grid = nullptr;
+    QFrame* box = section(QStringLiteral("RADIO"), &grid);
+    m_kind = new QComboBox;
+    m_kind->setObjectName(QStringLiteral("radioKind"));
+    m_kind->setAccessibleName(QStringLiteral("Radio"));
+    m_kind->addItem(QStringLiteral("ExpertSDR3 (TCI)"), QStringLiteral("tci"));
+    for (const UsbModel& model : usb::models()) {
+        const QString label = model.hasCat() ? QStringLiteral("%1 (USB)").arg(model.label())
+                                             : QStringLiteral("%1 (USB, audio only)").arg(model.label());
+        m_kind->addItem(label, QStringLiteral("usb:") + model.id);
+    }
+    const QString current = config().radioKind == QLatin1String("usb") ? QStringLiteral("usb:") + config().usbModel
+                                                                        : QStringLiteral("tci");
+    m_kind->setCurrentIndex(std::max(0, m_kind->findData(current)));
+    m_kind->setToolTip(QStringLiteral("How this app hears the radio: from ExpertSDR3 over the network, or "
+                                      "from a radio's own USB audio."));
+    grid->addWidget(m_kind, 1, 0);
+    grid->setColumnStretch(0, 1);
+    connect(m_kind, &QComboBox::currentIndexChanged, this, [this](int index) {
+        const QString choice = m_kind->itemData(index).toString();
+        if (choice.startsWith(QLatin1String("usb:"))) {
+            config().radioKind = QStringLiteral("usb");
+            config().usbModel = choice.mid(4);
+        } else {
+            config().radioKind = QStringLiteral("tci");
+        }
+        showKind();
+        // The output list leaves out a USB radio's own codec, so it is drawn again.
+        context().post([](Engine* engine) { engine->refreshDevices(); });
+    });
+    return box;
+}
+
+QWidget* RadioPage::buildUsb()
+{
+    QGridLayout* grid = nullptr;
+    QFrame* box = section(QStringLiteral("USB RADIO"), &grid);
+    m_usbInput = new QComboBox;
+    m_usbInput->setObjectName(QStringLiteral("usbInput"));
+    m_usbInput->setAccessibleName(QStringLiteral("Radio's audio input"));
+    m_usbInput->setToolTip(QStringLiteral("The input this computer shows the radio's USB audio as."));
+    m_usbRefresh = new QPushButton(QStringLiteral("Refresh"));
+    m_usbRefresh->setObjectName(QStringLiteral("usbRefresh"));
+    m_usbRefresh->setToolTip(QStringLiteral("Look again for audio devices, after plugging in or switching on the radio."));
+    m_usbReceiver = new QComboBox;
+    m_usbReceiver->setObjectName(QStringLiteral("usbReceiver"));
+    m_usbReceiver->setAccessibleName(QStringLiteral("Receiver"));
+    m_usbTrim = new QDoubleSpinBox;
+    m_usbTrim->setObjectName(QStringLiteral("usbTrim"));
+    m_usbTrim->setAccessibleName(QStringLiteral("Input trim"));
+    m_usbTrim->setRange(kMinUsbTrimDb, kMaxUsbTrimDb);
+    m_usbTrim->setSingleStep(0.5);
+    m_usbTrim->setDecimals(1);
+    m_usbTrim->setSuffix(QStringLiteral(" dB"));
+    m_usbTrim->setValue(config().usbTrimDb);
+    m_usbTrim->setToolTip(QStringLiteral("Raise or lower the radio's audio before processing. FROM RADIO shows the result."));
+    m_usbConnect = new QPushButton(QStringLiteral("Connect"));
+    m_usbConnect->setObjectName(QStringLiteral("usbConnect"));
+    m_usbConnect->setCheckable(true);
+    m_usbConnect->setMinimumWidth(130);
+    m_usbSetup = hintLabel();
+    m_usbSetup->setWordWrap(true);
+    m_usbLabel = hintLabel(colored(QStringLiteral("color.text.label"), QStringLiteral("Not connected")));
+
+    grid->addWidget(new QLabel(QStringLiteral("Input")), 1, 0);
+    grid->addWidget(m_usbInput, 1, 1, 1, 2);
+    grid->addWidget(m_usbRefresh, 1, 3);
+    grid->addWidget(new QLabel(QStringLiteral("Receiver")), 2, 0);
+    grid->addWidget(m_usbReceiver, 2, 1);
+    grid->addWidget(new QLabel(QStringLiteral("Trim")), 2, 2);
+    grid->addWidget(m_usbTrim, 2, 3);
+    grid->addWidget(m_usbSetup, 3, 0, 1, 4);
+    auto* buttons = new QHBoxLayout;
+    buttons->addStretch(1);
+    buttons->addWidget(m_usbConnect);
+    grid->addLayout(buttons, 4, 0, 1, 4);
+    grid->addWidget(m_usbLabel, 5, 0, 1, 4);
+    grid->setColumnStretch(1, 1);
+
+    connect(m_usbConnect, &QPushButton::toggled, this, &RadioPage::onConnectToggled);
+    connect(m_usbRefresh, &QPushButton::clicked, this,
+            [this] { context().post([](Engine* engine) { engine->refreshDevices(); }); });
+    connect(m_usbInput, &QComboBox::currentIndexChanged, this, [this](int index) {
+        config().usbInput = m_usbInput->itemData(index).toString();
+        context().post([](Engine* engine) { engine->refreshDevices(); });  // the output list follows
+    });
+    connect(m_usbReceiver, &QComboBox::currentIndexChanged, this, [this](int index) {
+        const int receiver = m_usbReceiver->itemData(index).toInt();
+        config().receiver = receiver;
+        context().post([receiver](Engine* engine) { engine->setReceiver(receiver); });
+    });
+    connect(m_usbTrim, &QDoubleSpinBox::valueChanged, this, [this](double db) {
+        config().usbTrimDb = db;
+        context().post([db](Engine* engine) { engine->setUsbTrimDb(db); });
+    });
+    return box;
+}
+
+bool RadioPage::usbRadio() const
+{
+    return config().radioKind == QLatin1String("usb");
+}
+
+void RadioPage::showKind()
+{
+    const bool usb = usbRadio();
+    m_tciBox->setVisible(!usb);
+    m_usbBox->setVisible(usb);
+    // Only ExpertSDR3's own audio can be muted from here, so far.
+    m_muteBox->setVisible(!usb);
+    m_inputMeter->setToolTip(usb ? QStringLiteral("The level of the radio's USB audio, before any processing.")
+                                 : QStringLiteral("The level of the audio arriving from ExpertSDR3, before any processing."));
+    if (usb) {
+        m_usbSetup->setText(colored(QStringLiteral("color.text.label"), usb::model(config().usbModel).setup));
+        fillUsbReceivers();
+        fillUsbInputs();
+    }
+}
+
+void RadioPage::fillUsbReceivers()
+{
+    const QSignalBlocker block(m_usbReceiver);
+    m_usbReceiver->clear();
+    const UsbModel& model = usb::model(config().usbModel);
+    for (int i = 0; i < model.receivers.size(); ++i) m_usbReceiver->addItem(model.receivers.at(i), i);
+    m_usbReceiver->setCurrentIndex(std::max(0, m_usbReceiver->findData(config().receiver)));
+    if (m_usbReceiver->currentIndex() >= 0) config().receiver = m_usbReceiver->currentData().toInt();
+}
+
+void RadioPage::showInputDevices(const QList<AudioDeviceInfo>& devices)
+{
+    m_inputs = devices;
+    // Kept for when a USB radio is chosen; until then nothing is suggested or changed.
+    if (usbRadio()) fillUsbInputs();
+}
+
+void RadioPage::fillUsbInputs()
+{
+    const UsbModel& model = usb::model(config().usbModel);
+    // Nothing chosen yet: offer the one input that looks like this model's codec, never more
+    // than a suggestion of which input it is. It is only ever listened to.
+    if (config().usbInput.isEmpty() && !model.codecHint.isEmpty()) {
+        QString only;
+        int matches = 0;
+        for (const AudioDeviceInfo& device : std::as_const(m_inputs)) {
+            if (device.name.contains(model.codecHint, Qt::CaseInsensitive)) {
+                only = device.key;
+                ++matches;
+            }
+        }
+        if (matches == 1) config().usbInput = only;
+    }
+    const QString selected = config().usbInput;
+    const QSignalBlocker block(m_usbInput);
+    m_usbInput->clear();
+    if (selected.isEmpty()) m_usbInput->addItem(QStringLiteral("Choose the radio's audio input"), QString());
+    for (const AudioDeviceInfo& device : std::as_const(m_inputs)) {
+        m_usbInput->addItem(QStringLiteral("%1  (%2)").arg(device.name, device.hostApi), device.key);
+    }
+    const int index = m_usbInput->findData(selected);
+    if (index >= 0) {
+        m_usbInput->setCurrentIndex(index);
+    } else {
+        // Not plugged in, or the radio is off: shown, so switching it on picks it up again.
+        m_usbInput->addItem(QStringLiteral("%1 (not found)").arg(selected.section(QLatin1Char('|'), 1)), selected);
+        m_usbInput->setCurrentIndex(m_usbInput->count() - 1);
+    }
 }
 
 QWidget* RadioPage::buildConnection()
@@ -210,14 +386,27 @@ void RadioPage::hideEvent(QHideEvent* event)
 
 void RadioPage::connectNow()
 {
-    m_connect->setChecked(true);
+    (usbRadio() ? m_usbConnect : m_connect)->setChecked(true);
 }
 
 void RadioPage::onConnectToggled(bool on)
 {
+    // One Connect for each kind of radio, and only the chosen kind's shows: they move together.
+    for (QPushButton* button : {m_connect, m_usbConnect}) {
+        if (button->isChecked() == on) continue;
+        const QSignalBlocker block(button);
+        button->setChecked(on);
+    }
+    for (QPushButton* button : {m_connect, m_usbConnect}) {
+        button->setText(on ? QStringLiteral("Disconnect") : QStringLiteral("Connect"));
+    }
+    m_kind->setEnabled(!on);
+    m_usbInput->setEnabled(!on);
     if (on) {
-        config().host = m_host->text().trimmed();
-        config().port = m_port->value();
+        if (!usbRadio()) {
+            config().host = m_host->text().trimmed();
+            config().port = m_port->value();
+        }
         const AppConfig snapshot = config();
         context().post([snapshot](Engine* engine) {
             engine->configure(snapshot);
@@ -226,7 +415,6 @@ void RadioPage::onConnectToggled(bool on)
     } else {
         context().post([](Engine* engine) { engine->disconnectRadio(); });
     }
-    m_connect->setText(on ? QStringLiteral("Disconnect") : QStringLiteral("Connect"));
     m_host->setEnabled(!on);
     m_port->setEnabled(!on);
 }
@@ -234,6 +422,8 @@ void RadioPage::onConnectToggled(bool on)
 void RadioPage::connectTo(const DiscoveredRadio& radio)
 {
     if (m_connect->isChecked()) m_connect->setChecked(false);
+    // A radio found on the network is a TCI one.
+    if (usbRadio()) m_kind->setCurrentIndex(m_kind->findData(QStringLiteral("tci")));
     m_host->setText(radio.host);
     {
         const QSignalBlocker block(m_port);
@@ -260,10 +450,11 @@ int RadioPage::port() const
 void RadioPage::showStatus(const EngineStatus& s)
 {
     const QString radio = statusText::radio(s);
-    if (radio != m_radioLabel->text()) m_radioLabel->setText(radio);
+    QLabel* label = s.radioKind == QLatin1String("usb") ? m_usbLabel : m_radioLabel;
+    if (radio != label->text()) label->setText(radio);
 
     // The server knows how many receivers there are. Match it.
-    if (s.trxCount > 0 && s.trxCount != m_receiver->count()) {
+    if (s.radioKind == QLatin1String("tci") && s.trxCount > 0 && s.trxCount != m_receiver->count()) {
         const QSignalBlocker block(m_receiver);
         m_receiver->clear();
         for (int i = 0; i < s.trxCount; ++i) m_receiver->addItem(QStringLiteral("RX %1").arg(i + 1), i);
