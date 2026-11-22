@@ -35,6 +35,8 @@ struct AppConfig {
     // Empty: audio only, and nothing is ever sent to the radio.
     QString usbCatPort;
     int usbCatBaud{115200};
+    // Turn the radio's AF down while this app plays (a model with afMute). Off until chosen.
+    bool usbAfMute{false};
     QString host{QStringLiteral("127.0.0.1")};
     int port{40001};
     // Tried if nothing answers on `port`: the ports ExpertSDR3 installs commonly use.
@@ -81,6 +83,7 @@ public:
     struct MuteOwnership {
         bool owned{false};
         bool priorMuted{false};
+        int priorLevel{-1};  // a level control's level before it was turned down
     };
     MuteOwnership loadMuteOwnership(const QString& radioHost) const;
     void saveMuteOwnership(const QString& radioHost, const MuteOwnership& ownership);

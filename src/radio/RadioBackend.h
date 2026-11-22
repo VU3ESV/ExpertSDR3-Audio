@@ -70,6 +70,12 @@ public:
 
     // SpeakerControl::Switch only.
     virtual void sendMute(bool muted) { Q_UNUSED(muted); }
+    // SpeakerControl::Level only: the speaker's level, 0 silent. Refused until a level has been
+    // read on this link, so nothing is ever overwritten unseen.
+    virtual void setSpeakerLevel(int level) { Q_UNUSED(level); }
+    // Whether the speaker control can be reached now. For TCI that is the link itself. A USB
+    // radio's speaker is on its CAT link, which says so with speakerLinkChanged.
+    virtual bool speakerLinkUp() const { return state() == Link::Ready; }
 
     virtual Link state() const = 0;
     virtual const RadioState& radio() const = 0;
@@ -104,6 +110,9 @@ signals:
     void stateChanged(esa::RadioBackend::Link state);
     void radioChanged();
     void muteReported(bool muted);
+    // SpeakerControl::Level: the speaker's link up or down, and every level read on it.
+    void speakerLinkChanged(bool up);
+    void speakerLevelReported(int level);
     void modulationChanged(int receiver, const QString& modulation);
     void transmitChanged(int receiver, bool transmitting);
     // Interleaved stereo float at `sampleRate`, delivered directly on the engine thread; the

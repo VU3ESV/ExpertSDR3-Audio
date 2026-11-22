@@ -12,10 +12,12 @@ bool MuteController::settled() const
     return m_phase != Phase::Engaging && m_phase != Phase::Restoring;
 }
 
-void MuteController::setOwnership(bool owned, bool priorMuted)
+void MuteController::setOwnership(bool owned, bool priorMuted, int priorLevel)
 {
-    if (m_ownership.owned == owned && m_ownership.priorMuted == priorMuted) return;
-    m_ownership = {owned, priorMuted};
+    if (m_ownership.owned == owned && m_ownership.priorMuted == priorMuted && m_ownership.priorLevel == priorLevel) {
+        return;
+    }
+    m_ownership = {owned, priorMuted, priorLevel};
     if (m_actions.persist) m_actions.persist(m_ownership);
 }
 
@@ -23,6 +25,11 @@ void MuteController::send(bool muted, qint64 nowMs)
 {
     m_lastSendMs = nowMs;
     ++m_attempts;
+    if (m_actions.sendLevel) {
+        const int level = muted ? 0 : m_ownership.priorLevel;
+        if (level >= 0) m_actions.sendLevel(level);
+        return;
+    }
     if (m_actions.sendMute) m_actions.sendMute(muted);
 }
 
@@ -37,12 +44,14 @@ void MuteController::onConnected()
 {
     m_connected = true;
     m_serverKnown = false;  // unknown until the init burst reports it
+    m_serverLevel = -1;
 }
 
 void MuteController::onDisconnected()
 {
     m_connected = false;
     m_serverKnown = false;
+    m_serverLevel = -1;
     // The phases that describe the live connection end with it. Ownership and an
     // operator override both survive: a network blip is not a new decision.
     if (m_phase == Phase::Engaging || m_phase == Phase::Holding
@@ -66,7 +75,11 @@ void MuteController::beginEngage(qint64 nowMs)
     }
     // Keep an existing prior: on re-engage after a reconnect the server may have
     // restarted unmuted, and the first prior is still the operator's real state.
-    if (!m_ownership.owned) setOwnership(true, false);
+    // A level read above 0 is different: it is what the operator hears now, whoever set it,
+    // and the level to give back. 0 is never taken as a prior (a restore in flight reads 0).
+    if (!m_ownership.owned || (m_actions.sendLevel && m_serverLevel > 0)) {
+        setOwnership(true, false, m_actions.sendLevel ? m_serverLevel : -1);
+    }
     m_phase = Phase::Engaging;
     send(true, nowMs);
 }
@@ -106,10 +119,19 @@ void MuteController::evaluate(qint64 nowMs)
         if (m_wanted) beginEngage(nowMs);
         break;
     case Phase::OperatorOverride:
+        if (!m_wanted && !m_actions.sendLevel) m_phase = Phase::Idle;  // a level waits for rearm()
+        break;
     case Phase::Failed:
         if (!m_wanted) m_phase = Phase::Idle;
         break;
     }
+}
+
+void MuteController::rearm(qint64 nowMs)
+{
+    if (m_phase != Phase::OperatorOverride) return;
+    m_phase = Phase::Idle;
+    evaluate(nowMs);
 }
 
 void MuteController::onServerMute(bool muted, qint64 nowMs)
@@ -142,6 +164,12 @@ void MuteController::onServerMute(bool muted, qint64 nowMs)
     evaluate(nowMs);
 }
 
+void MuteController::onServerLevel(int level, qint64 nowMs)
+{
+    m_serverLevel = level;
+    onServerMute(level == 0, nowMs);
+}
+
 void MuteController::tick(qint64 nowMs)
 {
     if (!m_connected || (m_phase != Phase::Engaging && m_phase != Phase::Restoring)) return;
@@ -150,8 +178,10 @@ void MuteController::tick(qint64 nowMs)
     if (m_attempts >= kMaxAttempts) {
         // A failed engage changed nothing, so nothing is owed. A failed restore
         // keeps ownership: the next session tries again rather than forgetting
-        // that ExpertSDR3 was left muted on our account.
-        if (m_phase == Phase::Engaging) setOwnership(false, false);
+        // that ExpertSDR3 was left muted on our account. A level's failed engage
+        // keeps it too: its sets may have landed unconfirmed, and the record costs
+        // nothing, because a later reading above 0 just clears it.
+        if (m_phase == Phase::Engaging && !m_actions.sendLevel) setOwnership(false, false);
         m_phase = Phase::Failed;
         return;
     }

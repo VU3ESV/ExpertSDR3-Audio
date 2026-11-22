@@ -160,6 +160,38 @@ AppConfig catConfig()
     return c;
 }
 
+// The engine, with a fake codec and the mock radio on its CAT port, and its every status.
+struct Station {
+    QTemporaryDir dir;
+    std::shared_ptr<Radio> radio = std::make_shared<Radio>();
+    std::shared_ptr<Codec> codec = std::make_shared<Codec>();
+    std::shared_ptr<std::atomic<quint64>> played = std::make_shared<std::atomic<quint64>>(0);
+    std::unique_ptr<Engine> engine;
+    EngineStatus status;
+
+    QString settingsPath() const { return dir.filePath(QStringLiteral("s.ini")); }
+
+    void start(AppConfig config)
+    {
+        auto playedCount = played;
+        engine = std::make_unique<Engine>(settingsPath(), [playedCount](const AppConfig&, QString*) {
+            return std::make_unique<CountingSink>(playedCount);
+        });
+        engine->setBackendFactory([this](const QString& kind, QObject* parent) -> RadioBackend* {
+            if (kind == QLatin1String("usb")) return new UsbBackend(fakeCodec(codec), parent, mockRadio(radio));
+            return nullptr;
+        });
+        QObject::connect(engine.get(), &Engine::statusChanged, engine.get(), [this](const EngineStatus& s) { status = s; });
+        engine->configure(config);
+        engine->connectRadio();
+    }
+
+    Settings::MuteOwnership owed() const
+    {
+        return Settings(settingsPath()).loadMuteOwnership(QStringLiteral("usb:ts990s"));
+    }
+};
+
 } // namespace
 
 class TestTs990 : public QObject {
@@ -211,9 +243,14 @@ private slots:
             ++found;
         }
         QVERIFY(found >= 7);
-        // One place writes to the port, after the allowlist has passed the command.
+        // Commands are checked as they are queued, and one place writes to the port, checking
+        // them again.
         QCOMPARE(text.count(QStringLiteral("->write(")), 1);
-        QVERIFY(text.contains(QStringLiteral("if (!allowed(command))")));
+        QCOMPARE(text.count(QStringLiteral("if (!allowed(command))")), 1);
+        QCOMPARE(text.count(QStringLiteral("if (!allowed(command) || (m_identifyOnly && command != \"ID;\"))")), 1);
+        const qsizetype writer = text.indexOf(QStringLiteral("void Ts990Cat::writeCommand"));
+        QVERIFY(writer > 0);
+        QVERIFY(text.indexOf(QStringLiteral("->write("), writer) > writer);
     }
 
     // ── Identifying ──────────────────────────────────────────────────────────
@@ -506,6 +543,45 @@ private slots:
         QCOMPARE(cat.afLevel(), 120);
     }
 
+    // A newer set replaces one still waiting to go out: nothing can undo it after.
+    void aNewerSetReplacesOneNotYetSent()
+    {
+        auto radio = std::make_shared<Radio>();
+        Ts990Cat cat(mockRadio(radio));
+        cat.open(kPort, 115200);
+        QTRY_COMPARE_WITH_TIMEOUT(cat.state(), Ts990Cat::State::Ready, kTimeout);
+        QSignalSpy sets(&cat, &Ts990Cat::afLevelSet);
+        cat.readAfLevel();  // on the wire, so the sets below wait
+        cat.setAfLevel(0);
+        cat.setAfLevel(90);
+        QTRY_COMPARE_WITH_TIMEOUT(sets.count(), 1, kTimeout);
+        QCOMPARE(sets.first().at(0).toInt(), 90);
+        QCOMPARE(sets.first().at(1).toBool(), true);
+        QVERIFY(!radio->received.contains("AG0000;"));
+        QCOMPARE(radio->af, 90);
+    }
+
+    // As the session closes, a restore still queued goes out; a 0 never does.
+    void aPendingRestoreGoesOutAtClose()
+    {
+        auto radio = std::make_shared<Radio>();
+        Ts990Cat cat(mockRadio(radio));
+        cat.open(kPort, 115200);
+        QTRY_COMPARE_WITH_TIMEOUT(cat.state(), Ts990Cat::State::Ready, kTimeout);
+        radio->answers = false;  // what is on the wire now waits for its timeout
+        cat.readAfLevel();
+        cat.setAfLevel(0);
+        cat.flushPendingLevel();
+        QVERIFY(!radio->received.contains("AG0000;"));
+        cat.readAfLevel();
+        cat.setAfLevel(120);
+        cat.flushPendingLevel();
+        QCOMPARE(radio->received.count("AG0120;"), 1);
+        cat.close();
+        QCOMPARE(radio->received.count("AG0120;"), 1);
+        for (const QByteArray& c : std::as_const(radio->received)) QVERIFY2(Ts990Cat::allowed(c), c.constData());
+    }
+
     // ── The test sandbox ─────────────────────────────────────────────────────
 
     void theSandboxRefusesRealSerialPorts()
@@ -609,6 +685,137 @@ private slots:
         for (const QByteArray& c : std::as_const(radio->received)) QVERIFY2(Ts990Cat::allowed(c), c.constData());
         QVERIFY(!radio->received.contains("AG0000;"));  // nothing is set before the mute exists
         engine.shutdown();
+    }
+
+    // ── The AF, turned down while this app plays ────────────────────────────
+
+    // Read first, then 0, and back to exactly where it was before the port closes.
+    void theAfIsTurnedDownWhileThisAppPlaysAndGivenBack()
+    {
+        Station st;
+        AppConfig config = catConfig();
+        config.usbAfMute = true;
+        st.start(config);
+        QTRY_COMPARE_WITH_TIMEOUT(st.radio->af, 0, kTimeout);
+        QTRY_COMPARE_WITH_TIMEOUT(st.status.mutePhase, MuteController::Phase::Holding, kTimeout);
+        QCOMPARE(st.status.mutePriorLevel, 120);
+        const auto& sent = st.radio->received;
+        QVERIFY(sent.indexOf("AG0;") >= 0);
+        QVERIFY(sent.indexOf("AG0;") < sent.indexOf("AG0000;"));
+        // Owed, on disk, before a crash could lose it.
+        QVERIFY(st.owed().owned);
+        QCOMPARE(st.owed().priorLevel, 120);
+
+        st.engine->disconnectRadio();
+        QTRY_COMPARE_WITH_TIMEOUT(st.status.connection, RadioBackend::Link::Disconnected, kTimeout);
+        QCOMPARE(st.radio->af, 120);
+        QVERIFY(sent.contains("AG0120;"));
+        QVERIFY(!st.radio->open);
+        QVERIFY(!st.owed().owned);
+        for (const QByteArray& c : sent) QVERIFY2(Ts990Cat::allowed(c), c.constData());
+        st.engine->shutdown();
+    }
+
+    // Off unless chosen: the AF is read, and never set.
+    void theAfIsLeftAloneUnlessAskedFor()
+    {
+        Station st;
+        st.start(catConfig());
+        QTRY_VERIFY_WITH_TIMEOUT(st.status.audioFlowing && st.status.catReady, kTimeout);
+        QTest::qWait(1500);
+        QCOMPARE(st.radio->af, 120);
+        for (const QByteArray& c : std::as_const(st.radio->received)) {
+            QVERIFY2(!(c.startsWith("AG0") && c.size() == 7), c.constData());
+        }
+        QCOMPARE(st.status.mutePhase, MuteController::Phase::Idle);
+        // Chosen while playing: down at once. Unchosen: back.
+        st.engine->setUsbAfMute(true);
+        QTRY_COMPARE_WITH_TIMEOUT(st.radio->af, 0, kTimeout);
+        st.engine->setUsbAfMute(false);
+        QTRY_COMPARE_WITH_TIMEOUT(st.radio->af, 120, kTimeout);
+        QTRY_COMPARE_WITH_TIMEOUT(st.status.mutePhase, MuteController::Phase::Idle, kTimeout);
+        st.engine->shutdown();
+    }
+
+    // The operator turns the knob up while it is down: theirs from then on.
+    void turningTheKnobUpHandsItBack()
+    {
+        Station st;
+        AppConfig config = catConfig();
+        config.usbAfMute = true;
+        st.start(config);
+        QTRY_COMPARE_WITH_TIMEOUT(st.status.mutePhase, MuteController::Phase::Holding, kTimeout);
+        st.radio->af = 50;
+        QTRY_COMPARE_WITH_TIMEOUT(st.status.mutePhase, MuteController::Phase::OperatorOverride, kTimeout);
+        const qsizetype sets = st.radio->received.count("AG0000;");
+        // The radio's audio goes silent long enough to count as no radio, then comes back: the
+        // knob still wins.
+        st.codec->left = 0.0f;
+        st.codec->right = 0.0f;
+        QTRY_VERIFY_WITH_TIMEOUT(!st.status.audioFlowing, kTimeout);
+        st.codec->left = 0.25f;
+        st.codec->right = -0.5f;
+        QTRY_VERIFY_WITH_TIMEOUT(st.status.audioFlowing, kTimeout);
+        QTest::qWait(1000);
+        QCOMPARE(st.status.mutePhase, MuteController::Phase::OperatorOverride);
+        QCOMPARE(st.radio->af, 50);
+        st.engine->disconnectRadio();
+        QTRY_COMPARE_WITH_TIMEOUT(st.status.connection, RadioBackend::Link::Disconnected, kTimeout);
+        QCOMPARE(st.radio->af, 50);
+        QCOMPARE(st.radio->received.count("AG0000;"), sets);
+        QVERIFY(!st.radio->received.contains("AG0120;"));
+        QVERIFY(!st.owed().owned);
+        st.engine->shutdown();
+    }
+
+    // Quitting while it is down gives it back before the app goes.
+    void quittingWhileDownGivesItBack()
+    {
+        Station st;
+        AppConfig config = catConfig();
+        config.usbAfMute = true;
+        st.radio->af = 200;
+        st.start(config);
+        QTRY_COMPARE_WITH_TIMEOUT(st.radio->af, 0, kTimeout);
+        st.engine->shutdown();
+        QCOMPARE(st.radio->af, 200);
+        QVERIFY(!st.owed().owned);
+    }
+
+    // The app was killed while the AF was down: the next connection gives it back, even with the
+    // choice since turned off.
+    void aCrashWhileDownIsGivenBackNextTime()
+    {
+        Station st;
+        // Owed under the radio's model, whichever port name it had then.
+        Settings(st.settingsPath()).saveMuteOwnership(QStringLiteral("usb:ts990s"), {true, false, 90});
+        st.radio->af = 0;
+        st.start(catConfig());
+        QTRY_COMPARE_WITH_TIMEOUT(st.radio->af, 90, kTimeout);
+        QTRY_VERIFY_WITH_TIMEOUT(!st.owed().owned, kTimeout);
+        st.engine->shutdown();
+        QCOMPARE(st.radio->af, 90);
+    }
+
+    // The radio stops answering while the AF is down, and comes back: still down, and still owed.
+    void aLostCatLinkKeepsWhatIsOwed()
+    {
+        Station st;
+        AppConfig config = catConfig();
+        config.usbAfMute = true;
+        st.start(config);
+        QTRY_COMPARE_WITH_TIMEOUT(st.status.mutePhase, MuteController::Phase::Holding, kTimeout);
+        st.radio->answers = false;
+        QTRY_VERIFY_WITH_TIMEOUT(!st.status.catReady, Ts990Cat::kMissesToLose * Ts990Cat::kReplyTimeoutMs + kTimeout);
+        QVERIFY(st.owed().owned);
+        st.radio->answers = true;
+        QTRY_COMPARE_WITH_TIMEOUT(st.status.mutePhase, MuteController::Phase::Holding,
+                                  Ts990Cat::kRetryMs + kTimeout);
+        QCOMPARE(st.radio->af, 0);
+        st.engine->disconnectRadio();
+        QTRY_COMPARE_WITH_TIMEOUT(st.status.connection, RadioBackend::Link::Disconnected, kTimeout);
+        QCOMPARE(st.radio->af, 120);
+        st.engine->shutdown();
     }
 
     void theRadioPagesTestSendsIdAlone()

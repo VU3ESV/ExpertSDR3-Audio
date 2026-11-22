@@ -323,6 +323,34 @@ Final Output page or the output path, on each platform with a release build and 
 - Plug in a USB headset, press Refresh: it is listed, choosing it moves the sound there, and
   unplugging it leaves it in the list as "(not found)" until it comes back.
 
+### Checking a USB radio (Kenwood TS-990S) by hand
+
+The tests use a fake codec and a mock TS-990S. Before a release that changes the USB path,
+the CAT driver or the mute, check on a real TS-990S. For the first CAT run on a computer, turn
+TX Inhibit on (menu 0-06-03).
+
+- **Audio.** `--list-inputs` shows "USB Audio CODEC". Choose Kenwood TS-990S (USB), the codec,
+  Main, and real speakers: the processed audio plays. Turning the AF knob does not change the
+  app's level. Sub switches to the sub receiver. Final Output's device list never offers "USB
+  Audio CODEC".
+- **CAT.** Run with `ESA_CAT_TRACE=<file>`. Test answers "Kenwood TS-990S answered on ...", and
+  the trace shows `ID;` alone. Once connected, the frequency and mode follow the radio within a
+  second. CW bypasses NR, and USB brings it back. The trace holds only `ID;`, `FA;`, `FB;`,
+  `OM0;`, `OM1;`, `AG0;`, and with the AF setting on, `AG0nnn;`.
+- **Losing CAT.** Switch the radio off while connected. The page says the radio stopped
+  answering, and NR is no longer bypassed for CW. Switch it on again: CAT comes back by itself.
+- **The AF bench test.** Set AF to about 120 and connect with the AF setting on:
+  1. AF goes to 0 once audio plays.
+  2. Disconnect: AF returns to 120.
+  3. Connect, and turn the knob up while the AF is held at 0: the app says it is leaving it alone.
+     Disconnect: the AF stays where you put it.
+  4. Quit while the AF is at 0: it returns to 120 first.
+  5. Kill the app (`kill -9`) while the AF is at 0, then start and connect again: the AF returns
+     to 120.
+
+  When all five pass, set `afMuteVerified` for the model in `src/radio/UsbModels.cpp`, and say
+  so in the release notes.
+
 ### Measuring on a Raspberry Pi
 
 Upstream's pages redraw every 16 ms while they are on screen, so the window's own CPU matters

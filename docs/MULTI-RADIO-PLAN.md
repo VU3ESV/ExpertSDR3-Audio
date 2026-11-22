@@ -1,6 +1,6 @@
 # Multi-radio plan
 
-Status: proposal, 2026-11-07. Nothing here is implemented. No radio was contacted while researching it.
+Status: proposal, 2026-11-07. Since 2026-11-22, phases 1, 3, 4 and 5 are being built for one model, the Kenwood TS-990S, on branch `feature/multi-radio`. Section 12 records how that differs from this plan. No radio was contacted while researching it.
 Code references are to commit `5455f6f` and will drift. Source tags in square brackets, such as [I1], are listed in section 11.
 
 ## 1. Summary
@@ -1340,3 +1340,47 @@ Base: `https://github.com/aethersdr/AetherSDR/blob/141231e412ed554b9ab49213b2f8c
   - App stores and package archives: https://apps.apple.com/us/app/aether/id404629109; https://apps.apple.com/us/app/aether-pro-audio-video-camera/id6755774662; https://sources.debian.org/api/src/aethersdr/; https://itunes.apple.com/search; https://play.google.com/store/search?q=aether%20audio&c=apps; https://flathub.org/api/v2/search; https://sources.debian.org/api/search/aetheraudio/; https://apps.microsoft.com/search?query=aether+audio
   - Trademark aggregators: https://uspto.report/TM/85983676; https://www.trademarkelite.com/trademark/trademark-detail/85983675/AETHER; https://www.trademarkelite.com/trademark/trademark-detail/77052959/QUIETR; https://markinton.com/trademark/quietgrid-88880114; https://gleanmark.com/trademark/uspto-87645334
   - Same-niche tools and rejected names: https://clearqso.com/; https://themodernham.com/noise-suppression-ai-and-ham-radio-a-perfect-mix/; https://solidcopy.app; https://clearrig.com
+
+## 12. The TS-990S build (2026-11-22)
+
+The developer now has a Kenwood TS-990S on the bench, connected to a Mac by USB. Its codec is a
+PCM2903B (08BB:29B3), and its CAT port is a CP2102 (10C4:EA60). Phases 1, 3, 4 and 5 were built
+for that one model, on branch `feature/multi-radio`, one commit per phase. Where this differs
+from the plan above:
+
+- **A built-in driver, not Hamlib (the user's decision, section 10, item 0).** `Ts990Cat`
+  (`src/radio/Ts990Cat.*`) speaks the TS-990S's own commands from Kenwood's PC Control Command
+  Reference. It sends an allowlist only, checked where commands are queued:
+  - Reads: `ID;`, `FA;`, `FB;`, `OM0;`, `OM1;` and `AG0;`.
+  - One write: `AG0000;` to `AG0255;`.
+
+  Nothing writes at open, so the Hamlib conditions in section 4.3 do not arise. Qt SerialPort
+  opens the port, with DTR and RTS dropped at once. The Radio page's Test sends `ID;` alone.
+  Hamlib stays the plan for further models: a second built-in driver is written only for a
+  model that is on the bench.
+- **No transmit read.** The TS-990S's `IF;` always reports P8 as 0, and pushes would need an
+  `AI` write. So the chain's transmit bypass does not follow this radio. It is receive-only as
+  far as this app goes.
+- **Mode names** are the radio's own (`CW-R`, `FSK`, `PSK`, `USB-D1` and so on). `modeBypassesNr`
+  learned them. There is no `ModeClass` yet.
+- **The mute key** is `usb:<model>`, not the bridge serial or the port. One radio can show up
+  under more than one port name: on a Mac its CP2102 has one for each driver, and Windows may
+  renumber a COM port. An AF owed back must be found whichever name is chosen. Two radios of
+  the same model on one computer would share a record, which is accepted.
+- **The operator's override lasts longer** for a level than for a switch. It holds until the
+  setting is chosen again or a new session starts (`MuteController::rearm()`). A USB radio's
+  silence guard can stop and restart this app's audio within a session, and that must not
+  turn the AF back down over the operator's knob.
+- **A failed engage keeps its record** for a level: its sets may have landed unseen. A later
+  reading above 0 clears the record and sends nothing.
+- **Sets never undo each other.** A newer AF set replaces one not yet sent. As a session
+  closes, a pending restore (a level above 0) is written out, and the port is drained before
+  it closes.
+- **`MuteController` stays in `src/tci/`.** It gained `Actions::sendLevel`,
+  `Ownership::priorLevel` and `onServerLevel()`. A level read above 0 at engage is taken as
+  the prior, and 0 never is.
+- **AF is read on every poll** while the model has `afMute`, even with the setting off. A
+  record owed from a crash is then restored on the next connection without the setting.
+- **`muteVerified` is `afMuteVerified`** in `UsbModels`, and is still false until the bench
+  test in docs/RELEASING.md passes.
+

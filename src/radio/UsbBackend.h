@@ -39,6 +39,7 @@ public:
     Capabilities capabilities() const override;
 
     void open(const AppConfig& config) override;
+    void flush() override;
     void close() override;
     void requestAudio(int receiver, int chainRate) override;
     void stopAudio() override {}
@@ -50,6 +51,8 @@ public:
     Input input() const override;
     void setInputTrimDb(double db) override;
     Cat cat() const override;
+    void setSpeakerLevel(int level) override;
+    bool speakerLinkUp() const override;
     // The CAT link, while a port is chosen; null for audio only.
     Ts990Cat* catLink() const { return m_cat; }
     void releaseAudioDevices() override;
@@ -65,10 +68,12 @@ private:
     void drain();
     void deliver(const float* mono, size_t frames);
     void onCatBand(int receiver);
+    void updateSpeakerLink();
 
     SourceFactory m_sourceFactory;
     Ts990Cat::TransportFactory m_catTransport;
     Ts990Cat* m_cat{nullptr};
+    bool m_speakerUp{false};
     std::unique_ptr<AudioSource> m_source;
     QTimer m_retry;
     QTimer m_drain;

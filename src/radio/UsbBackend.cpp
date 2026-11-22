@@ -72,7 +72,8 @@ UsbBackend::~UsbBackend() = default;
 RadioBackend::Capabilities UsbBackend::capabilities() const
 {
     Capabilities c;
-    c.speaker = SpeakerControl::None;
+    // The main receiver's AF, where the model has it and its CAT is in use.
+    c.speaker = m_model.afMute && m_cat && m_cat->active() ? SpeakerControl::Level : SpeakerControl::None;
     c.audioProvesRadio = false;
     const bool catReady = m_cat && m_cat->state() == Ts990Cat::State::Ready;
     c.reportsMode = catReady;
@@ -109,7 +110,10 @@ void UsbBackend::open(const AppConfig& config)
             m_cat = new Ts990Cat(m_catTransport, this);
             connect(m_cat, &Ts990Cat::bandChanged, this, &UsbBackend::onCatBand);
             connect(m_cat, &Ts990Cat::stateChanged, this, &RadioBackend::radioChanged);
+            connect(m_cat, &Ts990Cat::stateChanged, this, &UsbBackend::updateSpeakerLink);
+            connect(m_cat, &Ts990Cat::afLevelRead, this, &RadioBackend::speakerLevelReported);
         }
+        m_cat->setReadsAfLevel(m_model.afMute);
         m_cat->open(config.usbCatPort, config.usbCatBaud);
     } else if (m_cat) {
         m_cat->close();
@@ -127,6 +131,29 @@ RadioBackend::Cat UsbBackend::cat() const
     return c;
 }
 
+bool UsbBackend::speakerLinkUp() const
+{
+    return m_model.afMute && m_cat && m_cat->state() == Ts990Cat::State::Ready;
+}
+
+void UsbBackend::updateSpeakerLink()
+{
+    const bool up = speakerLinkUp();
+    if (up == m_speakerUp) return;
+    m_speakerUp = up;
+    emit speakerLinkChanged(up);
+}
+
+void UsbBackend::setSpeakerLevel(int level)
+{
+    // Never before the level has been read on this link: what it would overwrite is unknown.
+    if (!speakerLinkUp() || !m_cat->afKnown()) {
+        qCWarning(lcUsb) << "AF level" << level << "not sent: the radio's own level has not been read on this link";
+        return;
+    }
+    m_cat->setAfLevel(level);
+}
+
 void UsbBackend::onCatBand(int receiver)
 {
     if (!m_radio.receivers.contains(receiver)) return;
@@ -137,6 +164,11 @@ void UsbBackend::onCatBand(int receiver)
     rx.modulation = band.mode;
     emit radioChanged();
     if (modeChanged) emit modulationChanged(receiver, band.mode);
+}
+
+void UsbBackend::flush()
+{
+    if (m_cat) m_cat->flushPendingLevel();
 }
 
 void UsbBackend::close()

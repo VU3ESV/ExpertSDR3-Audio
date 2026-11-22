@@ -450,7 +450,7 @@ int main(int argc, char** argv)
     const QCommandLineOption bufferOpt(QStringLiteral("buffer"), QStringLiteral("Output buffer in ms."), QStringLiteral("ms"));
     const QCommandLineOption deviceRateOpt(QStringLiteral("device-rate"), QStringLiteral("Force the output device's sample rate, converting to it if needed."), QStringLiteral("hz"));
     const QCommandLineOption rateOpt(QStringLiteral("rate"), QStringLiteral("Processing rate: 48000 (default) or 24000 for low-power machines."), QStringLiteral("hz"));
-    const QCommandLineOption noMuteOpt(QStringLiteral("no-mute"), QStringLiteral("Leave ExpertSDR3's own audio alone."));
+    const QCommandLineOption noMuteOpt(QStringLiteral("no-mute"), QStringLiteral("Leave the radio's own audio alone: ExpertSDR3's mute, and a USB radio's AF."));
     const QCommandLineOption captureOpt(QStringLiteral("capture"), QStringLiteral("Headless: record the radio's audio to <base>.before.wav and the chain's output to <base>.after.wav (or the next free names; a rate change continues in _part2)."), QStringLiteral("base"));
     const QCommandLineOption recordOpt(QStringLiteral("record"), QStringLiteral("Headless: record the chain's output from the first audio until exit or --duration, into this folder, named from the time, frequency and mode, or into this .wav file. An existing file is never replaced."), QStringLiteral("folder|file.wav"));
     const QCommandLineOption durationOpt(QStringLiteral("duration"), QStringLiteral("Headless: stop after this many seconds."), QStringLiteral("s"));
@@ -625,7 +625,10 @@ int main(int argc, char** argv)
     }
     if (parser.isSet(bufferOpt)) config.bufferMs = parser.value(bufferOpt).toInt();
     if (parser.isSet(deviceRateOpt)) config.deviceRate = parser.value(deviceRateOpt).toInt();
-    if (parser.isSet(noMuteOpt)) config.muteExpert = false;
+    if (parser.isSet(noMuteOpt)) {
+        config.muteExpert = false;
+        config.usbAfMute = false;
+    }
     if (parser.isSet(rateOpt)) {
         const int rate = parser.value(rateOpt).toInt();
         if (rate != 24000 && rate != 48000) {

@@ -98,6 +98,7 @@ AppConfig Settings::load() const
     c.usbCatPort = s.value(QStringLiteral("radio/usb/cat/port")).toString();
     const int baud = s.value(QStringLiteral("radio/usb/cat/baud"), c.usbCatBaud).toInt();
     if (kCatBauds.contains(baud)) c.usbCatBaud = baud;
+    c.usbAfMute = s.value(QStringLiteral("radio/usb/afMute"), c.usbAfMute).toBool();
     c.host = s.value(QStringLiteral("radio/host"), c.host).toString();
     c.port = s.value(QStringLiteral("radio/port"), c.port).toInt();
     c.receiver = s.value(QStringLiteral("radio/receiver"), c.receiver).toInt();
@@ -138,6 +139,7 @@ void Settings::save(const AppConfig& c)
     s.setValue(QStringLiteral("radio/usb/trimDb"), c.usbTrimDb);
     s.setValue(QStringLiteral("radio/usb/cat/port"), c.usbCatPort);
     s.setValue(QStringLiteral("radio/usb/cat/baud"), c.usbCatBaud);
+    s.setValue(QStringLiteral("radio/usb/afMute"), c.usbAfMute);
     s.setValue(QStringLiteral("radio/host"), c.host);
     s.setValue(QStringLiteral("radio/port"), c.port);
     s.setValue(QStringLiteral("radio/receiver"), c.receiver);
@@ -178,6 +180,7 @@ Settings::MuteOwnership Settings::loadMuteOwnership(const QString& radioHost) co
     MuteOwnership o;
     o.owned = m_settings->value(group + QStringLiteral("/owned"), false).toBool();
     o.priorMuted = m_settings->value(group + QStringLiteral("/priorMuted"), false).toBool();
+    o.priorLevel = m_settings->value(group + QStringLiteral("/priorLevel"), -1).toInt();
     return o;
 }
 
@@ -187,6 +190,8 @@ void Settings::saveMuteOwnership(const QString& radioHost, const MuteOwnership& 
     if (o.owned) {
         m_settings->setValue(group + QStringLiteral("/owned"), true);
         m_settings->setValue(group + QStringLiteral("/priorMuted"), o.priorMuted);
+        if (o.priorLevel >= 0) m_settings->setValue(group + QStringLiteral("/priorLevel"), o.priorLevel);
+        else m_settings->remove(group + QStringLiteral("/priorLevel"));
     } else {
         m_settings->remove(group);  // nothing owed: leave no trace of every radio ever used
     }

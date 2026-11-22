@@ -367,10 +367,16 @@ private slots:
             old.setValue(QStringLiteral("radio/host"), QStringLiteral("192.0.2.5"));
         }
         QCOMPARE(Settings(path).load().radioKind, QStringLiteral("tci"));
+        QCOMPARE(Settings(path).load().usbCatPort, QString());
+        QCOMPARE(Settings(path).load().usbCatBaud, 115200);
+        QVERIFY(!Settings(path).load().usbAfMute);
 
         AppConfig config = usbConfig();
         config.usbTrimDb = -4.5;
         config.receiver = 1;
+        config.usbCatPort = QStringLiteral("cu.usbserial-TEST");
+        config.usbCatBaud = 38400;
+        config.usbAfMute = true;
         Settings(path).save(config);
         const AppConfig back = Settings(path).load();
         QCOMPARE(back.radioKind, QStringLiteral("usb"));
@@ -379,6 +385,16 @@ private slots:
         QCOMPARE(back.usbTrimDb, -4.5);
         QCOMPARE(back.receiver, 1);
         QCOMPARE(back.host, QStringLiteral("192.0.2.1"));
+        QCOMPARE(back.usbCatPort, QStringLiteral("cu.usbserial-TEST"));
+        QCOMPARE(back.usbCatBaud, 38400);
+        QVERIFY(back.usbAfMute);
+
+        // A level owed back is kept with its record, and gone with it.
+        Settings(path).saveMuteOwnership(QStringLiteral("usb:ts990s:cu.usbserial-TEST"), {true, false, 87});
+        QCOMPARE(Settings(path).loadMuteOwnership(QStringLiteral("usb:ts990s:cu.usbserial-TEST")).priorLevel, 87);
+        QCOMPARE(Settings(path).loadMuteOwnership(QStringLiteral("usb:ts990s:cu.usbserial-OTHER")).owned, false);
+        Settings(path).saveMuteOwnership(QStringLiteral("usb:ts990s:cu.usbserial-TEST"), {});
+        QCOMPARE(Settings(path).loadMuteOwnership(QStringLiteral("usb:ts990s:cu.usbserial-TEST")).priorLevel, -1);
 
         // What a damaged or hand-edited file may hold.
         {
@@ -386,11 +402,13 @@ private slots:
             edited.setValue(QStringLiteral("radio/kind"), QStringLiteral("carrier-pigeon"));
             edited.setValue(QStringLiteral("radio/usb/model"), QStringLiteral("ts-9999"));
             edited.setValue(QStringLiteral("radio/usb/trimDb"), QStringLiteral("nan"));
+            edited.setValue(QStringLiteral("radio/usb/cat/baud"), 12345);
         }
         const AppConfig edited = Settings(path).load();
         QCOMPARE(edited.radioKind, QStringLiteral("tci"));
         QCOMPARE(edited.usbModel, QStringLiteral("generic"));
         QCOMPARE(edited.usbTrimDb, 0.0);
+        QCOMPARE(edited.usbCatBaud, 115200);
     }
 
     void theTs990sIsKnown()

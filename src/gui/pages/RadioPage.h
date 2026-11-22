@@ -52,6 +52,8 @@ private:
     QWidget* buildUsb();
     QWidget* buildLevel();
     QWidget* buildMute();
+    QWidget* buildAfMute();
+    void showAfNote();
     void onConnectToggled(bool on);
     // Which sections show, from the radio chosen.
     void showKind();
@@ -64,6 +66,7 @@ private:
     QWidget* m_tciBox{nullptr};
     QWidget* m_usbBox{nullptr};
     QWidget* m_muteBox{nullptr};
+    QWidget* m_afBox{nullptr};  // a USB radio's AF, turned down while this app plays
     QComboBox* m_usbInput{nullptr};
     QComboBox* m_usbReceiver{nullptr};
     QDoubleSpinBox* m_usbTrim{nullptr};
@@ -89,6 +92,10 @@ private:
     QTimer* m_levelTimer{nullptr};
     QCheckBox* m_muteExpert{nullptr};
     QLabel* m_muteStatus{nullptr};
+    QCheckBox* m_afMute{nullptr};
+    QLabel* m_afNote{nullptr};
+    QLabel* m_afStatus{nullptr};
+    QPushButton* m_afRestore{nullptr};
 };
 
 } // namespace esa

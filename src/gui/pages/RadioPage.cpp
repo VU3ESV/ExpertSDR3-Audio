@@ -91,6 +91,7 @@ RadioPage::RadioPage(PageContext& ctx)
     column->addWidget(m_usbBox = buildUsb());
     column->addWidget(buildLevel());
     column->addWidget(m_muteBox = buildMute());
+    column->addWidget(m_afBox = buildAfMute());
     column->addStretch(1);
 
     auto* layout = new QVBoxLayout(this);
@@ -219,6 +220,7 @@ QWidget* RadioPage::buildUsb()
     connect(m_catPort, &QComboBox::currentIndexChanged, this, [this](int index) {
         config().usbCatPort = m_catPort->itemData(index).toString();
         m_catLabel->clear();
+        showAfNote();
     });
     connect(m_catBaud, &QComboBox::currentIndexChanged, this,
             [this](int index) { config().usbCatBaud = m_catBaud->itemData(index).toInt(); });
@@ -260,9 +262,15 @@ void RadioPage::showKind()
     m_muteBox->setVisible(!usb);
     m_inputMeter->setToolTip(usb ? QStringLiteral("The level of the radio's USB audio, before any processing.")
                                  : QStringLiteral("The level of the audio arriving from ExpertSDR3, before any processing."));
-    const bool cat = usb && usb::model(config().usbModel).hasCat();
+    const UsbModel& model = usb::model(config().usbModel);
+    const bool cat = usb && model.hasCat();
     for (QWidget* widget : std::as_const(m_catWidgets)) widget->setVisible(cat);
     if (!cat) config().usbCatPort.clear();  // a model with no CAT is never sent anything
+    m_afBox->setVisible(cat && model.afMute);
+    if (cat && model.afMute) {
+        m_afMute->setText(QStringLiteral("Turn the %1's AF down while this app is playing").arg(model.name));
+        showAfNote();
+    }
     if (usb) {
         m_usbSetup->setText(colored(QStringLiteral("color.text.label"), usb::model(config().usbModel).setup));
         fillUsbReceivers();
@@ -453,6 +461,50 @@ QWidget* RadioPage::buildMute()
     return box;
 }
 
+QWidget* RadioPage::buildAfMute()
+{
+    QGridLayout* grid = nullptr;
+    QFrame* box = section(QStringLiteral("THE RADIO'S SPEAKER"), &grid);
+    m_afMute = new QCheckBox;  // named for the radio in showKind()
+    m_afMute->setObjectName(QStringLiteral("usbAfMute"));
+    m_afMute->setChecked(config().usbAfMute);
+    m_afMute->setToolTip(QStringLiteral(
+        "The main receiver's AF only. It goes back to where it was when you disconnect or quit, and "
+        "turning the AF knob yourself hands it back to you."));
+    m_afNote = hintLabel();
+    m_afNote->setWordWrap(true);
+    m_afStatus = hintLabel();
+    m_afStatus->setObjectName(QStringLiteral("usbAfStatus"));
+    m_afStatus->hide();  // until there is something to say
+    m_afRestore = new QPushButton(QStringLiteral("Restore radio volume now"));
+    m_afRestore->setObjectName(QStringLiteral("usbAfRestore"));
+    m_afRestore->setToolTip(QStringLiteral("Gives the radio its AF back now, and stops turning it down."));
+    m_afRestore->hide();
+    grid->addWidget(m_afMute, 1, 0, 1, 2);
+    grid->addWidget(m_afNote, 2, 0, 1, 2);
+    grid->addWidget(m_afStatus, 3, 0);
+    grid->addWidget(m_afRestore, 3, 1, Qt::AlignRight);
+    grid->setColumnStretch(0, 1);
+    connect(m_afMute, &QCheckBox::toggled, this, [this](bool on) {
+        config().usbAfMute = on;
+        context().post([on](Engine* engine) { engine->setUsbAfMute(on); });
+    });
+    connect(m_afRestore, &QPushButton::clicked, m_afMute, [this] { m_afMute->setChecked(false); });
+    return box;
+}
+
+void RadioPage::showAfNote()
+{
+    const UsbModel& model = usb::model(config().usbModel);
+    QStringList lines;
+    if (config().usbCatPort.isEmpty()) lines << QStringLiteral("Needs the CAT port above: the AF is set over it.");
+    if (!model.afMuteVerified) {
+        lines << QStringLiteral("Not yet bench-tested on a real %1: watch its AF the first time.").arg(model.name);
+    }
+    m_afNote->setText(colored(QStringLiteral("color.text.label"), lines.join(QStringLiteral("<br>"))));
+    m_afNote->setVisible(!lines.isEmpty());
+}
+
 void RadioPage::showEvent(QShowEvent* event)
 {
     Page::showEvent(event);
@@ -558,9 +610,14 @@ void RadioPage::showStatus(const EngineStatus& s)
         m_receiver->setCurrentIndex(std::max(0, m_receiver->findData(s.receiver)));
     }
 
+    const bool usb = s.radioKind == QLatin1String("usb");
+    QLabel* muteLabel = usb ? m_afStatus : m_muteStatus;
     const QString mute = statusText::mute(s);
-    if (mute != m_muteStatus->text()) m_muteStatus->setText(mute);
-    m_muteStatus->setVisible(!mute.isEmpty());
+    if (mute != muteLabel->text()) muteLabel->setText(mute);
+    muteLabel->setVisible(!mute.isEmpty());
+    // While the radio's AF is down on this app's account, it can be given back at once.
+    const bool down = s.mutePhase == MuteController::Phase::Holding || s.mutePhase == MuteController::Phase::Engaging;
+    m_afRestore->setVisible(usb && down && s.mutePriorLevel > 0 && m_afMute->isChecked());
 }
 
 } // namespace esa

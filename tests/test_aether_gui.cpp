@@ -1734,9 +1734,26 @@ private slots:
         baud->setCurrentIndex(baud->findData(38400));
         QCOMPARE(m_window->config().usbCatBaud, 38400);
 
+        // Its AF, turned down while this app plays: off until chosen, and said to need CAT.
+        auto* afMute = page->findChild<QCheckBox*>(QStringLiteral("usbAfMute"));
+        QVERIFY(afMute && afMute->isVisibleTo(page));
+        QVERIFY(!afMute->isChecked());
+        QVERIFY(afMute->text().contains(QLatin1String("TS-990S's AF")));
+        bool needsCat = false;
+        for (QLabel* note : afMute->parentWidget()->findChildren<QLabel*>()) {
+            if (note->text().contains(QLatin1String("Needs the CAT port"))) needsCat = note->isVisibleTo(page);
+        }
+        QVERIFY(needsCat);
+        afMute->setChecked(true);
+        QVERIFY(m_window->config().usbAfMute);
+        afMute->setChecked(false);
+        QVERIFY(!m_window->config().usbAfMute);
+        QVERIFY(!page->findChild<QPushButton*>(QStringLiteral("usbAfRestore"))->isVisibleTo(page));
+
         // A radio without CAT has no such section, and is never sent anything.
         kind->setCurrentIndex(kind->findData(QStringLiteral("usb:generic")));
         QVERIFY(!port->isVisibleTo(page));
+        QVERIFY(!afMute->isVisibleTo(page));
         QCOMPARE(m_window->config().usbCatPort, QString());
         kind->setCurrentIndex(kind->findData(QStringLiteral("tci")));
         QVERIFY(!port->isVisibleTo(page));
@@ -1854,6 +1871,21 @@ private slots:
         QCOMPARE(esa::StatusChip::summarize(s, false).text, QStringLiteral("No audio from radio"));
         s.audioFlowing = true;
         QCOMPARE(esa::StatusChip::summarize(s, false).text, QStringLiteral("● TS-990S · Main"));
+
+        // Its speaker is its AF, and the words say so.
+        s.mutePhase = esa::MuteController::Phase::Holding;
+        s.mutePriorLevel = 120;
+        QVERIFY(esa::statusText::mute(s).contains(QLatin1String("TS-990S AF turned down (it was 120)")));
+        s.mutePhase = esa::MuteController::Phase::OperatorOverride;
+        QVERIFY(esa::statusText::mute(s).contains(QLatin1String("You turned the TS-990S's AF up")));
+        s.mutePhase = esa::MuteController::Phase::Failed;
+        QCOMPARE(esa::StatusChip::summarize(s, false).text, QStringLiteral("TS-990S AF level failed"));
+        for (auto phase : {esa::MuteController::Phase::Holding, esa::MuteController::Phase::Engaging,
+                           esa::MuteController::Phase::Restoring, esa::MuteController::Phase::OperatorOverride,
+                           esa::MuteController::Phase::Failed}) {
+            s.mutePhase = phase;
+            QVERIFY(!esa::statusText::mute(s).contains(QLatin1String("ExpertSDR3")));
+        }
     }
 
     void theDeviceListRefreshAndBufferWorkAsBefore()

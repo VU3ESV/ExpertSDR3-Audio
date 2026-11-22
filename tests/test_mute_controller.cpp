@@ -18,8 +18,8 @@ struct Harness {
 
     explicit Harness(MuteController::Ownership restored = {})
         : persisted(restored),
-          controller({[this](bool muted) { sent.push_back(muted); },
-                      [this](const MuteController::Ownership& o) { persisted = o; }},
+          controller({.sendMute = [this](bool muted) { sent.push_back(muted); },
+                      .persist = [this](const MuteController::Ownership& o) { persisted = o; }},
                      restored) {}
 
     void connectWithServerMuted(bool muted)
@@ -29,6 +29,33 @@ struct Harness {
     }
     void wanted(bool value) { controller.setWanted(value, now); }
     void server(bool muted) { controller.onServerMute(muted, now); }
+    void advance(qint64 ms)
+    {
+        now += ms;
+        controller.tick(now);
+    }
+};
+
+// The same against a speaker that is a level, as the TS-990S's AF is: 0 is muted.
+struct LevelHarness {
+    std::vector<int> sent;
+    MuteController::Ownership persisted;
+    MuteController controller;
+    qint64 now{1000};
+
+    explicit LevelHarness(MuteController::Ownership restored = {})
+        : persisted(restored),
+          controller({.sendLevel = [this](int level) { sent.push_back(level); },
+                      .persist = [this](const MuteController::Ownership& o) { persisted = o; }},
+                     restored) {}
+
+    void connectAt(int level)
+    {
+        controller.onConnected();
+        controller.onServerLevel(level, now);
+    }
+    void wanted(bool value) { controller.setWanted(value, now); }
+    void level(int value) { controller.onServerLevel(value, now); }
     void advance(qint64 ms)
     {
         now += ms;
@@ -306,6 +333,226 @@ private slots:
         h.controller.onDisconnected();
         h.advance(10 * MuteController::kRetryMs);
         QCOMPARE(h.sent.size(), size_t(1));
+    }
+
+    // ── A speaker that is a level ────────────────────────────────────────────
+
+    // AF goes to 0 while this app plays and back to exactly where it was, at any level.
+    void aLevelIsTurnedDownAndGivenBackExactly()
+    {
+        for (int prior = 1; prior <= 255; ++prior) {
+            LevelHarness h;
+            h.connectAt(prior);
+            h.wanted(true);
+            QCOMPARE(h.sent, (std::vector<int>{0}));
+            QCOMPARE(h.controller.phase(), Phase::Engaging);
+            // Owned, with the level to give back, before anything was sent: a crash now is safe.
+            QVERIFY(h.persisted.owned);
+            QCOMPARE(h.persisted.priorLevel, prior);
+            h.level(0);
+            QCOMPARE(h.controller.phase(), Phase::Holding);
+            h.wanted(false);
+            QCOMPARE(h.sent, (std::vector<int>{0, prior}));
+            QCOMPARE(h.controller.phase(), Phase::Restoring);
+            h.level(prior);
+            QCOMPARE(h.controller.phase(), Phase::Idle);
+            QVERIFY(!h.persisted.owned);
+            QVERIFY(h.controller.settled());
+        }
+    }
+
+    // Nothing is sent before the level has been read on this connection.
+    void nothingIsSentBeforeALevelIsRead()
+    {
+        LevelHarness h;
+        h.wanted(true);
+        h.controller.onConnected();
+        h.advance(1000);
+        QVERIFY(h.sent.empty());
+        QCOMPARE(h.controller.phase(), Phase::Idle);
+        h.level(120);
+        QCOMPARE(h.sent, (std::vector<int>{0}));
+    }
+
+    // The AF was already down: it is the operator's, and stays down.
+    void aLevelAlreadyAtZeroIsLeftThere()
+    {
+        LevelHarness h;
+        h.connectAt(0);
+        h.wanted(true);
+        QVERIFY(h.sent.empty());
+        QCOMPARE(h.controller.phase(), Phase::Holding);
+        QVERIFY(!h.persisted.owned);
+        h.wanted(false);
+        QVERIFY(h.sent.empty());
+        QCOMPARE(h.controller.phase(), Phase::Idle);
+    }
+
+    // The operator turns the knob up while it is held: hands off, and nothing is owed.
+    void turningTheKnobUpHandsItBack()
+    {
+        LevelHarness h;
+        h.connectAt(120);
+        h.wanted(true);
+        h.level(0);
+        QCOMPARE(h.controller.phase(), Phase::Holding);
+        h.level(40);
+        QCOMPARE(h.controller.phase(), Phase::OperatorOverride);
+        QVERIFY(!h.persisted.owned);
+        h.advance(5000);
+        h.level(0);  // and down again: still theirs
+        h.wanted(false);
+        QCOMPARE(h.sent, (std::vector<int>{0}));
+    }
+
+    // A crash while it was down: the next connection gives the level back, from the record.
+    void aCrashWhileDownIsRestoredFromTheRecord()
+    {
+        LevelHarness h(MuteController::Ownership{true, false, 120});
+        h.connectAt(0);
+        QCOMPARE(h.sent, (std::vector<int>{120}));
+        QCOMPARE(h.controller.phase(), Phase::Restoring);
+        h.level(120);
+        QCOMPARE(h.controller.phase(), Phase::Idle);
+        QVERIFY(!h.persisted.owned);
+    }
+
+    // A crash, and the operator turned it up before this app came back: nothing is restored,
+    // nor is their level touched.
+    void aCrashAndTheKnobTurnedSinceIsLeftAlone()
+    {
+        LevelHarness h(MuteController::Ownership{true, false, 120});
+        h.connectAt(60);
+        QVERIFY(h.sent.empty());
+        QVERIFY(!h.persisted.owned);
+        QCOMPARE(h.controller.phase(), Phase::Idle);
+    }
+
+    // A crash while down, and this app plays again at once: it holds, and still owes 120.
+    void aCrashWhileDownAndPlayingAgainKeepsTheRecord()
+    {
+        LevelHarness h(MuteController::Ownership{true, false, 120});
+        h.wanted(true);
+        h.connectAt(0);
+        QVERIFY(h.sent.empty());
+        QCOMPARE(h.controller.phase(), Phase::Holding);
+        QCOMPARE(h.persisted.priorLevel, 120);
+        h.wanted(false);
+        QCOMPARE(h.sent, (std::vector<int>{120}));
+    }
+
+    // Played again while the restore is on its way: the stale 0 is never taken as the level to
+    // give back.
+    void reArmingMidRestoreKeepsThePriorLevel()
+    {
+        LevelHarness h;
+        h.connectAt(120);
+        h.wanted(true);
+        h.level(0);
+        h.wanted(false);
+        QCOMPARE(h.controller.phase(), Phase::Restoring);
+        h.wanted(true);
+        QCOMPARE(h.persisted.priorLevel, 120);
+        h.level(120);  // the restore landed
+        h.advance(MuteController::kRetryMs);
+        h.level(0);
+        QCOMPARE(h.controller.phase(), Phase::Holding);
+        h.wanted(false);
+        QCOMPARE(h.sent.back(), 120);
+    }
+
+    // A set the radio never takes is retried a bounded number of times, then given up. The
+    // record stays: the sets may have landed unseen. A later reading above 0 clears it, and
+    // nothing is sent.
+    void aLevelTheRadioNeverTakesIsGivenUp()
+    {
+        LevelHarness h;
+        h.connectAt(120);
+        h.wanted(true);
+        for (int i = 0; i < MuteController::kMaxAttempts + 3; ++i) {
+            h.level(120);
+            h.advance(MuteController::kRetryMs);
+        }
+        QCOMPARE(h.controller.phase(), Phase::Failed);
+        QCOMPARE(int(h.sent.size()), MuteController::kMaxAttempts);
+        QVERIFY(h.persisted.owned);
+        QCOMPARE(h.persisted.priorLevel, 120);
+        h.wanted(false);
+        h.level(120);
+        QVERIFY(!h.persisted.owned);
+        QCOMPARE(int(h.sent.size()), MuteController::kMaxAttempts);
+        QCOMPARE(h.controller.phase(), Phase::Idle);
+    }
+
+    // The same, but the sets did land and were never seen: the next reading of 0 gives it back.
+    void aFailedEngageThatLandedIsGivenBack()
+    {
+        LevelHarness h;
+        h.connectAt(120);
+        h.wanted(true);
+        for (int i = 0; i < MuteController::kMaxAttempts + 3; ++i) h.advance(MuteController::kRetryMs);
+        QCOMPARE(h.controller.phase(), Phase::Failed);
+        h.wanted(false);
+        h.level(0);
+        QCOMPARE(h.sent.back(), 120);
+        QCOMPARE(h.controller.phase(), Phase::Restoring);
+        h.level(120);
+        QVERIFY(!h.persisted.owned);
+    }
+
+    // The knob turned up is the operator's decision until they choose the feature again: this
+    // app's audio stopping and starting again is not that.
+    void anOverrideHoldsUntilRearmed()
+    {
+        LevelHarness h;
+        h.connectAt(120);
+        h.wanted(true);
+        h.level(0);
+        h.level(40);
+        QCOMPARE(h.controller.phase(), Phase::OperatorOverride);
+        h.wanted(false);
+        h.wanted(true);
+        h.level(40);
+        h.advance(5000);
+        QCOMPARE(h.controller.phase(), Phase::OperatorOverride);
+        QCOMPARE(h.sent, (std::vector<int>{0}));
+        h.controller.rearm(h.now);
+        QCOMPARE(h.sent, (std::vector<int>{0, 0}));
+        QCOMPARE(h.persisted.priorLevel, 40);  // their level now, to give back
+        h.level(0);
+        h.wanted(false);
+        QCOMPARE(h.sent.back(), 40);
+    }
+
+    // A switch's override still ends when it is no longer wanted, as it always has.
+    void aSwitchOverrideStillEndsWhenNotWanted()
+    {
+        Harness h;
+        h.connectWithServerMuted(false);
+        h.wanted(true);
+        h.server(true);
+        h.server(false);
+        QCOMPARE(h.controller.phase(), Phase::OperatorOverride);
+        h.wanted(false);
+        QCOMPARE(h.controller.phase(), Phase::Idle);
+        h.controller.rearm(h.now);  // nothing to re-arm
+        QCOMPARE(h.controller.phase(), Phase::Idle);
+    }
+
+    // The link drops while it is down: the record stays, and the next link carries on.
+    void aLostLinkKeepsWhatIsOwed()
+    {
+        LevelHarness h;
+        h.connectAt(120);
+        h.wanted(true);
+        h.level(0);
+        h.controller.onDisconnected();
+        QCOMPARE(h.controller.phase(), Phase::Idle);
+        QVERIFY(h.persisted.owned);
+        h.wanted(false);
+        QCOMPARE(h.sent, (std::vector<int>{0}));  // nothing can be sent without the link
+        h.connectAt(0);
+        QCOMPARE(h.sent, (std::vector<int>{0, 120}));
     }
 };
 

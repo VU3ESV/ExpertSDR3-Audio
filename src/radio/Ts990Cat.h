@@ -54,10 +54,16 @@ public:
     QString port() const { return m_portName; }
     const Band& band(int receiver) const;
 
+    // Reads the main receiver's AF level on every poll, for turning the speaker down. Set
+    // before open().
+    void setReadsAfLevel(bool on) { m_readAf = on; }
     // The main receiver's AF level, 0 to 255: read, and set then read back.
     void readAfLevel();
     void setAfLevel(int level);
     bool afKnown() const { return m_afLevel >= 0; }
+    // Closing: a level set that is queued and not yet sent goes out now, if it gives the speaker
+    // back (above 0). A pending 0 is dropped.
+    void flushPendingLevel();
     int afLevel() const { return m_afLevel; }
 
     // Whether this exact command may be sent to the radio.
@@ -91,6 +97,7 @@ private:
     void enqueue(const QByteArray& command, const QByteArray& answer, int readBackOf = -1);
     void idUnanswered();
     void sendNext();
+    void writeCommand(const QByteArray& command);
     void onReadyRead();
     void onReply(const QByteArray& reply);
     void onTimeout();
@@ -109,6 +116,7 @@ private:
     QString m_portName;
     int m_baud{0};
     bool m_identifyOnly{false};
+    bool m_readAf{false};
     bool m_wantOpen{false};
 
     QList<Request> m_queue;

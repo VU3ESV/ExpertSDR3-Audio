@@ -155,7 +155,7 @@ void Ts990Cat::setState(State state)
 
 void Ts990Cat::tryOpen()
 {
-    if (!m_wantOpen) return;
+    if (!m_wantOpen || m_state == State::Ready) return;  // a late ID022 got there first
     if (m_portName.isEmpty()) {
         m_lastError = QStringLiteral("No CAT port chosen");
         return;
@@ -221,6 +221,14 @@ void Ts990Cat::enqueue(const QByteArray& command, const QByteArray& answer, int 
         qCCritical(lcCat) << "Refused to send" << command << "while only identifying the radio";
         return;
     }
+    // A newer set replaces one not yet sent, with its read-back: queued sets can never undo
+    // each other, so a restore cannot be followed by a stale 0.
+    if (answer.isEmpty()) {
+        const qsizetype sent = m_waiting ? 1 : 0;  // the request out on the wire stays
+        for (qsizetype i = m_queue.size() - 1; i >= sent; --i) {
+            if (m_queue.at(i).answer.isEmpty() || m_queue.at(i).readBackOf >= 0) m_queue.removeAt(i);
+        }
+    }
     // A read already waiting in the queue is not asked for twice, unless a set lies between:
     // then the later read answers a different question.
     if (!answer.isEmpty() && readBackOf < 0) {
@@ -236,16 +244,27 @@ void Ts990Cat::enqueue(const QByteArray& command, const QByteArray& answer, int 
 void Ts990Cat::sendNext()
 {
     while (!m_waiting && !m_queue.isEmpty() && m_transport && m_transport->isOpen()) {
-        const Request& next = m_queue.first();
-        trace('>', next.command);
-        m_transport->write(next.command);
+        // A copy, and the bookkeeping done first: writing can lose the port, which empties the queue.
+        const Request next = m_queue.first();
         if (next.answer.isEmpty()) {
             m_queue.removeFirst();  // nothing comes back for a set
-            continue;
+        } else {
+            m_waiting = true;
+            m_reply.start();
         }
-        m_waiting = true;
-        m_reply.start();
+        writeCommand(next.command);
     }
+}
+
+void Ts990Cat::writeCommand(const QByteArray& command)
+{
+    // The one place bytes reach the radio, and the allowlist checked again here.
+    if (!allowed(command) || (m_identifyOnly && command != "ID;")) {
+        qCCritical(lcCat) << "Refused to write a command outside the allowlist:" << command;
+        return;
+    }
+    trace('>', command);
+    m_transport->write(command);
 }
 
 void Ts990Cat::onReadyRead()
@@ -287,6 +306,7 @@ void Ts990Cat::onReply(const QByteArray& reply)
         if (id == kTs990Id) {
             if (m_state == State::Identifying) {
                 m_lastError.clear();
+                m_retry.stop();
                 setState(State::Ready);
                 if (!m_identifyOnly) {
                     poll();
@@ -356,6 +376,19 @@ void Ts990Cat::onTimeout()
     sendNext();
 }
 
+void Ts990Cat::flushPendingLevel()
+{
+    if (!m_transport || !m_transport->isOpen()) return;
+    for (qsizetype i = m_queue.size() - 1; i >= 0; --i) {
+        const Request& r = m_queue.at(i);
+        if (!r.answer.isEmpty() || (m_waiting && i == 0)) continue;
+        const QByteArray command = r.command;  // AG0nnn;
+        m_queue.removeAt(i);
+        if (command.mid(3, 3).toInt() > 0) writeCommand(command);
+        return;  // only ever one set is queued
+    }
+}
+
 void Ts990Cat::idUnanswered()
 {
     if (++m_idTries >= kIdTries) {
@@ -377,6 +410,7 @@ void Ts990Cat::poll()
     enqueue(QByteArrayLiteral("OM0;"), QByteArrayLiteral("OM0"));
     enqueue(QByteArrayLiteral("FB;"), QByteArrayLiteral("FB"));
     enqueue(QByteArrayLiteral("OM1;"), QByteArrayLiteral("OM1"));
+    if (m_readAf) enqueue(QByteArrayLiteral("AG0;"), QByteArrayLiteral("AG0"));
 }
 
 void Ts990Cat::trace(char direction, const QByteArray& bytes)

@@ -13,6 +13,10 @@ It connects over [TCI](https://github.com/ExpertSDR3/TCI), plays through any aud
 the computer, and mutes ExpertSDR3's own audio while it plays so you don't hear both. It can
 also record what the chain makes of the radio's audio, and play it back.
 
+It can also take the audio from a radio's own USB audio, without ExpertSDR3. For now that is
+the **Kenwood TS-990S**, experimental and tested on one radio: see
+[A USB radio: the Kenwood TS-990S](#a-usb-radio-the-kenwood-ts-990s).
+
 ![The main window on its EQ page, with a radio connected](docs/screenshot.png)
 
 ## Install
@@ -244,6 +248,61 @@ disconnect or quit.
 Final Output's **MUTE** is separate: it silences this app and leaves ExpertSDR3 as it is.
 [docs/TCI-NOTES.md](docs/TCI-NOTES.md) has the protocol behaviour behind this.
 
+## A USB radio: the Kenwood TS-990S
+
+This is experimental, and so far tested on one TS-990S on a Mac. The app listens to the
+radio's own USB audio, and reads its frequency and mode over the same USB cable. ExpertSDR3
+is not involved.
+
+**On the radio:**
+
+- The USB audio level is set by the radio's USB audio output menus (0-07-08 and 0-07-09). The
+  AF knob does not change it.
+- **Received audio only** (menu 0-07-14) keeps the radio's beeps and sidetone out of what you
+  hear through the app.
+- **Normal** USB audio output (menu 0-07-16) puts the main receiver on the left channel and
+  the sub receiver on the right. The app expects that.
+- The USB baud rate (menu 0-07-01) must match the app's **Baud**, which is 115200 unless you
+  change it.
+- The first time you use CAT, turn **TX Inhibit** on (menu 0-06-03). Then check that none of
+  the radio's USB port settings let DTR or RTS key it. The app drops both lines as it opens the
+  port, but the computer may raise them for a moment first.
+
+**In the app:**
+
+1. On the **Radio** page, choose **Kenwood TS-990S (USB)**. The first time on a Mac, allow
+   microphone access when asked: macOS asks for any audio input, and this one is the radio's.
+2. **Input**: "USB Audio CODEC". **Receiver**: Main or Sub.
+3. **CAT**: the radio's port. It is a CP2102 (10C4:EA60), shown on a Mac as
+   `cu.usbserial-<serial>` or `cu.SLAB_USBtoUART`. No port is chosen for you, because other
+   ports may belong to an amplifier, a GPS or a panel. **Test** asks the radio who it is and
+   sends nothing else.
+4. **Connect**. With CAT, the frequency and mode follow the radio, and recordings are named by
+   them. CW and data modes skip NR, as they do with ExpertSDR3. Without CAT you get the audio
+   only.
+
+**What the app sends the radio.** The code allows only these, and checks them in one place:
+
+- Reads: `ID;`, `FA;`, `FB;`, `OM0;`, `OM1;` and `AG0;`.
+- One write, `AG0nnn;` (the main receiver's AF level), and only with the setting below.
+
+It never sends transmit, menu, power or tuning commands. To check, set `ESA_CAT_TRACE` to a
+file name before starting the app: every byte to and from the radio goes into that file.
+
+**Turn the TS-990S's AF down while this app is playing.** This setting is under THE RADIO'S
+SPEAKER, and is off by default. It does for the main receiver's AF what the ExpertSDR3 mute
+above does:
+
+- It reads the AF level first. Once this app is playing, it sets the AF to 0. When you
+  disconnect or quit, it sets the AF back to exactly the level it read.
+- If you turn the AF knob up yourself, you win. The app lets go, and leaves the AF alone until
+  you connect again or switch the setting off and on.
+- If the AF was already at 0, it stays at 0.
+- If the app crashes while the AF is down, the next connection with CAT knows and gives it back.
+- **Restore radio volume now** gives the AF back at once.
+- The sub receiver's AF is never touched.
+- It has not been bench-tested on a TS-990S yet, so watch the radio's AF the first time.
+
 ## Command line
 
 On a Mac the program is `/Applications/ExpertSDR3Audio.app/Contents/MacOS/ExpertSDR3Audio`.
@@ -257,6 +316,11 @@ ExpertSDR3Audio --list-params   # NR methods, and everything --set can change
 # These connect, so they need ExpertSDR3 running at that address:
 ExpertSDR3Audio --headless --host 192.168.1.20 --port 40001 --device "USB" --nr nr2
 ExpertSDR3Audio --headless --host 192.168.1.20 --device "USB" --record ~/Recordings --duration 3600
+# A USB radio. --list-serial only lists the ports, and opens none:
+ExpertSDR3Audio --list-inputs
+ExpertSDR3Audio --list-serial
+ExpertSDR3Audio --headless --radio usb --usb-model ts990s --input "USB Audio CODEC" \
+    --cat-port cu.usbserial-XXXX --cat-baud 115200 --device "Speakers" --no-mute
 ```
 
 Profiles from a terminal (the last line connects, so it needs a radio too):
@@ -346,6 +410,10 @@ core here, and a Pi core is several times slower, so they may not keep up; the a
 so. Note that `--rate 24000` adds about 150 ms of delay from resampling and does not make
 RN2 any cheaper, because RNNoise always runs at 48 kHz internally. On a small screen, such as
 the 7-inch display, the window opens maximised.
+
+**USB radios.** The Kenwood TS-990S's USB audio has been heard live on a Mac, through the
+chain. Its CAT and the AF setting have so far been tested only against a simulated radio, and
+nothing USB has been tried on Windows or Linux.
 
 **Transceivers.** Testing so far is on a receive-only radio. While transmitting, the chain
 is bypassed and restarts cleanly afterwards, but that has only been tested against a

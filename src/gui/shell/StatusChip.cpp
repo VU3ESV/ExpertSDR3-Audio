@@ -115,6 +115,26 @@ QString radio(const EngineStatus& s)
 QString mute(const EngineStatus& s)
 {
     // Say what is true now, and whether anything needs doing.
+    if (s.radioKind == QLatin1String("usb")) {
+        // A USB radio's speaker is its AF level.
+        const QString radio = s.device.isEmpty() ? QStringLiteral("radio") : s.device;
+        const QString was = s.mutePriorLevel > 0 ? QStringLiteral(" (it was %1)").arg(s.mutePriorLevel) : QString();
+        switch (s.mutePhase) {
+        case MuteController::Phase::Holding:
+            return colored(kSuccess, QStringLiteral("%1 AF turned down%2").arg(radio, was));
+        case MuteController::Phase::Engaging:
+            return colored(kWarning, QStringLiteral("Turning the %1's AF down...").arg(radio));
+        case MuteController::Phase::Restoring:
+            return colored(kWarning, QStringLiteral("Giving the %1's AF back...").arg(radio));
+        case MuteController::Phase::OperatorOverride:
+            return colored(kWarning, QStringLiteral("You turned the %1's AF up; leaving it alone").arg(radio));
+        case MuteController::Phase::Failed:
+            return colored(kDanger, QStringLiteral("The %1 did not take its AF level%2").arg(radio, was));
+        case MuteController::Phase::Idle:
+            break;
+        }
+        return QString();
+    }
     switch (s.mutePhase) {
     case MuteController::Phase::Holding:
         return colored(kSuccess, QStringLiteral("ExpertSDR3 muted"));
@@ -189,7 +209,9 @@ StatusChip::Summary StatusChip::summarize(const EngineStatus& s, bool recordingF
         return {QStringLiteral("Output: %1").arg(s.outputError), QStringLiteral("danger"), QStringLiteral("output")};
     }
     if (s.mutePhase == MuteController::Phase::Failed) {
-        return {QStringLiteral("ExpertSDR3 mute failed"), QStringLiteral("danger"), radioPage};
+        const QString text = s.radioKind == QLatin1String("usb") ? QStringLiteral("%1 AF level failed").arg(s.device)
+                                                                 : QStringLiteral("ExpertSDR3 mute failed");
+        return {text, QStringLiteral("danger"), radioPage};
     }
     if (s.dspLoad > 0.85) return {QStringLiteral("Can't keep up: try NR2"), QStringLiteral("danger"), nrPage};
     if (s.nrFailed) return {QStringLiteral("NR failed: running dry"), QStringLiteral("danger"), nrPage};

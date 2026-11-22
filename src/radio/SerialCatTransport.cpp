@@ -55,7 +55,10 @@ public:
 
     void close() override
     {
-        if (m_port.isOpen()) m_port.close();
+        if (!m_port.isOpen()) return;
+        // A level restore written as the session ends must reach the radio before the port goes.
+        if (m_port.bytesToWrite() > 0) m_port.waitForBytesWritten(200);
+        m_port.close();
     }
 
     bool isOpen() const override { return m_port.isOpen(); }

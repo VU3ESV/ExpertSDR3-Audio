@@ -46,6 +46,7 @@ struct EngineStatus {
     bool transmitting{false};
 
     MuteController::Phase mutePhase{MuteController::Phase::Idle};
+    int mutePriorLevel{-1};  // a level control's level, to go back to, while one is owed
 
     QString nrMethod;         // what the operator selected; empty when off
     bool nrPreparing{false};  // still being built off the audio path
@@ -168,6 +169,8 @@ public slots:
     void setBoost(bool on);
     void setOutputMuted(bool muted);
     void setMuteExpert(bool on);
+    // Turn a USB radio's AF down while this app plays, where its model can.
+    void setUsbAfMute(bool on);
     void setNrAutoBypass(bool on);
     void setNrMethod(const QString& id);
     void setStageOrder(const QStringList& order);
@@ -224,6 +227,7 @@ private slots:
     void onAudioBlock(int receiver, const float* stereo, int frames, int sampleRate);
     void onConnectionState(esa::RadioBackend::Link state);
     void onMuteReported(bool muted);
+    void onSpeakerLink(bool up);
     void onModulationChanged(int receiver, const QString& modulation);
     void onTransmitChanged(int receiver, bool transmitting);
     void onHousekeeping();
@@ -268,6 +272,8 @@ private:
     void startNrBuild();
     // Mute ownership belongs to one radio, so a different radio gets its own controller.
     void prepareMuteFor(const QString& host);
+    // Whose mute this session's is: a TCI host, or a USB radio's model.
+    QString muteKey() const;
     void openSink();
     void closeSink();
     void updateMuteWanted();

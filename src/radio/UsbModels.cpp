@@ -19,6 +19,8 @@ const QList<UsbModel>& models()
         ts990.catId = QStringLiteral("022");
         ts990.catBaud = 115200;
         ts990.bridgeHint = QStringLiteral("10C4:EA60");  // the CP2102 beside its codec
+        ts990.afMute = true;  // AG0: the main receiver's AF, 000 to 255
+        ts990.afMuteVerified = false;  // until the bench test on a real TS-990S passes
         ts990.setup = QStringLiteral(
             "On the TS-990S: USB audio is \"USB Audio CODEC\" in this computer's inputs. Its level is set "
             "by the radio's USB audio output menus, not by AF, so turn AF down to silence the radio's "

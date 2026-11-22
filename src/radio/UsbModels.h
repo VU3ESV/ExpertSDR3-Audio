@@ -22,6 +22,10 @@ struct UsbModel {
     QString catId;          // the radio's answer to ID;, such as "022"
     int catBaud{0};
     QString bridgeHint;     // the USB serial bridge's VID:PID, as a hint for the port list
+    // The main receiver's AF can be read and set over CAT, so its speaker can be turned down
+    // while this app plays. `afMuteVerified` once that has been bench-tested on a real radio.
+    bool afMute{false};
+    bool afMuteVerified{false};
     // Things to set on the radio, shown where the radio is chosen.
     QString setup;
 

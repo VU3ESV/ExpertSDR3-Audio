@@ -192,6 +192,9 @@ void Engine::useBackendFor(const QString& kind)
     m_caps = m_radio->capabilities();
     connect(m_radio, &RadioBackend::stateChanged, this, &Engine::onConnectionState);
     connect(m_radio, &RadioBackend::muteReported, this, &Engine::onMuteReported);
+    connect(m_radio, &RadioBackend::speakerLinkChanged, this, &Engine::onSpeakerLink);
+    connect(m_radio, &RadioBackend::speakerLevelReported, this,
+            [this](int level) { m_mute->onServerLevel(level, nowMs()); });
     connect(m_radio, &RadioBackend::modulationChanged, this, &Engine::onModulationChanged);
     connect(m_radio, &RadioBackend::transmitChanged, this, &Engine::onTransmitChanged);
     connect(m_radio, &RadioBackend::audioBlock, this, &Engine::onAudioBlock);
@@ -199,7 +202,10 @@ void Engine::useBackendFor(const QString& kind)
     connect(m_radio, &RadioBackend::blocksLost, this, [this](quint64 count) { m_droppedBlocks += count; });
     connect(m_radio, &RadioBackend::portResolved, this, &Engine::connectedPortChanged);
     // What a backend reports can change while it runs: a USB radio's CAT answering, or not.
-    connect(m_radio, &RadioBackend::radioChanged, this, [this] { m_caps = m_radio->capabilities(); });
+    connect(m_radio, &RadioBackend::radioChanged, this, [this] {
+        m_caps = m_radio->capabilities();
+        updateMuteWanted();
+    });
 }
 
 void Engine::prepareMuteFor(const QString& host)
@@ -208,12 +214,17 @@ void Engine::prepareMuteFor(const QString& host)
 
     const Settings::MuteOwnership stored = m_settings->loadMuteOwnership(host);
     MuteController::Actions actions;
-    actions.sendMute = [this](bool muted) { m_radio->sendMute(muted); };
+    if (m_radio->kind() == QLatin1String("usb")) {
+        // A USB radio's speaker is its AF level, set over CAT.
+        actions.sendLevel = [this](int level) { m_radio->setSpeakerLevel(level); };
+    } else {
+        actions.sendMute = [this](bool muted) { m_radio->sendMute(muted); };
+    }
     actions.persist = [this, host](const MuteController::Ownership& o) {
-        m_settings->saveMuteOwnership(host, {o.owned, o.priorMuted});
+        m_settings->saveMuteOwnership(host, {o.owned, o.priorMuted, o.priorLevel});
     };
-    m_mute = std::make_unique<MuteController>(std::move(actions),
-                                              MuteController::Ownership{stored.owned, stored.priorMuted});
+    m_mute = std::make_unique<MuteController>(
+        std::move(actions), MuteController::Ownership{stored.owned, stored.priorMuted, stored.priorLevel});
     m_muteHost = host;
 }
 
@@ -787,13 +798,22 @@ void Engine::connectRadio()
     useBackendFor(m_config.radioKind);
     m_lastSoundMs = -1;
     // Mute ownership belongs to one radio. A USB radio's is kept apart from any TCI host's.
-    prepareMuteFor(m_radio->kind() == QLatin1String("usb") ? QStringLiteral("usb:") + m_config.usbModel
-                                                           : m_config.host);
+    prepareMuteFor(muteKey());
+    // A new session is a new choice: an AF knob turned in the last one no longer holds.
+    if (m_radio->kind() == QLatin1String("usb")) m_mute->rearm(nowMs());
     if (!m_chain) rebuildChain(m_config.chainRate);
     openSink();
     requestAudio();
     m_radio->open(m_config);
     emitStatus();
+}
+
+QString Engine::muteKey() const
+{
+    if (m_radio->kind() != QLatin1String("usb")) return m_config.host;
+    // Per model, not per port: one radio can show up under more than one port name (two drivers
+    // on a Mac, a renumbered COM port), and an AF owed back must be found whichever is chosen.
+    return QStringLiteral("usb:") + m_config.usbModel;
 }
 
 void Engine::disconnectRadio()
@@ -807,7 +827,7 @@ void Engine::disconnectRadio()
     updateMuteWanted();
 
     // Give the restore a chance to land before the socket closes.
-    if (!m_mute->settled() && m_radio->state() == RadioBackend::Link::Ready) {
+    if (!m_mute->settled() && m_radio->speakerLinkUp()) {
         m_closing = true;
         m_closeDeadlineMs = nowMs() + kShutdownWaitMs;
         m_closeTimer.start();
@@ -820,8 +840,7 @@ void Engine::disconnectRadio()
 void Engine::continueClosing()
 {
     m_mute->tick(nowMs());
-    if (m_mute->settled() || nowMs() >= m_closeDeadlineMs
-        || m_radio->state() != RadioBackend::Link::Ready) {
+    if (m_mute->settled() || nowMs() >= m_closeDeadlineMs || !m_radio->speakerLinkUp()) {
         finishClosing();
     }
 }
@@ -902,11 +921,16 @@ void Engine::requestAudio()
 
 void Engine::onConnectionState(RadioBackend::Link state)
 {
+    // A USB radio's audio link carries neither its speaker nor its mode: both are on its CAT
+    // link, which reports them itself (onSpeakerLink, onModulationChanged).
+    const bool linkCarriesAll = m_radio->kind() != QLatin1String("usb");
     if (state == RadioBackend::Link::Initializing) {
-        m_mute->onConnected();
+        if (linkCarriesAll) m_mute->onConnected();
     } else if (state == RadioBackend::Link::Connecting || state == RadioBackend::Link::Disconnected) {
-        m_mute->onDisconnected();
-        m_modulation.clear();
+        if (linkCarriesAll) {
+            m_mute->onDisconnected();
+            m_modulation.clear();
+        }
     } else if (state == RadioBackend::Link::Ready) {
         // Whatever arrives on this new connection is a fresh stream.
         if (m_chain) m_chain->reset();
@@ -920,6 +944,17 @@ void Engine::onConnectionState(RadioBackend::Link state)
 void Engine::onMuteReported(bool muted)
 {
     m_mute->onServerMute(muted, nowMs());
+}
+
+void Engine::onSpeakerLink(bool up)
+{
+    // The level is unknown until the radio is read again on this link, so nothing is sent before.
+    if (up) {
+        m_mute->onConnected();
+    } else {
+        m_mute->onDisconnected();
+    }
+    emitStatus();
 }
 
 void Engine::onModulationChanged(int receiver, const QString& modulation)
@@ -1035,13 +1070,21 @@ void Engine::setMuteExpert(bool on)
     updateMuteWanted();
 }
 
+void Engine::setUsbAfMute(bool on)
+{
+    m_config.usbAfMute = on;
+    if (on) m_mute->rearm(nowMs());  // chosen again: the operator's override is over
+    updateMuteWanted();
+}
+
 void Engine::updateMuteWanted()
 {
     // Only silence ExpertSDR3 once this app is demonstrably producing sound.
     // m_audioConfirmed latches across a reconnect, so a network blip does not
     // briefly unmute ExpertSDR3 and let both programs play at once.
-    const bool wanted = m_caps.speaker != RadioBackend::SpeakerControl::None && m_config.muteExpert
-                        && m_sessionActive && m_sink && m_sink->alive() && m_audioConfirmed;
+    const bool asked = m_radio->kind() == QLatin1String("usb") ? m_config.usbAfMute : m_config.muteExpert;
+    const bool wanted = m_caps.speaker != RadioBackend::SpeakerControl::None && asked && m_sessionActive && m_sink
+                        && m_sink->alive() && m_audioConfirmed;
     m_mute->setWanted(wanted, nowMs());
 }
 
@@ -1226,6 +1269,7 @@ void Engine::emitStatus()
     s.transmitting = rx.transmitting;
 
     s.mutePhase = m_mute->phase();
+    s.mutePriorLevel = m_mute->ownership().owned ? m_mute->ownership().priorLevel : -1;
 
     s.nrMethod = m_config.nrMethod;
     s.nrPreparing = m_nrPreparing;
