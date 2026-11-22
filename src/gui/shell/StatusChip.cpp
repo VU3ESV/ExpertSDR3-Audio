@@ -44,20 +44,20 @@ QString radio(const EngineStatus& s)
 {
     QString radio;
     switch (s.connection) {
-    case TciClient::State::Disconnected:
+    case RadioBackend::Link::Disconnected:
         radio = colored(kLabel, QStringLiteral("Not connected"));
         break;
-    case TciClient::State::Connecting: {
+    case RadioBackend::Link::Connecting: {
         radio = colored(kWarning, QStringLiteral("Looking for ExpertSDR3 on port %1...").arg(s.connectedPort));
         if (!s.connectionError.isEmpty()) {
             radio += QStringLiteral(" ") + colored(kLabel, QStringLiteral("(is TCI enabled in its options?)"));
         }
         break;
     }
-    case TciClient::State::Initializing:
+    case RadioBackend::Link::Initializing:
         radio = colored(kWarning, QStringLiteral("Connected, reading radio state..."));
         break;
-    case TciClient::State::Ready: {
+    case RadioBackend::Link::Ready: {
         QString line = QStringLiteral("%1 %2  ·  %3").arg(s.serverName, s.serverVersion, s.device);
         if (s.frequencyHz > 0) {
             line += QStringLiteral("  ·  %1 %2").arg(formatFrequency(s.frequencyHz), s.modulation);
@@ -170,12 +170,12 @@ StatusChip::Summary StatusChip::summarize(const EngineStatus& s, bool recordingF
     // this session's any more: the radio is going, not silent.
     if (s.disconnecting) return {QStringLiteral("Disconnecting…"), QStringLiteral("warning"), radioPage};
     switch (s.connection) {
-    case TciClient::State::Disconnected:
+    case RadioBackend::Link::Disconnected:
         return {QStringLiteral("Not connected"), QStringLiteral("idle"), radioPage};
-    case TciClient::State::Connecting:
-    case TciClient::State::Initializing:
+    case RadioBackend::Link::Connecting:
+    case RadioBackend::Link::Initializing:
         return {QStringLiteral("Connecting…"), QStringLiteral("warning"), radioPage};
-    case TciClient::State::Ready:
+    case RadioBackend::Link::Ready:
         break;
     }
     if (!s.audioFlowing) return {QStringLiteral("No audio from radio"), QStringLiteral("warning"), radioPage};

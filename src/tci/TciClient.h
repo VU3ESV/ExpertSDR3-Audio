@@ -1,5 +1,6 @@
 #pragma once
 
+#include "radio/RadioBackend.h"
 #include "tci/TciProtocol.h"
 
 #include <QAbstractSocket>
@@ -13,31 +14,14 @@
 
 namespace esa {
 
-// What the server has told us. Later commands overwrite earlier ones, and the
-// server pushes every change, so this is always current without polling.
-struct RadioState {
-    QString serverName;     // "ExpertSDR3"
-    QString serverVersion;  // "2.1"
-    QString device;         // "ColibriDDC"
-    bool receiveOnly{false};
-    int trxCount{0};
-    struct Receiver {
-        qint64 frequencyHz{0};  // VFO A
-        QString modulation;
-        bool transmitting{false};
-        bool enabled{true};
-    };
-    QHash<int, Receiver> receivers;
-};
-
 // The TCI connection: WebSocket lifecycle, the init handshake, reconnects and the
 // RX audio request. Lives on the engine thread. Knows nothing about DSP or muting.
 class TciClient : public QObject {
     Q_OBJECT
 
 public:
-    enum class State { Disconnected, Connecting, Initializing, Ready };
-    Q_ENUM(State)
+    // The same four states every radio backend has.
+    using State = RadioBackend::Link;
 
     struct AudioRequest {
         int receiver{0};

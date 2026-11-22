@@ -18,6 +18,9 @@ inline constexpr double kMaxOutputGainDb = 30.0;
 // Everything that describes how the app should run. The GUI edits this, `--flags`
 // override it, and the engine consumes it.
 struct AppConfig {
+    // How the radio is reached: "tci" (ExpertSDR3 over the network) or "usb" (a radio's own
+    // USB audio codec, with CAT on its serial port).
+    QString radioKind{QStringLiteral("tci")};
     QString host{QStringLiteral("127.0.0.1")};
     int port{40001};
     // Tried if nothing answers on `port`: the ports ExpertSDR3 installs commonly use.

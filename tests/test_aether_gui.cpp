@@ -18,6 +18,7 @@
 #include "audio/PlaybackBuffer.h"
 #include "dsp/RxChain.h"
 #include "dsp/StageSet.h"
+#include "tci/TciClient.h"
 #include "gui/DetailsWindow.h"
 #include "gui/MainWindow.h"
 #include "gui/ParamWidgets.h"

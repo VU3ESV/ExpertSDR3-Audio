@@ -182,7 +182,7 @@ void OutputPage::showDevices(const QList<AudioDeviceInfo>& devices)
 void OutputPage::showStatus(const EngineStatus& s)
 {
     m_band->showStatus(s);
-    m_radioConnected = s.connection == TciClient::State::Ready;
+    m_radioConnected = s.connection == RadioBackend::Link::Ready;
     showScopeNote();
 }
 

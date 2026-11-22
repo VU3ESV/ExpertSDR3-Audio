@@ -11,6 +11,7 @@
 #include "gui/DetailsWindow.h"
 #include "gui/MainWindow.h"
 #include "gui/ParamWidgets.h"
+#include "tci/TciClient.h"
 #include "gui/aether/Appearance.h"
 #include "gui/pages/Pages.h"
 #include "gui/shell/HeaderBar.h"

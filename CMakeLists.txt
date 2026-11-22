@@ -283,6 +283,7 @@ qt_add_resources(aether_gui "canon_ticks"
 # ── Application core (everything except the GUI, shared with tests) ──────────
 add_library(esa_core STATIC
     src/tci/TciProtocol.cpp src/tci/TciClient.cpp src/tci/TciDiscovery.cpp src/tci/MuteController.cpp
+    src/radio/RadioBackend.h src/radio/TciBackend.cpp
     src/dsp/RxChain.cpp src/dsp/NrRegistry.cpp
     src/audio/PlaybackBuffer.cpp src/audio/PortAudioSink.cpp
     src/app/Engine.cpp src/app/Profiles.cpp src/app/Settings.cpp)

@@ -6,8 +6,8 @@
 #include "app/Settings.h"
 #include "audio/AudioSink.h"
 #include "dsp/RxChain.h"
+#include "radio/RadioBackend.h"
 #include "tci/MuteController.h"
-#include "tci/TciClient.h"
 
 #include <QElapsedTimer>
 #include <QHash>
@@ -26,7 +26,8 @@ namespace esa {
 
 // A snapshot for display, emitted several times a second.
 struct EngineStatus {
-    TciClient::State connection{TciClient::State::Disconnected};
+    RadioBackend::Link connection{RadioBackend::Link::Disconnected};
+    QString radioKind{QStringLiteral("tci")};  // the backend reaching the radio: "tci" or "usb"
     // Disconnect was pressed and the link stays up until ExpertSDR3 has its mute back. The
     // radio's audio still plays meanwhile, but it is no longer this session's.
     bool disconnecting{false};
@@ -109,6 +110,9 @@ class Engine : public QObject {
 public:
     using SinkFactory = std::function<std::unique_ptr<AudioSink>(
         const AppConfig& config, QString* error)>;
+    // Makes the backend for a kind of radio ("tci", "usb"), parented to the engine. Empty
+    // when the kind is unknown.
+    using BackendFactory = std::function<RadioBackend*(const QString& kind, QObject* parent)>;
 
     // `settingsPath` selects the settings store for mute ownership. Empty uses the
     // default store. `sinkFactory` is a seam for tests; empty uses real devices.
@@ -120,6 +124,9 @@ public:
     // The same object for the engine's whole life, so any thread may call this. Holding
     // it keeps the data valid after the engine is gone.
     std::shared_ptr<LiveTaps> taps() const { return m_taps; }
+
+    // A seam for tests: how backends are made. Set before the first connectRadio().
+    void setBackendFactory(BackendFactory factory);
 
     // For tests only: a stage parameter as the chain the audio runs through holds it. False
     // before the first configure(), or for a key that is not a stage's. It reads the chain
@@ -189,8 +196,8 @@ signals:
     void playbackFailed(const QString& reason);
 
 private slots:
-    void onAudioBlock(const esa::tci::StreamHeader& header, const QByteArray& frame);
-    void onConnectionState(esa::TciClient::State state);
+    void onAudioBlock(int receiver, const float* stereo, int frames, int sampleRate);
+    void onConnectionState(esa::RadioBackend::Link state);
     void onMuteReported(bool muted);
     void onModulationChanged(int receiver, const QString& modulation);
     void onTransmitChanged(int receiver, bool transmitting);
@@ -199,6 +206,9 @@ private slots:
 
 private:
     void finishClosing();
+    // The backend for m_config.radioKind, made anew when the kind changes. Only while no
+    // session is open on the old one.
+    void useBackendFor(const QString& kind);
     void rebuildChain(int sampleRate);
     // Everything done with a processed block: meters, taps, recording, capture and the speakers.
     void publishBlock(const float* stereo, int frames);
@@ -242,10 +252,11 @@ private:
     qint64 nowMs() const { return m_clock.elapsed(); }
 
     SinkFactory m_sinkFactory;
+    BackendFactory m_backendFactory;
     std::unique_ptr<Settings> m_settings;
     AppConfig m_config;
 
-    TciClient* m_tci;
+    RadioBackend* m_radio{nullptr};
     std::unique_ptr<MuteController> m_mute;
     QString m_muteHost;
     std::unique_ptr<RxChain> m_chain;
@@ -292,8 +303,6 @@ private:
     std::vector<float> m_decoded;
     QByteArray m_input;
 
-    bool m_counterValid{false};
-    quint32 m_lastCounter{0};
     quint64 m_blocks{0};
     quint64 m_droppedBlocks{0};
     quint64 m_malformedBlocks{0};

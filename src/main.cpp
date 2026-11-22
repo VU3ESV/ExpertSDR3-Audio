@@ -137,13 +137,13 @@ const char* muteName(MuteController::Phase phase)
     return "?";
 }
 
-const char* connectionName(TciClient::State state)
+const char* connectionName(RadioBackend::Link state)
 {
     switch (state) {
-    case TciClient::State::Disconnected: return "disconnected";
-    case TciClient::State::Connecting: return "connecting";
-    case TciClient::State::Initializing: return "initializing";
-    case TciClient::State::Ready: return "ready";
+    case RadioBackend::Link::Disconnected: return "disconnected";
+    case RadioBackend::Link::Connecting: return "connecting";
+    case RadioBackend::Link::Initializing: return "initializing";
+    case RadioBackend::Link::Ready: return "ready";
     }
     return "?";
 }

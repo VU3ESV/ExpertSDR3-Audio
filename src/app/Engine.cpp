@@ -3,6 +3,7 @@
 #include "app/RecordNaming.h"
 #include "audio/PortAudioSink.h"
 #include "dsp/NrProcessor.h"
+#include "radio/TciBackend.h"
 
 #include <QCoreApplication>
 #include <QDateTime>
@@ -58,6 +59,12 @@ std::unique_ptr<AudioSink> openRealSink(const AppConfig& c, QString* error)
     return PortAudioSink::open(c.deviceKey, c.chainRate, c.bufferMs, c.deviceRate, error);
 }
 
+RadioBackend* makeRealBackend(const QString& kind, QObject* parent)
+{
+    if (kind == QLatin1String("tci")) return new TciBackend(parent);
+    return nullptr;
+}
+
 // Never prepared and never processed, so its meters read as silence: -120 dB and no
 // gain reduction. Copied over a stage's meters whenever that stage did not run.
 const StageSet& idleStages()
@@ -80,8 +87,8 @@ Engine::Engine(const QString& settingsPath, SinkFactory sinkFactory, QObject* pa
                Recorder::Options recorderOptions)
     : QObject(parent),
       m_sinkFactory(sinkFactory ? std::move(sinkFactory) : SinkFactory(openRealSink)),
+      m_backendFactory(makeRealBackend),
       m_settings(std::make_unique<Settings>(settingsPath)),
-      m_tci(new TciClient(this)),
       m_taps(std::make_shared<LiveTaps>()),
       m_housekeeping(this),  // parented so moveToThread() carries them along
       m_meterRest(this),
@@ -96,18 +103,11 @@ Engine::Engine(const QString& settingsPath, SinkFactory sinkFactory, QObject* pa
     qRegisterMetaType<AppConfig>();
     qRegisterMetaType<ChainSettings>();
     qRegisterMetaType<QList<AudioDeviceInfo>>();
-    qRegisterMetaType<tci::StreamHeader>();
 
     m_clock.start();
 
+    useBackendFor(m_config.radioKind);
     prepareMuteFor(QString());
-
-    connect(m_tci, &TciClient::stateChanged, this, &Engine::onConnectionState);
-    connect(m_tci, &TciClient::muteReported, this, &Engine::onMuteReported);
-    connect(m_tci, &TciClient::modulationChanged, this, &Engine::onModulationChanged);
-    connect(m_tci, &TciClient::transmitChanged, this, &Engine::onTransmitChanged);
-    connect(m_tci, &TciClient::audioBlock, this, &Engine::onAudioBlock);
-    connect(m_tci, &TciClient::malformedBlock, this, [this] { ++m_malformedBlocks; });
 
     m_nrPool.setMaxThreadCount(1);
 
@@ -155,13 +155,49 @@ Engine::~Engine()
 
 // ── Configuration ───────────────────────────────────────────────────────────
 
+void Engine::setBackendFactory(BackendFactory factory)
+{
+    m_backendFactory = factory ? std::move(factory) : BackendFactory(makeRealBackend);
+    if (m_radio) {
+        m_radio->disconnect(this);
+        delete m_radio;
+        m_radio = nullptr;
+    }
+    useBackendFor(m_config.radioKind);
+}
+
+void Engine::useBackendFor(const QString& kind)
+{
+    if (m_radio && m_radio->kind() == kind) return;  // keeps what the radio has told it
+    RadioBackend* next = m_backendFactory(kind, this);
+    if (!next) {
+        qCWarning(lcEngine) << "No way to reach a radio of kind" << kind;
+        if (m_radio) return;
+        next = makeRealBackend(QStringLiteral("tci"), this);
+    }
+    if (m_radio) {
+        m_radio->disconnect(this);
+        m_radio->close();
+        m_radio->deleteLater();
+    }
+    m_radio = next;
+    connect(m_radio, &RadioBackend::stateChanged, this, &Engine::onConnectionState);
+    connect(m_radio, &RadioBackend::muteReported, this, &Engine::onMuteReported);
+    connect(m_radio, &RadioBackend::modulationChanged, this, &Engine::onModulationChanged);
+    connect(m_radio, &RadioBackend::transmitChanged, this, &Engine::onTransmitChanged);
+    connect(m_radio, &RadioBackend::audioBlock, this, &Engine::onAudioBlock);
+    connect(m_radio, &RadioBackend::malformedBlock, this, [this] { ++m_malformedBlocks; });
+    connect(m_radio, &RadioBackend::blocksLost, this, [this](quint64 count) { m_droppedBlocks += count; });
+    connect(m_radio, &RadioBackend::portResolved, this, &Engine::connectedPortChanged);
+}
+
 void Engine::prepareMuteFor(const QString& host)
 {
     if (m_mute && host == m_muteHost) return;  // keep what it knows, such as an operator override
 
     const Settings::MuteOwnership stored = m_settings->loadMuteOwnership(host);
     MuteController::Actions actions;
-    actions.sendMute = [this](bool muted) { m_tci->sendMute(muted); };
+    actions.sendMute = [this](bool muted) { m_radio->sendMute(muted); };
     actions.persist = [this, host](const MuteController::Ownership& o) {
         m_settings->saveMuteOwnership(host, {o.owned, o.priorMuted});
     };
@@ -355,7 +391,7 @@ void Engine::beginRecording(const QString& folder, const QString& file)
     m_recordPath.clear();
     m_recordError.clear();
     m_recordRefused = false;
-    if (m_tci->state() == TciClient::State::Ready) openRecordingSession();  // else when it is
+    if (m_radio->state() == RadioBackend::Link::Ready) openRecordingSession();  // else when it is
     emitStatus();  // at once, so the button follows the engine
 }
 
@@ -376,7 +412,7 @@ void Engine::openRecordingSession()
     if (!m_recordFile.isEmpty()) {
         request = RecordRequest::forFile(m_recordFile, rate);
     } else {
-        const RadioState::Receiver rx = m_tci->radio().receivers.value(m_config.receiver);
+        const RadioState::Receiver rx = m_radio->radio().receivers.value(m_config.receiver);
         request = {m_recordFolder,
                    RecordNaming::baseName(QDateTime::currentDateTimeUtc(), rx.frequencyHz, rx.modulation,
                                           m_config.receiver),
@@ -737,12 +773,12 @@ void Engine::connectRadio()
     m_sessionActive = true;
     m_audioConfirmed = false;
     m_lastBlockMs = -1;
-    m_counterValid = false;
+    useBackendFor(m_config.radioKind);
     prepareMuteFor(m_config.host);
     if (!m_chain) rebuildChain(m_config.chainRate);
     openSink();
     requestAudio();
-    m_tci->open(m_config.host, m_config.port, m_config.fallbackPorts);
+    m_radio->open(m_config);
     emitStatus();
 }
 
@@ -757,7 +793,7 @@ void Engine::disconnectRadio()
     updateMuteWanted();
 
     // Give the restore a chance to land before the socket closes.
-    if (!m_mute->settled() && m_tci->state() == TciClient::State::Ready) {
+    if (!m_mute->settled() && m_radio->state() == RadioBackend::Link::Ready) {
         m_closing = true;
         m_closeDeadlineMs = nowMs() + kShutdownWaitMs;
         m_closeTimer.start();
@@ -771,7 +807,7 @@ void Engine::continueClosing()
 {
     m_mute->tick(nowMs());
     if (m_mute->settled() || nowMs() >= m_closeDeadlineMs
-        || m_tci->state() != TciClient::State::Ready) {
+        || m_radio->state() != RadioBackend::Link::Ready) {
         finishClosing();
     }
 }
@@ -780,9 +816,9 @@ void Engine::finishClosing()
 {
     m_closeTimer.stop();
     m_closing = false;
-    m_tci->stopAudio();
-    m_tci->flush();
-    m_tci->close();
+    m_radio->stopAudio();
+    m_radio->flush();
+    m_radio->close();
     closeSink();
     // After the mute restore, which must never wait on a disk.
     finishRecordings();
@@ -798,33 +834,25 @@ void Engine::setReceiver(int receiver)
     if (receiver == m_config.receiver) return;
     m_config.receiver = receiver;
     if (m_chain) m_chain->reset();  // a new source: old noise profiles do not apply
-    m_counterValid = false;
     // Pick up the new receiver's mode now; the server only pushes it on change.
-    const auto& receivers = m_tci->radio().receivers;
+    const auto& receivers = m_radio->radio().receivers;
     onModulationChanged(receiver, receivers.value(receiver).modulation);
     if (m_sessionActive) requestAudio();
 }
 
 void Engine::requestAudio()
 {
-    TciClient::AudioRequest request;
-    request.receiver = m_config.receiver;
-    request.sampleRate = m_config.chainRate;
-    // Real samples per block, targeting about 10.7 ms in stereo at either rate.
-    request.samplesPerBlock = m_config.chainRate == 24000 ? 512 : 1024;
-    m_tci->requestAudio(request);
+    m_radio->requestAudio(m_config.receiver, m_config.chainRate);
 }
 
-void Engine::onConnectionState(TciClient::State state)
+void Engine::onConnectionState(RadioBackend::Link state)
 {
-    if (state == TciClient::State::Initializing) {
+    if (state == RadioBackend::Link::Initializing) {
         m_mute->onConnected();
-    } else if (state == TciClient::State::Connecting || state == TciClient::State::Disconnected) {
+    } else if (state == RadioBackend::Link::Connecting || state == RadioBackend::Link::Disconnected) {
         m_mute->onDisconnected();
-        m_counterValid = false;
         m_modulation.clear();
-    } else if (state == TciClient::State::Ready) {
-        emit connectedPortChanged(m_tci->connectedPort());
+    } else if (state == RadioBackend::Link::Ready) {
         // Whatever arrives on this new connection is a fresh stream.
         if (m_chain) m_chain->reset();
         // A REC pressed while the link came up: the radio's frequency and mode are known now,
@@ -953,45 +981,25 @@ void Engine::updateMuteWanted()
 
 // ── Audio path ──────────────────────────────────────────────────────────────
 
-void Engine::onAudioBlock(const tci::StreamHeader& header, const QByteArray& frame)
+void Engine::onAudioBlock(int receiver, const float* stereo, int frames, int sampleRate)
 {
-    if (int(header.receiver) != m_config.receiver || !m_chain) return;
-    // Blocks still in flight while a closed socket shuts are the ended session's. Taken as
+    if (receiver != m_config.receiver || !m_chain || frames <= 0) return;
+    // Blocks still in flight while a closed link shuts are the ended session's. Taken as
     // audio they would show it flowing while disconnected, and reach an output a PLAY opened.
-    if (m_tci->state() != TciClient::State::Ready) return;
+    if (m_radio->state() != RadioBackend::Link::Ready) return;
 
-    const int frames = tci::decodeToStereo(header, frame.constData() + tci::kHeaderBytes,
-                                           frame.size() - tci::kHeaderBytes, m_decoded);
-    if (frames < 0) {
-        ++m_malformedBlocks;
-        return;
-    }
-    if (frames == 0) return;
-
-    // The server could ignore our rate request. Follow what it actually sends if the
-    // chain supports that rate, and drop it otherwise rather than play it at the
-    // wrong speed.
-    if (int(header.sampleRate) != m_chain->sampleRate()) {
-        if (header.sampleRate != 24000 && header.sampleRate != 48000) {
-            ++m_malformedBlocks;
-            return;
-        }
-        qCInfo(lcEngine) << "Stream rate is" << header.sampleRate << "Hz; rebuilding the chain";
-        m_config.chainRate = int(header.sampleRate);
+    // Follow the rate the radio actually sends (the backend passes on only rates the chain
+    // supports), rather than play it at the wrong speed.
+    if (sampleRate != m_chain->sampleRate()) {
+        qCInfo(lcEngine) << "Stream rate is" << sampleRate << "Hz; rebuilding the chain";
+        m_config.chainRate = sampleRate;
         rebuildChain(m_config.chainRate);
         openSink();
         // A recording or capture in progress rolls to its next part when the first block at
         // the new rate reaches it (publishBlock, pushCapture).
     }
 
-    // The packet counter restarts on TX/RX switches, so a backwards jump is not a
-    // loss; only a forward gap is.
-    if (m_counterValid && header.count > m_lastCounter + 1) {
-        m_droppedBlocks += header.count - m_lastCounter - 1;
-    }
-    m_lastCounter = header.count;
-    m_counterValid = true;
-
+    m_decoded.assign(stereo, stereo + size_t(frames) * 2);
     if (m_complexStereo) {
         // In DIGL/DIGU the pair is I/Q. The I component alone is the real audio.
         for (int i = 0; i < frames; ++i) m_decoded[size_t(i) * 2 + 1] = m_decoded[size_t(i) * 2];
@@ -1104,7 +1112,7 @@ void Engine::onHousekeeping()
         openSink();
     }
 
-    if (m_audioConfirmed && m_tci->state() == TciClient::State::Ready && m_lastBlockMs >= 0
+    if (m_audioConfirmed && m_radio->state() == RadioBackend::Link::Ready && m_lastBlockMs >= 0
         && now - m_lastBlockMs > kStreamDeadMs) {
         m_audioConfirmed = false;
     }
@@ -1127,16 +1135,17 @@ void Engine::onHousekeeping()
 void Engine::emitStatus()
 {
     EngineStatus s;
-    const RadioState& radio = m_tci->radio();
-    s.connection = m_tci->state();
+    const RadioState& radio = m_radio->radio();
+    s.connection = m_radio->state();
+    s.radioKind = m_radio->kind();
     s.disconnecting = m_closing;
-    s.connectionError = m_tci->lastError();
+    s.connectionError = m_radio->lastError();
     s.serverName = radio.serverName;
     s.serverVersion = radio.serverVersion;
     s.device = radio.device;
     s.receiveOnly = radio.receiveOnly;
     s.trxCount = radio.trxCount;
-    s.connectedPort = m_tci->connectedPort();
+    s.connectedPort = m_radio->connectedPort();
     s.receiver = m_config.receiver;
     const RadioState::Receiver rx = radio.receivers.value(m_config.receiver);
     s.frequencyHz = rx.frequencyHz;
