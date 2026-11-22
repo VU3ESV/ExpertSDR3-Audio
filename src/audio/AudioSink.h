@@ -13,6 +13,7 @@ struct AudioDeviceInfo {
     QString name;
     QString hostApi;
     int maxOutputChannels{0};
+    int maxInputChannels{0};
     double defaultSampleRate{0.0};
     bool isDefault{false};
 };
@@ -46,6 +47,32 @@ public:
     virtual void setMuted(bool muted) = 0;
     virtual void setTargetLatencyMs(int ms) = 0;
 };
+
+namespace audio {
+// Whether two device keys name the same physical device, in either direction. On macOS and
+// Linux one name covers a device's input and output, so the keys are equal. Windows names
+// each end, such as "Microphone (USB Audio CODEC)" and "Speakers (2- USB Audio CODEC)", so
+// the part in brackets is compared too, less a leading "2- ". Two devices of one model look
+// alike either way, which errs on the side of keeping a radio's codec out of the outputs.
+inline QString physicalName(const QString& key)
+{
+    QString name = key.section(QLatin1Char('|'), 1).trimmed();
+    const qsizetype open = name.lastIndexOf(QLatin1Char('('));
+    if (open >= 0 && name.endsWith(QLatin1Char(')'))) name = name.mid(open + 1, name.size() - open - 2).trimmed();
+    qsizetype digits = 0;
+    while (digits < name.size() && name.at(digits).isDigit()) ++digits;
+    if (digits > 0 && name.mid(digits).startsWith(QLatin1String("- "))) name = name.mid(digits + 2);
+    return name.trimmed().toCaseFolded();
+}
+
+inline bool samePhysicalDevice(const QString& a, const QString& b)
+{
+    if (a.isEmpty() || b.isEmpty()) return false;
+    if (a == b) return true;
+    const QString left = physicalName(a);
+    return !left.isEmpty() && left == physicalName(b);
+}
+} // namespace audio
 
 // The device key that selects NullSink.
 inline const QLatin1String kNullDeviceKey("null");

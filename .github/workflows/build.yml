@@ -45,7 +45,7 @@ jobs:
         with:
           version: ${{ env.QT_VERSION }}
           arch: clang_64
-          modules: qtwebsockets
+          modules: qtwebsockets qtserialport
           cache: true
 
       - name: Install build tools
@@ -159,7 +159,7 @@ jobs:
         with:
           version: ${{ env.QT_VERSION }}
           arch: win64_msvc2022_64
-          modules: qtwebsockets
+          modules: qtwebsockets qtserialport
           cache: true
 
       - name: Install FFTW
@@ -265,7 +265,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build pkg-config git curl ca-certificates file zstd xz-utils \
-            dpkg-dev qt6-base-dev qt6-base-dev-tools libqt6websockets6-dev libfftw3-dev \
+            dpkg-dev qt6-base-dev qt6-base-dev-tools libqt6websockets6-dev libqt6serialport6-dev libfftw3-dev \
             libasound2-dev libgl1-mesa-dev qt6-qpa-plugins
 
       - uses: actions/checkout@v7
@@ -344,7 +344,7 @@ jobs:
         with:
           version: ${{ env.QT_VERSION }}
           arch: linux_gcc_64
-          modules: qtwebsockets
+          modules: qtwebsockets qtserialport
           cache: true
 
       - name: Install build tools

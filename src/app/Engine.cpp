@@ -3,6 +3,10 @@
 #include "app/RecordNaming.h"
 #include "audio/PortAudioSink.h"
 #include "dsp/NrProcessor.h"
+#include "radio/TciBackend.h"
+#include "radio/Ts990Cat.h"
+#include "radio/UsbBackend.h"
+#include "audio/PortAudioSource.h"
 
 #include <QCoreApplication>
 #include <QDateTime>
@@ -27,6 +31,9 @@ constexpr int kHousekeepingMs = 100;
 // With no audio for this long, ExpertSDR3 should not stay muted: the operator
 // would otherwise hear nothing from either program.
 constexpr int kStreamDeadMs = 3000;
+// Below this a USB radio's audio counts as silence: a radio switched off, or its codec idle.
+// A receiver's own band noise is far above it.
+constexpr float kSilenceFloor = 1e-5f;  // -100 dBFS
 constexpr int kSinkRetryMs = 3000;
 constexpr int kShutdownWaitMs = 1500;
 // With no audio for this long, the stage meters fall to silence rather than freeze.
@@ -55,7 +62,15 @@ float peakOf(const float* samples, qsizetype count)
 std::unique_ptr<AudioSink> openRealSink(const AppConfig& c, QString* error)
 {
     if (c.deviceKey == kNullDeviceKey) return std::make_unique<NullSink>();
-    return PortAudioSink::open(c.deviceKey, c.chainRate, c.bufferMs, c.deviceRate, error);
+    const QString radioCodec = c.radioKind == QLatin1String("usb") ? c.usbInput : QString();
+    return PortAudioSink::open(c.deviceKey, c.chainRate, c.bufferMs, c.deviceRate, error, radioCodec);
+}
+
+RadioBackend* makeRealBackend(const QString& kind, QObject* parent)
+{
+    if (kind == QLatin1String("tci")) return new TciBackend(parent);
+    if (kind == QLatin1String("usb")) return new UsbBackend({}, parent);
+    return nullptr;
 }
 
 // Never prepared and never processed, so its meters read as silence: -120 dB and no
@@ -80,8 +95,8 @@ Engine::Engine(const QString& settingsPath, SinkFactory sinkFactory, QObject* pa
                Recorder::Options recorderOptions)
     : QObject(parent),
       m_sinkFactory(sinkFactory ? std::move(sinkFactory) : SinkFactory(openRealSink)),
+      m_backendFactory(makeRealBackend),
       m_settings(std::make_unique<Settings>(settingsPath)),
-      m_tci(new TciClient(this)),
       m_taps(std::make_shared<LiveTaps>()),
       m_housekeeping(this),  // parented so moveToThread() carries them along
       m_meterRest(this),
@@ -96,18 +111,11 @@ Engine::Engine(const QString& settingsPath, SinkFactory sinkFactory, QObject* pa
     qRegisterMetaType<AppConfig>();
     qRegisterMetaType<ChainSettings>();
     qRegisterMetaType<QList<AudioDeviceInfo>>();
-    qRegisterMetaType<tci::StreamHeader>();
 
     m_clock.start();
 
+    useBackendFor(m_config.radioKind);
     prepareMuteFor(QString());
-
-    connect(m_tci, &TciClient::stateChanged, this, &Engine::onConnectionState);
-    connect(m_tci, &TciClient::muteReported, this, &Engine::onMuteReported);
-    connect(m_tci, &TciClient::modulationChanged, this, &Engine::onModulationChanged);
-    connect(m_tci, &TciClient::transmitChanged, this, &Engine::onTransmitChanged);
-    connect(m_tci, &TciClient::audioBlock, this, &Engine::onAudioBlock);
-    connect(m_tci, &TciClient::malformedBlock, this, [this] { ++m_malformedBlocks; });
 
     m_nrPool.setMaxThreadCount(1);
 
@@ -155,18 +163,68 @@ Engine::~Engine()
 
 // ── Configuration ───────────────────────────────────────────────────────────
 
+void Engine::setBackendFactory(BackendFactory factory)
+{
+    m_backendFactory = factory ? std::move(factory) : BackendFactory(makeRealBackend);
+    if (m_radio) {
+        m_radio->disconnect(this);
+        delete m_radio;
+        m_radio = nullptr;
+    }
+    useBackendFor(m_config.radioKind);
+}
+
+void Engine::useBackendFor(const QString& kind)
+{
+    if (m_radio && m_radio->kind() == kind) return;  // keeps what the radio has told it
+    RadioBackend* next = m_backendFactory(kind, this);
+    if (!next) {
+        qCWarning(lcEngine) << "No way to reach a radio of kind" << kind;
+        if (m_radio) return;
+        next = makeRealBackend(QStringLiteral("tci"), this);
+    }
+    if (m_radio) {
+        m_radio->disconnect(this);
+        m_radio->close();
+        m_radio->deleteLater();
+    }
+    m_radio = next;
+    m_caps = m_radio->capabilities();
+    connect(m_radio, &RadioBackend::stateChanged, this, &Engine::onConnectionState);
+    connect(m_radio, &RadioBackend::muteReported, this, &Engine::onMuteReported);
+    connect(m_radio, &RadioBackend::speakerLinkChanged, this, &Engine::onSpeakerLink);
+    connect(m_radio, &RadioBackend::speakerLevelReported, this,
+            [this](int level) { m_mute->onServerLevel(level, nowMs()); });
+    connect(m_radio, &RadioBackend::modulationChanged, this, &Engine::onModulationChanged);
+    connect(m_radio, &RadioBackend::transmitChanged, this, &Engine::onTransmitChanged);
+    connect(m_radio, &RadioBackend::audioBlock, this, &Engine::onAudioBlock);
+    connect(m_radio, &RadioBackend::malformedBlock, this, [this] { ++m_malformedBlocks; });
+    connect(m_radio, &RadioBackend::blocksLost, this, [this](quint64 count) { m_droppedBlocks += count; });
+    connect(m_radio, &RadioBackend::portResolved, this, &Engine::connectedPortChanged);
+    // What a backend reports can change while it runs: a USB radio's CAT answering, or not.
+    connect(m_radio, &RadioBackend::radioChanged, this, [this] {
+        m_caps = m_radio->capabilities();
+        updateMuteWanted();
+    });
+}
+
 void Engine::prepareMuteFor(const QString& host)
 {
     if (m_mute && host == m_muteHost) return;  // keep what it knows, such as an operator override
 
     const Settings::MuteOwnership stored = m_settings->loadMuteOwnership(host);
     MuteController::Actions actions;
-    actions.sendMute = [this](bool muted) { m_tci->sendMute(muted); };
+    if (m_radio->kind() == QLatin1String("usb")) {
+        // A USB radio's speaker is its AF level, set over CAT.
+        actions.sendLevel = [this](int level) { m_radio->setSpeakerLevel(level); };
+    } else {
+        actions.sendMute = [this](bool muted) { m_radio->sendMute(muted); };
+    }
     actions.persist = [this, host](const MuteController::Ownership& o) {
-        m_settings->saveMuteOwnership(host, {o.owned, o.priorMuted});
+        m_settings->saveMuteOwnership(host, {o.owned, o.priorMuted, o.priorLevel});
     };
-    m_mute = std::make_unique<MuteController>(std::move(actions),
-                                              MuteController::Ownership{stored.owned, stored.priorMuted});
+    m_mute = std::make_unique<MuteController>(
+        std::move(actions), MuteController::Ownership{stored.owned, stored.priorMuted, stored.priorLevel});
     m_muteHost = host;
 }
 
@@ -355,7 +413,7 @@ void Engine::beginRecording(const QString& folder, const QString& file)
     m_recordPath.clear();
     m_recordError.clear();
     m_recordRefused = false;
-    if (m_tci->state() == TciClient::State::Ready) openRecordingSession();  // else when it is
+    if (m_radio->state() == RadioBackend::Link::Ready) openRecordingSession();  // else when it is
     emitStatus();  // at once, so the button follows the engine
 }
 
@@ -376,7 +434,7 @@ void Engine::openRecordingSession()
     if (!m_recordFile.isEmpty()) {
         request = RecordRequest::forFile(m_recordFile, rate);
     } else {
-        const RadioState::Receiver rx = m_tci->radio().receivers.value(m_config.receiver);
+        const RadioState::Receiver rx = m_radio->radio().receivers.value(m_config.receiver);
         request = {m_recordFolder,
                    RecordNaming::baseName(QDateTime::currentDateTimeUtc(), rx.frequencyHz, rx.modulation,
                                           m_config.receiver),
@@ -737,13 +795,25 @@ void Engine::connectRadio()
     m_sessionActive = true;
     m_audioConfirmed = false;
     m_lastBlockMs = -1;
-    m_counterValid = false;
-    prepareMuteFor(m_config.host);
+    useBackendFor(m_config.radioKind);
+    m_lastSoundMs = -1;
+    // Mute ownership belongs to one radio. A USB radio's is kept apart from any TCI host's.
+    prepareMuteFor(muteKey());
+    // A new session is a new choice: an AF knob turned in the last one no longer holds.
+    if (m_radio->kind() == QLatin1String("usb")) m_mute->rearm(nowMs());
     if (!m_chain) rebuildChain(m_config.chainRate);
     openSink();
     requestAudio();
-    m_tci->open(m_config.host, m_config.port, m_config.fallbackPorts);
+    m_radio->open(m_config);
     emitStatus();
+}
+
+QString Engine::muteKey() const
+{
+    if (m_radio->kind() != QLatin1String("usb")) return m_config.host;
+    // Per model, not per port: one radio can show up under more than one port name (two drivers
+    // on a Mac, a renumbered COM port), and an AF owed back must be found whichever is chosen.
+    return QStringLiteral("usb:") + m_config.usbModel;
 }
 
 void Engine::disconnectRadio()
@@ -757,7 +827,7 @@ void Engine::disconnectRadio()
     updateMuteWanted();
 
     // Give the restore a chance to land before the socket closes.
-    if (!m_mute->settled() && m_tci->state() == TciClient::State::Ready) {
+    if (!m_mute->settled() && m_radio->speakerLinkUp()) {
         m_closing = true;
         m_closeDeadlineMs = nowMs() + kShutdownWaitMs;
         m_closeTimer.start();
@@ -770,8 +840,7 @@ void Engine::disconnectRadio()
 void Engine::continueClosing()
 {
     m_mute->tick(nowMs());
-    if (m_mute->settled() || nowMs() >= m_closeDeadlineMs
-        || m_tci->state() != TciClient::State::Ready) {
+    if (m_mute->settled() || nowMs() >= m_closeDeadlineMs || !m_radio->speakerLinkUp()) {
         finishClosing();
     }
 }
@@ -780,9 +849,9 @@ void Engine::finishClosing()
 {
     m_closeTimer.stop();
     m_closing = false;
-    m_tci->stopAudio();
-    m_tci->flush();
-    m_tci->close();
+    m_radio->stopAudio();
+    m_radio->flush();
+    m_radio->close();
     closeSink();
     // After the mute restore, which must never wait on a disk.
     finishRecordings();
@@ -798,33 +867,71 @@ void Engine::setReceiver(int receiver)
     if (receiver == m_config.receiver) return;
     m_config.receiver = receiver;
     if (m_chain) m_chain->reset();  // a new source: old noise profiles do not apply
-    m_counterValid = false;
     // Pick up the new receiver's mode now; the server only pushes it on change.
-    const auto& receivers = m_tci->radio().receivers;
+    const auto& receivers = m_radio->radio().receivers;
     onModulationChanged(receiver, receivers.value(receiver).modulation);
     if (m_sessionActive) requestAudio();
 }
 
-void Engine::requestAudio()
+void Engine::testCat(const QString& port, int baud)
 {
-    TciClient::AudioRequest request;
-    request.receiver = m_config.receiver;
-    request.sampleRate = m_config.chainRate;
-    // Real samples per block, targeting about 10.7 ms in stereo at either rate.
-    request.samplesPerBlock = m_config.chainRate == 24000 ? 512 : 1024;
-    m_tci->requestAudio(request);
+    if (m_catProbe) return;  // one Test at a time; its answer is coming
+    if (const RadioBackend::Cat session = m_radio->cat(); session.used) {
+        emit catTested(false, QStringLiteral("The connected radio is using %1: disconnect to test").arg(session.port));
+        return;
+    }
+    if (port.isEmpty()) {
+        emit catTested(false, QStringLiteral("No CAT port chosen"));
+        return;
+    }
+    auto* probe = new Ts990Cat(m_catTransport, this);
+    m_catProbe = probe;
+    auto answered = std::make_shared<bool>(false);
+    const auto finish = [this, probe, answered](bool ok, const QString& text) {
+        if (*answered) return;
+        *answered = true;
+        m_catProbe.clear();
+        emit catTested(ok, text);
+        probe->close();
+        probe->deleteLater();
+    };
+    connect(probe, &Ts990Cat::stateChanged, this, [probe, finish, port](Ts990Cat::State state) {
+        if (state == Ts990Cat::State::Ready) finish(true, QStringLiteral("Kenwood TS-990S answered on %1").arg(port));
+        if (state == Ts990Cat::State::Refused) finish(false, probe->lastError());
+    });
+    // Three unanswered IDs take 1.5 s; a port that will not open fails at once.
+    QTimer::singleShot(2500, probe, [probe, finish] {
+        finish(false, probe->lastError().isEmpty() ? QStringLiteral("No answer") : probe->lastError());
+    });
+    probe->open(port, baud, true);
+    // A port that will not open (not there, taken, or the test sandbox) fails at once.
+    if (probe->state() == Ts990Cat::State::Closed) finish(false, probe->lastError());
 }
 
-void Engine::onConnectionState(TciClient::State state)
+void Engine::setUsbTrimDb(double db)
 {
-    if (state == TciClient::State::Initializing) {
-        m_mute->onConnected();
-    } else if (state == TciClient::State::Connecting || state == TciClient::State::Disconnected) {
-        m_mute->onDisconnected();
-        m_counterValid = false;
-        m_modulation.clear();
-    } else if (state == TciClient::State::Ready) {
-        emit connectedPortChanged(m_tci->connectedPort());
+    m_config.usbTrimDb = db;
+    m_radio->setInputTrimDb(db);
+}
+
+void Engine::requestAudio()
+{
+    m_radio->requestAudio(m_config.receiver, m_config.chainRate);
+}
+
+void Engine::onConnectionState(RadioBackend::Link state)
+{
+    // A USB radio's audio link carries neither its speaker nor its mode: both are on its CAT
+    // link, which reports them itself (onSpeakerLink, onModulationChanged).
+    const bool linkCarriesAll = m_radio->kind() != QLatin1String("usb");
+    if (state == RadioBackend::Link::Initializing) {
+        if (linkCarriesAll) m_mute->onConnected();
+    } else if (state == RadioBackend::Link::Connecting || state == RadioBackend::Link::Disconnected) {
+        if (linkCarriesAll) {
+            m_mute->onDisconnected();
+            m_modulation.clear();
+        }
+    } else if (state == RadioBackend::Link::Ready) {
         // Whatever arrives on this new connection is a fresh stream.
         if (m_chain) m_chain->reset();
         // A REC pressed while the link came up: the radio's frequency and mode are known now,
@@ -837,6 +944,17 @@ void Engine::onConnectionState(TciClient::State state)
 void Engine::onMuteReported(bool muted)
 {
     m_mute->onServerMute(muted, nowMs());
+}
+
+void Engine::onSpeakerLink(bool up)
+{
+    // The level is unknown until the radio is read again on this link, so nothing is sent before.
+    if (up) {
+        m_mute->onConnected();
+    } else {
+        m_mute->onDisconnected();
+    }
+    emitStatus();
 }
 
 void Engine::onModulationChanged(int receiver, const QString& modulation)
@@ -860,7 +978,15 @@ void Engine::openSink()
     // ExpertSDR3 and re-mute it a moment later on every device change.
     m_sink.reset();
     QString error;
-    m_sink = m_sinkFactory(m_config, &error);
+    if (m_config.radioKind == QLatin1String("usb")
+        && audio::samePhysicalDevice(m_config.deviceKey, m_config.usbInput)) {
+        // With DATA VOX on, the radio can transmit what is played into its own codec.
+        error = QStringLiteral("%1 is the radio's own audio. Sound sent there can make the radio "
+                               "transmit, so choose another output.")
+                    .arg(m_config.deviceKey.section(QLatin1Char('|'), 1));
+    } else {
+        m_sink = m_sinkFactory(m_config, &error);
+    }
     m_sinkRate = m_sink ? m_config.chainRate : 0;
     m_sinkTargetMs = 0.0;
     m_outputError = m_sink ? QString() : error;
@@ -929,7 +1055,10 @@ void Engine::refreshDevices()
     // Close first: PortAudio only rescans once every holder has let go. The mute is
     // not re-evaluated until openSink() below, so ExpertSDR3 stays as it is throughout.
     m_sink.reset();
+    m_radio->releaseAudioDevices();
     emit devicesChanged(audio::listOutputDevices());
+    emit inputDevicesChanged(audio::listInputDevices());
+    m_radio->reacquireAudioDevices();
     if (hadSink) openSink();
 }
 
@@ -941,57 +1070,45 @@ void Engine::setMuteExpert(bool on)
     updateMuteWanted();
 }
 
+void Engine::setUsbAfMute(bool on)
+{
+    m_config.usbAfMute = on;
+    if (on) m_mute->rearm(nowMs());  // chosen again: the operator's override is over
+    updateMuteWanted();
+}
+
 void Engine::updateMuteWanted()
 {
     // Only silence ExpertSDR3 once this app is demonstrably producing sound.
     // m_audioConfirmed latches across a reconnect, so a network blip does not
     // briefly unmute ExpertSDR3 and let both programs play at once.
-    const bool wanted = m_config.muteExpert && m_sessionActive && m_sink && m_sink->alive()
-                        && m_audioConfirmed;
+    const bool asked = m_radio->kind() == QLatin1String("usb") ? m_config.usbAfMute : m_config.muteExpert;
+    const bool wanted = m_caps.speaker != RadioBackend::SpeakerControl::None && asked && m_sessionActive && m_sink
+                        && m_sink->alive() && m_audioConfirmed;
     m_mute->setWanted(wanted, nowMs());
 }
 
 // ── Audio path ──────────────────────────────────────────────────────────────
 
-void Engine::onAudioBlock(const tci::StreamHeader& header, const QByteArray& frame)
+void Engine::onAudioBlock(int receiver, const float* stereo, int frames, int sampleRate)
 {
-    if (int(header.receiver) != m_config.receiver || !m_chain) return;
-    // Blocks still in flight while a closed socket shuts are the ended session's. Taken as
+    if (receiver != m_config.receiver || !m_chain || frames <= 0) return;
+    // Blocks still in flight while a closed link shuts are the ended session's. Taken as
     // audio they would show it flowing while disconnected, and reach an output a PLAY opened.
-    if (m_tci->state() != TciClient::State::Ready) return;
+    if (m_radio->state() != RadioBackend::Link::Ready) return;
 
-    const int frames = tci::decodeToStereo(header, frame.constData() + tci::kHeaderBytes,
-                                           frame.size() - tci::kHeaderBytes, m_decoded);
-    if (frames < 0) {
-        ++m_malformedBlocks;
-        return;
-    }
-    if (frames == 0) return;
-
-    // The server could ignore our rate request. Follow what it actually sends if the
-    // chain supports that rate, and drop it otherwise rather than play it at the
-    // wrong speed.
-    if (int(header.sampleRate) != m_chain->sampleRate()) {
-        if (header.sampleRate != 24000 && header.sampleRate != 48000) {
-            ++m_malformedBlocks;
-            return;
-        }
-        qCInfo(lcEngine) << "Stream rate is" << header.sampleRate << "Hz; rebuilding the chain";
-        m_config.chainRate = int(header.sampleRate);
+    // Follow the rate the radio actually sends (the backend passes on only rates the chain
+    // supports), rather than play it at the wrong speed.
+    if (sampleRate != m_chain->sampleRate()) {
+        qCInfo(lcEngine) << "Stream rate is" << sampleRate << "Hz; rebuilding the chain";
+        m_config.chainRate = sampleRate;
         rebuildChain(m_config.chainRate);
         openSink();
         // A recording or capture in progress rolls to its next part when the first block at
         // the new rate reaches it (publishBlock, pushCapture).
     }
 
-    // The packet counter restarts on TX/RX switches, so a backwards jump is not a
-    // loss; only a forward gap is.
-    if (m_counterValid && header.count > m_lastCounter + 1) {
-        m_droppedBlocks += header.count - m_lastCounter - 1;
-    }
-    m_lastCounter = header.count;
-    m_counterValid = true;
-
+    m_decoded.assign(stereo, stereo + size_t(frames) * 2);
     if (m_complexStereo) {
         // In DIGL/DIGU the pair is I/Q. The I component alone is the real audio.
         for (int i = 0; i < frames; ++i) m_decoded[size_t(i) * 2 + 1] = m_decoded[size_t(i) * 2];
@@ -1019,11 +1136,12 @@ void Engine::onAudioBlock(const tci::StreamHeader& header, const QByteArray& fra
 
     ++m_blocks;
     m_lastBlockMs = nowMs();
+    if (inputPeak > kSilenceFloor) m_lastSoundMs = m_lastBlockMs;
     // Only a session the operator still wants can confirm audio. The radio goes on streaming while
     // a disconnect waits for ExpertSDR3 to take its mute back, and those blocks are still played
     // and recorded, but they must not show the ended session's audio as flowing, nor set the mute
-    // policy going again.
-    if (m_sessionActive && !m_audioConfirmed) {
+    // policy going again. A USB codec streams silence with the radio off, so there only sound counts.
+    if (m_sessionActive && !m_audioConfirmed && (m_caps.audioProvesRadio || m_lastSoundMs == m_lastBlockMs)) {
         m_audioConfirmed = true;
         updateMuteWanted();
     }
@@ -1104,8 +1222,12 @@ void Engine::onHousekeeping()
         openSink();
     }
 
-    if (m_audioConfirmed && m_tci->state() == TciClient::State::Ready && m_lastBlockMs >= 0
+    if (m_audioConfirmed && m_radio->state() == RadioBackend::Link::Ready && m_lastBlockMs >= 0
         && now - m_lastBlockMs > kStreamDeadMs) {
+        m_audioConfirmed = false;
+    }
+    // The silence guard: a USB radio's codec goes on streaming once the radio is off.
+    if (m_audioConfirmed && !m_caps.audioProvesRadio && (m_lastSoundMs < 0 || now - m_lastSoundMs > kStreamDeadMs)) {
         m_audioConfirmed = false;
     }
     updateMuteWanted();
@@ -1127,24 +1249,27 @@ void Engine::onHousekeeping()
 void Engine::emitStatus()
 {
     EngineStatus s;
-    const RadioState& radio = m_tci->radio();
-    s.connection = m_tci->state();
+    const RadioState& radio = m_radio->radio();
+    s.connection = m_radio->state();
+    s.radioKind = m_radio->kind();
     s.disconnecting = m_closing;
-    s.connectionError = m_tci->lastError();
+    s.connectionError = m_radio->lastError();
     s.serverName = radio.serverName;
     s.serverVersion = radio.serverVersion;
     s.device = radio.device;
     s.receiveOnly = radio.receiveOnly;
     s.trxCount = radio.trxCount;
-    s.connectedPort = m_tci->connectedPort();
+    s.connectedPort = m_radio->connectedPort();
     s.receiver = m_config.receiver;
     const RadioState::Receiver rx = radio.receivers.value(m_config.receiver);
     s.frequencyHz = rx.frequencyHz;
     s.modulation = rx.modulation;
     s.receiverEnabled = rx.enabled;
+    s.receiverName = rx.name;
     s.transmitting = rx.transmitting;
 
     s.mutePhase = m_mute->phase();
+    s.mutePriorLevel = m_mute->ownership().owned ? m_mute->ownership().priorLevel : -1;
 
     s.nrMethod = m_config.nrMethod;
     s.nrPreparing = m_nrPreparing;
@@ -1164,6 +1289,15 @@ void Engine::emitStatus()
     s.inputPeakDb = toDb(m_inputPeak);
     s.outputPeakDb = toDb(m_outputPeak);
     s.audioFlowing = m_audioConfirmed && m_lastBlockMs >= 0 && nowMs() - m_lastBlockMs < 1000;
+    const RadioBackend::Input input = m_radio->input();
+    s.inputDevice = input.device;
+    s.inputRate = input.sampleRate;
+    s.inputOverflows = input.overflows;
+    const RadioBackend::Cat cat = m_radio->cat();
+    s.catUsed = cat.used;
+    s.catReady = cat.ready;
+    s.catPort = cat.port;
+    s.catError = cat.error;
     s.blocksPerSecond = m_blocksPerSecond;
     s.blocks = m_blocks;
     s.droppedBlocks = m_droppedBlocks;

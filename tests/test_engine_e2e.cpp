@@ -3,6 +3,7 @@
 #include "app/Engine.h"
 #include "app/WavFile.h"
 #include "audio/AudioSink.h"
+#include "tci/TciClient.h"
 
 #include <QDir>
 #include <QElapsedTimer>

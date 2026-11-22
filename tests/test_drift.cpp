@@ -21,12 +21,12 @@ struct DriftResult {
     double minFill{1e12};
 };
 
-// Simulates a TCI producer in bursty blocks against a device consuming fixed buffers,
-// with the two clocks disagreeing by `clockErrorPpm`.
-DriftResult simulate(double clockErrorPpm, double seconds, int blockFrames, double jitterMs)
+// Simulates a producer in bursty blocks (TCI's, or a USB radio's codec callbacks) against a
+// device consuming fixed buffers, with the two clocks disagreeing by `clockErrorPpm`.
+DriftResult simulate(double clockErrorPpm, double seconds, int blockFrames, double jitterMs, int deviceBuffer = 256)
 {
     constexpr double kRate = 48000.0;
-    constexpr int kDeviceBuffer = 256;
+    const int kDeviceBuffer = deviceBuffer;
     const double target = kRate * 0.06;
 
     DriftController drift(kRate, target);
@@ -98,6 +98,37 @@ private slots:
         const DriftResult r = simulate(50.0, 4 * 3600.0, 512, 3.0);
         QVERIFY(r.minFill > 0.0);
         QVERIFY(std::abs(r.finalErrorMs) < 3.0);
+    }
+
+    // A USB radio: its codec has its own clock, hands over up to 1024 frames a callback, and is
+    // drained every 5 ms; the output may take up to 1024 frames a callback too. Half an hour
+    // at the worst clock errors a codec is expected to have.
+    void holdsTheBufferAgainstACaptureClock_data()
+    {
+        QTest::addColumn<double>("ppm");
+        QTest::addColumn<int>("deviceBuffer");
+        for (const double ppm : {-500.0, 500.0}) {
+            for (const int buffer : {256, 1024}) {
+                QTest::addRow("%+.0fppm, output %d", ppm, buffer) << ppm << buffer;
+            }
+        }
+    }
+
+    void holdsTheBufferAgainstACaptureClock()
+    {
+        QFETCH(double, ppm);
+        QFETCH(int, deviceBuffer);
+        const DriftResult r = simulate(ppm, 1800.0, 1024, 5.0, deviceBuffer);
+        QVERIFY2(r.minFill > 0.0, "the buffer ran dry");
+        // Held near its target: within half an output callback, since the level is only
+        // ever seen a callback at a time.
+        const double allowedMs = std::max(5.0, 0.5 * deviceBuffer / 48.0);
+        QVERIFY2(r.worstLateErrorMs < allowedMs, qPrintable(QString::number(r.worstLateErrorMs)));
+        // It learned the clock error. A 21 ms callback reads the level coarsely, so the
+        // correction at any one moment carries more of its quick part: 200 ppm is still a
+        // pitch change of 0.02 %, far below hearing.
+        const double allowedPpm = deviceBuffer > 256 ? 200.0 : 30.0;
+        QVERIFY2(std::abs(r.finalPpm - ppm) < allowedPpm, qPrintable(QString::number(r.finalPpm)));
     }
 
     void survivesTheDefaultLargeBlocks()

@@ -6,12 +6,14 @@
 #include "app/Settings.h"
 #include "audio/AudioSink.h"
 #include "dsp/RxChain.h"
+#include "radio/CatTransport.h"
+#include "radio/RadioBackend.h"
 #include "tci/MuteController.h"
-#include "tci/TciClient.h"
 
 #include <QElapsedTimer>
 #include <QHash>
 #include <QObject>
+#include <QPointer>
 #include <QSet>
 #include <QStringList>
 #include <QThreadPool>
@@ -26,7 +28,8 @@ namespace esa {
 
 // A snapshot for display, emitted several times a second.
 struct EngineStatus {
-    TciClient::State connection{TciClient::State::Disconnected};
+    RadioBackend::Link connection{RadioBackend::Link::Disconnected};
+    QString radioKind{QStringLiteral("tci")};  // the backend reaching the radio: "tci" or "usb"
     // Disconnect was pressed and the link stays up until ExpertSDR3 has its mute back. The
     // radio's audio still plays meanwhile, but it is no longer this session's.
     bool disconnecting{false};
@@ -36,18 +39,30 @@ struct EngineStatus {
     int trxCount{0};
     int connectedPort{0};
     int receiver{0};
+    QString receiverName;  // "Main", "Sub" where the radio names its receivers; empty otherwise
     qint64 frequencyHz{0};
     QString modulation;
     bool receiverEnabled{true};
     bool transmitting{false};
 
     MuteController::Phase mutePhase{MuteController::Phase::Idle};
+    int mutePriorLevel{-1};  // a level control's level, to go back to, while one is owed
 
     QString nrMethod;         // what the operator selected; empty when off
     bool nrPreparing{false};  // still being built off the audio path
     bool nrFailed{false};     // construction failed; running dry
     bool nrBypassedByMode{false};
     float nrGainDb{0.0f};
+
+    // A radio heard through this computer's sound hardware: the device its audio comes in on.
+    QString inputDevice;
+    int inputRate{0};
+    quint64 inputOverflows{0};
+    // CAT beside a USB radio's audio.
+    bool catUsed{false};
+    bool catReady{false};
+    QString catPort;
+    QString catError;
 
     QString outputDevice;
     QString outputError;
@@ -109,6 +124,9 @@ class Engine : public QObject {
 public:
     using SinkFactory = std::function<std::unique_ptr<AudioSink>(
         const AppConfig& config, QString* error)>;
+    // Makes the backend for a kind of radio ("tci", "usb"), parented to the engine. Empty
+    // when the kind is unknown.
+    using BackendFactory = std::function<RadioBackend*(const QString& kind, QObject* parent)>;
 
     // `settingsPath` selects the settings store for mute ownership. Empty uses the
     // default store. `sinkFactory` is a seam for tests; empty uses real devices.
@@ -120,6 +138,12 @@ public:
     // The same object for the engine's whole life, so any thread may call this. Holding
     // it keeps the data valid after the engine is gone.
     std::shared_ptr<LiveTaps> taps() const { return m_taps; }
+
+    // A seam for tests: how backends are made. Set before the first connectRadio().
+    void setBackendFactory(BackendFactory factory);
+    // A seam for tests: the port the Radio page's CAT Test opens. Empty opens real serial ports.
+    using CatTransportFactory = std::function<std::unique_ptr<CatTransport>(QObject* parent)>;
+    void setCatTransportFactory(CatTransportFactory factory) { m_catTransport = std::move(factory); }
 
     // For tests only: a stage parameter as the chain the audio runs through holds it. False
     // before the first configure(), or for a key that is not a stage's. It reads the chain
@@ -134,12 +158,19 @@ public slots:
     // meanwhile takes effect straight after that, so switching radios cannot lose its way.
     void disconnectRadio();
     void setReceiver(int receiver);
+    // A USB radio's input trim, applied at once.
+    void setUsbTrimDb(double db);
+    // The Radio page's CAT Test: asks the radio on `port` who it is (ID;) and nothing else,
+    // then closes the port. Answered by catTested. Only while no session holds the port.
+    void testCat(const QString& port, int baud);
     void setOutputDevice(const QString& deviceKey);
     void setBufferMs(int ms);
     void setOutputGainDb(double db);
     void setBoost(bool on);
     void setOutputMuted(bool muted);
     void setMuteExpert(bool on);
+    // Turn a USB radio's AF down while this app plays, where its model can.
+    void setUsbAfMute(bool on);
     void setNrAutoBypass(bool on);
     void setNrMethod(const QString& id);
     void setStageOrder(const QStringList& order);
@@ -179,6 +210,8 @@ public slots:
 signals:
     void statusChanged(const esa::EngineStatus& status);
     void devicesChanged(const QList<esa::AudioDeviceInfo>& devices);
+    // The input devices, after the same rescan: where a USB radio's codec is chosen.
+    void inputDevicesChanged(const QList<esa::AudioDeviceInfo>& devices);
     void connectedPortChanged(int port);
     // Once each time REC is refused or a recording stops early (disk full, folder not writable).
     // The same text is in EngineStatus::recording.error. Whatever reached the disk is kept, and
@@ -187,11 +220,14 @@ signals:
     void recordingFailed(const QString& reason);
     // PLAY was refused (nothing recorded, another sample rate, no output) or stopped early.
     void playbackFailed(const QString& reason);
+    // What testCat found.
+    void catTested(bool ok, const QString& text);
 
 private slots:
-    void onAudioBlock(const esa::tci::StreamHeader& header, const QByteArray& frame);
-    void onConnectionState(esa::TciClient::State state);
+    void onAudioBlock(int receiver, const float* stereo, int frames, int sampleRate);
+    void onConnectionState(esa::RadioBackend::Link state);
     void onMuteReported(bool muted);
+    void onSpeakerLink(bool up);
     void onModulationChanged(int receiver, const QString& modulation);
     void onTransmitChanged(int receiver, bool transmitting);
     void onHousekeeping();
@@ -199,6 +235,9 @@ private slots:
 
 private:
     void finishClosing();
+    // The backend for m_config.radioKind, made anew when the kind changes. Only while no
+    // session is open on the old one.
+    void useBackendFor(const QString& kind);
     void rebuildChain(int sampleRate);
     // Everything done with a processed block: meters, taps, recording, capture and the speakers.
     void publishBlock(const float* stereo, int frames);
@@ -233,6 +272,8 @@ private:
     void startNrBuild();
     // Mute ownership belongs to one radio, so a different radio gets its own controller.
     void prepareMuteFor(const QString& host);
+    // Whose mute this session's is: a TCI host, or a USB radio's model.
+    QString muteKey() const;
     void openSink();
     void closeSink();
     void updateMuteWanted();
@@ -242,10 +283,14 @@ private:
     qint64 nowMs() const { return m_clock.elapsed(); }
 
     SinkFactory m_sinkFactory;
+    BackendFactory m_backendFactory;
+    CatTransportFactory m_catTransport;
+    QPointer<QObject> m_catProbe;  // the CAT Test running, if one is
     std::unique_ptr<Settings> m_settings;
     AppConfig m_config;
 
-    TciClient* m_tci;
+    RadioBackend* m_radio{nullptr};
+    RadioBackend::Capabilities m_caps;
     std::unique_ptr<MuteController> m_mute;
     QString m_muteHost;
     std::unique_ptr<RxChain> m_chain;
@@ -284,6 +329,9 @@ private:
     QString m_outputError;
     QString m_outputDeviceName;
     qint64 m_lastBlockMs{-1};
+    // The last block above the silence floor. A USB codec streams whether or not the radio is
+    // on, so for it only sound, not blocks, shows the radio is there.
+    qint64 m_lastSoundMs{-1};
     qint64 m_nextSinkRetryMs{0};
 
     QString m_modulation;
@@ -292,8 +340,6 @@ private:
     std::vector<float> m_decoded;
     QByteArray m_input;
 
-    bool m_counterValid{false};
-    quint32 m_lastCounter{0};
     quint64 m_blocks{0};
     quint64 m_droppedBlocks{0};
     quint64 m_malformedBlocks{0};

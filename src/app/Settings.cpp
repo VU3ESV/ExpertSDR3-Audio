@@ -1,5 +1,7 @@
 #include "app/Settings.h"
 
+#include "radio/UsbModels.h"
+
 #include "app/AppInfo.h"
 #include "dsp/NrProcessor.h"
 #include "dsp/RxChain.h"
@@ -86,6 +88,17 @@ AppConfig Settings::load() const
 {
     AppConfig c;
     QSettings& s = *m_settings;
+    // Absent in files from before USB radios: those were all ExpertSDR3 over TCI.
+    const QString kind = s.value(QStringLiteral("radio/kind"), c.radioKind).toString();
+    if (kind == QLatin1String("tci") || kind == QLatin1String("usb")) c.radioKind = kind;
+    c.usbModel = usb::model(s.value(QStringLiteral("radio/usb/model"), c.usbModel).toString()).id;
+    c.usbInput = s.value(QStringLiteral("radio/usb/input")).toString();
+    const double trimDb = s.value(QStringLiteral("radio/usb/trimDb"), c.usbTrimDb).toDouble();
+    if (std::isfinite(trimDb)) c.usbTrimDb = std::clamp(trimDb, kMinUsbTrimDb, kMaxUsbTrimDb);
+    c.usbCatPort = s.value(QStringLiteral("radio/usb/cat/port")).toString();
+    const int baud = s.value(QStringLiteral("radio/usb/cat/baud"), c.usbCatBaud).toInt();
+    if (kCatBauds.contains(baud)) c.usbCatBaud = baud;
+    c.usbAfMute = s.value(QStringLiteral("radio/usb/afMute"), c.usbAfMute).toBool();
     c.host = s.value(QStringLiteral("radio/host"), c.host).toString();
     c.port = s.value(QStringLiteral("radio/port"), c.port).toInt();
     c.receiver = s.value(QStringLiteral("radio/receiver"), c.receiver).toInt();
@@ -120,6 +133,13 @@ AppConfig Settings::load() const
 void Settings::save(const AppConfig& c)
 {
     QSettings& s = *m_settings;
+    s.setValue(QStringLiteral("radio/kind"), c.radioKind);
+    s.setValue(QStringLiteral("radio/usb/model"), c.usbModel);
+    s.setValue(QStringLiteral("radio/usb/input"), c.usbInput);
+    s.setValue(QStringLiteral("radio/usb/trimDb"), c.usbTrimDb);
+    s.setValue(QStringLiteral("radio/usb/cat/port"), c.usbCatPort);
+    s.setValue(QStringLiteral("radio/usb/cat/baud"), c.usbCatBaud);
+    s.setValue(QStringLiteral("radio/usb/afMute"), c.usbAfMute);
     s.setValue(QStringLiteral("radio/host"), c.host);
     s.setValue(QStringLiteral("radio/port"), c.port);
     s.setValue(QStringLiteral("radio/receiver"), c.receiver);
@@ -160,6 +180,7 @@ Settings::MuteOwnership Settings::loadMuteOwnership(const QString& radioHost) co
     MuteOwnership o;
     o.owned = m_settings->value(group + QStringLiteral("/owned"), false).toBool();
     o.priorMuted = m_settings->value(group + QStringLiteral("/priorMuted"), false).toBool();
+    o.priorLevel = m_settings->value(group + QStringLiteral("/priorLevel"), -1).toInt();
     return o;
 }
 
@@ -169,6 +190,8 @@ void Settings::saveMuteOwnership(const QString& radioHost, const MuteOwnership& 
     if (o.owned) {
         m_settings->setValue(group + QStringLiteral("/owned"), true);
         m_settings->setValue(group + QStringLiteral("/priorMuted"), o.priorMuted);
+        if (o.priorLevel >= 0) m_settings->setValue(group + QStringLiteral("/priorLevel"), o.priorLevel);
+        else m_settings->remove(group + QStringLiteral("/priorLevel"));
     } else {
         m_settings->remove(group);  // nothing owed: leave no trace of every radio ever used
     }

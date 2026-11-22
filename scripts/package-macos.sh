@@ -131,7 +131,15 @@ if [ -n "$IDENTITY" ]; then
   while IFS= read -r -d '' framework; do
     cs "${SIGN[@]}" "$framework"
   done < <(find "$APP/Contents/Frameworks" -type d -name '*.framework' -prune -print0 2>/dev/null)
-  cs "${SIGN[@]}" "$APP"
+  # The app alone carries the entitlements: a USB radio's codec is an audio input.
+  cs "${SIGN[@]}" --entitlements packaging/macos/ExpertSDR3Audio.entitlements "$APP"
+  # Without either of these macOS refuses a USB radio's audio, so a release must have both.
+  if ! codesign -d --entitlements - "$APP" 2>/dev/null | grep -q 'com.apple.security.device.audio-input'; then
+    echo "ERROR: the signed app lacks the audio-input entitlement" >&2; exit 1
+  fi
+  if ! /usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' "$APP/Contents/Info.plist" >/dev/null; then
+    echo "ERROR: Info.plist lacks NSMicrophoneUsageDescription" >&2; exit 1
+  fi
 else
   echo "==> WARNING: no signing identity, ad-hoc signing. This build will NOT pass Gatekeeper."
   codesign --force --sign - --deep "$APP"

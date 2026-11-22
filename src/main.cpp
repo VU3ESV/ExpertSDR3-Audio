@@ -2,6 +2,9 @@
 #include "app/Profiles.h"
 #include "app/Settings.h"
 #include "audio/PortAudioSink.h"
+#include "audio/PortAudioSource.h"
+#include "radio/CatTransport.h"
+#include "radio/UsbModels.h"
 #include "dsp/NrProcessor.h"
 #include "dsp/RxChain.h"
 #include "gui/MainWindow.h"
@@ -65,6 +68,46 @@ void printDevices()
     out() << "(* = system default)\n";
 }
 
+void printInputs()
+{
+    const auto devices = audio::listInputDevices();
+    if (devices.isEmpty()) {
+        out() << "No audio input devices found.\n";
+        return;
+    }
+    out() << "Audio input devices (a USB radio's codec is one of these):\n";
+    for (const AudioDeviceInfo& d : devices) {
+        out() << (d.isDefault ? "  * " : "    ") << d.name << "\n"
+              << "      " << d.hostApi << ", " << d.maxInputChannels << " ch, "
+              << int(d.defaultSampleRate) << " Hz\n"
+              << "      --input \"" << d.key << "\"\n";
+    }
+    out() << "(* = system default)\n";
+}
+
+// Lists the serial ports and opens none: a port may belong to an amplifier, a GPS or a panel.
+void printSerialPorts()
+{
+    const auto ports = listSerialPorts();
+    if (ports.isEmpty()) {
+        out() << "No serial ports found.\n";
+        return;
+    }
+    out() << "Serial ports (a USB radio's CAT port is one of these; none was opened):\n";
+    for (const QSerialPortInfo& port : ports) {
+        out() << "    " << port.portName();
+        if (!port.description().isEmpty()) out() << "  " << port.description();
+        if (port.hasVendorIdentifier() && port.hasProductIdentifier()) {
+            out() << "  " << QStringLiteral("%1:%2")
+                                 .arg(port.vendorIdentifier(), 4, 16, QLatin1Char('0'))
+                                 .arg(port.productIdentifier(), 4, 16, QLatin1Char('0'))
+                                 .toUpper();
+        }
+        if (!port.serialNumber().isEmpty()) out() << "  serial " << port.serialNumber();
+        out() << "\n      --cat-port \"" << port.portName() << "\"\n";
+    }
+}
+
 void printParams()
 {
     out() << "NR methods (--nr):\n  off\n";
@@ -76,6 +119,14 @@ void printParams()
         if (!s.choices.isEmpty()) out() << "  (" << s.choices.join(QStringLiteral(", ")) << ")";
         out() << "\n";
     }
+}
+
+// The USB radios this build knows, for --usb-model.
+QString usbModelList()
+{
+    QStringList ids;
+    for (const UsbModel& model : usb::models()) ids << QStringLiteral("%1 (%2)").arg(model.id, model.label());
+    return ids.join(QStringLiteral(", "));
 }
 
 QString pageIdList()
@@ -105,6 +156,23 @@ int runDiscovery()
         out() << "No radios found. Check that ExpertSDR3 is running with TCI enabled, and that its firewall allows the port.\n";
     }
     return 0;
+}
+
+// A key, an exact name or a unique part of a name, so `--input "CODEC"` works. Never the default
+// input: that would be this computer's microphone taken for the radio.
+QString resolveInput(const QString& wanted, QString* error)
+{
+    const auto devices = audio::listInputDevices();
+    QStringList partial;
+    for (const AudioDeviceInfo& d : devices) {
+        if (d.key == wanted || d.name == wanted) return d.key;
+        if (d.name.contains(wanted, Qt::CaseInsensitive)) partial.append(d.key);
+    }
+    if (partial.size() == 1) return partial.first();
+    *error = partial.isEmpty()
+                 ? QStringLiteral("No input device matches \"%1\". Try --list-inputs.").arg(wanted)
+                 : QStringLiteral("\"%1\" matches several inputs: %2").arg(wanted, partial.join(QStringLiteral(", ")));
+    return {};
 }
 
 // A key, an exact name or a unique part of a name, so `--device "USB"` works.
@@ -137,13 +205,13 @@ const char* muteName(MuteController::Phase phase)
     return "?";
 }
 
-const char* connectionName(TciClient::State state)
+const char* connectionName(RadioBackend::Link state)
 {
     switch (state) {
-    case TciClient::State::Disconnected: return "disconnected";
-    case TciClient::State::Connecting: return "connecting";
-    case TciClient::State::Initializing: return "initializing";
-    case TciClient::State::Ready: return "ready";
+    case RadioBackend::Link::Disconnected: return "disconnected";
+    case RadioBackend::Link::Connecting: return "connecting";
+    case RadioBackend::Link::Initializing: return "initializing";
+    case RadioBackend::Link::Ready: return "ready";
     }
     return "?";
 }
@@ -231,6 +299,14 @@ int runHeadless(EngineHost& host, const AppConfig& config, const QString& captur
               << "  drift " << QString::number(s.sink.driftPpm, 'f', 0) << " ppm"
               << "  underruns " << s.sink.underruns
               << "  mute " << muteName(s.mutePhase);
+        if (!s.inputDevice.isEmpty()) {
+            out() << "  input " << s.inputDevice << " " << s.inputRate << " Hz";
+            if (s.inputOverflows > 0) out() << " (lost " << s.inputOverflows << " times)";
+        }
+        if (s.catUsed) {
+            out() << "  cat " << s.catPort << " "
+                  << (s.catReady ? QStringLiteral("ready") : QStringLiteral("waiting: %1").arg(s.catError));
+        }
         if (s.recording.active) {
             out() << "  rec " << QString::number(s.recording.seconds, 'f', 0) << " s";
             if (s.recording.droppedFrames > 0) out() << " (dropped " << s.recording.droppedFrames << " frames)";
@@ -259,6 +335,13 @@ int runHeadless(EngineHost& host, const AppConfig& config, const QString& captur
     const EngineStatus& s = *last;
     QJsonObject summary{
         {QStringLiteral("connection"), QString::fromLatin1(connectionName(s.connection))},
+        {QStringLiteral("radio"), s.radioKind},
+        {QStringLiteral("inputDevice"), s.inputDevice},
+        {QStringLiteral("inputRate"), s.inputRate},
+        {QStringLiteral("inputOverflows"), double(s.inputOverflows)},
+        {QStringLiteral("catPort"), s.catPort},
+        {QStringLiteral("catReady"), s.catReady},
+        {QStringLiteral("catError"), s.catError},
         {QStringLiteral("server"), s.serverName + QLatin1Char(' ') + s.serverVersion},
         {QStringLiteral("device"), s.device},
         {QStringLiteral("port"), s.connectedPort},
@@ -308,7 +391,7 @@ int main(int argc, char** argv)
     // such as a headless Raspberry Pi cannot create a QApplication at all.
     bool consoleOnly = false;
     for (int i = 1; i < argc; ++i) {
-        for (const char* flag : {"--headless", "--list-devices", "--list-params", "--discover", "--list-profiles",
+        for (const char* flag : {"--headless", "--list-devices", "--list-inputs", "--list-serial", "--list-params", "--discover", "--list-profiles",
                                  "--import-profile", "--export-profile", "--help", "-h", "--version", "-v"}) {
             if (std::strcmp(argv[i], flag) == 0) consoleOnly = true;
         }
@@ -337,11 +420,20 @@ int main(int argc, char** argv)
 
     QCommandLineParser parser;
     parser.setApplicationDescription(
-        QStringLiteral("Plays ExpertSDR3 receive audio through the AetherRX noise-reduction chain."));
+        QStringLiteral("Plays a radio's receive audio through the AetherRX noise-reduction chain: ExpertSDR3 over "
+                       "TCI, or a radio's own USB audio, such as a Kenwood TS-990S's."));
     parser.addHelpOption();
     parser.addVersionOption();
     const QCommandLineOption headlessOpt(QStringLiteral("headless"), QStringLiteral("Run without a window."));
     const QCommandLineOption listDevicesOpt(QStringLiteral("list-devices"), QStringLiteral("List audio output devices and exit."));
+    const QCommandLineOption listInputsOpt(QStringLiteral("list-inputs"), QStringLiteral("List audio input devices, where a USB radio's codec appears, and exit."));
+    const QCommandLineOption radioOpt(QStringLiteral("radio"), QStringLiteral("How the radio is reached: \"tci\" (ExpertSDR3) or \"usb\" (its own USB audio)."), QStringLiteral("kind"));
+    const QCommandLineOption usbModelOpt(QStringLiteral("usb-model"), QStringLiteral("The USB radio: %1.").arg(usbModelList()), QStringLiteral("id"));
+    const QCommandLineOption inputOpt(QStringLiteral("input"), QStringLiteral("A USB radio's audio input: key, name or part of a name. See --list-inputs."), QStringLiteral("device"));
+    const QCommandLineOption trimOpt(QStringLiteral("trim"), QStringLiteral("A USB radio's input trim in dB."), QStringLiteral("dB"));
+    const QCommandLineOption listSerialOpt(QStringLiteral("list-serial"), QStringLiteral("List serial ports, where a USB radio's CAT port appears, and exit. None is opened."));
+    const QCommandLineOption catPortOpt(QStringLiteral("cat-port"), QStringLiteral("A USB radio's CAT port, or none. Only this port is opened. See --list-serial."), QStringLiteral("port"));
+    const QCommandLineOption catBaudOpt(QStringLiteral("cat-baud"), QStringLiteral("The CAT port's baud rate, as the radio's menu has it."), QStringLiteral("baud"));
     const QCommandLineOption listParamsOpt(QStringLiteral("list-params"), QStringLiteral("List NR methods and chain parameters and exit."));
     const QCommandLineOption discoverOpt(QStringLiteral("discover"), QStringLiteral("Look for TCI radios on the local network and exit."));
     const QCommandLineOption listProfilesOpt(QStringLiteral("list-profiles"), QStringLiteral("List saved audio chain profiles and exit."));
@@ -358,7 +450,7 @@ int main(int argc, char** argv)
     const QCommandLineOption bufferOpt(QStringLiteral("buffer"), QStringLiteral("Output buffer in ms."), QStringLiteral("ms"));
     const QCommandLineOption deviceRateOpt(QStringLiteral("device-rate"), QStringLiteral("Force the output device's sample rate, converting to it if needed."), QStringLiteral("hz"));
     const QCommandLineOption rateOpt(QStringLiteral("rate"), QStringLiteral("Processing rate: 48000 (default) or 24000 for low-power machines."), QStringLiteral("hz"));
-    const QCommandLineOption noMuteOpt(QStringLiteral("no-mute"), QStringLiteral("Leave ExpertSDR3's own audio alone."));
+    const QCommandLineOption noMuteOpt(QStringLiteral("no-mute"), QStringLiteral("Leave the radio's own audio alone: ExpertSDR3's mute, and a USB radio's AF."));
     const QCommandLineOption captureOpt(QStringLiteral("capture"), QStringLiteral("Headless: record the radio's audio to <base>.before.wav and the chain's output to <base>.after.wav (or the next free names; a rate change continues in _part2)."), QStringLiteral("base"));
     const QCommandLineOption recordOpt(QStringLiteral("record"), QStringLiteral("Headless: record the chain's output from the first audio until exit or --duration, into this folder, named from the time, frequency and mode, or into this .wav file. An existing file is never replaced."), QStringLiteral("folder|file.wav"));
     const QCommandLineOption durationOpt(QStringLiteral("duration"), QStringLiteral("Headless: stop after this many seconds."), QStringLiteral("s"));
@@ -367,7 +459,7 @@ int main(int argc, char** argv)
     const QCommandLineOption screenshotOpt(QStringLiteral("screenshot"), QStringLiteral("Save a PNG of the window after 2 s and exit (development)."), QStringLiteral("file"));
     const QCommandLineOption pageOpt(QStringLiteral("page"), QStringLiteral("With --screenshot: the page to show (%1).").arg(pageIdList()), QStringLiteral("id"));
     const QCommandLineOption sizeOpt(QStringLiteral("size"), QStringLiteral("With --screenshot: the window's size, e.g. 724x752, instead of the saved one."), QStringLiteral("WxH"));
-    parser.addOptions({headlessOpt, listDevicesOpt, listParamsOpt, discoverOpt, listProfilesOpt, profileOpt,
+    parser.addOptions({headlessOpt, listDevicesOpt, listInputsOpt, radioOpt, usbModelOpt, inputOpt, trimOpt, listSerialOpt, catPortOpt, catBaudOpt, listParamsOpt, discoverOpt, listProfilesOpt, profileOpt,
                        importProfileOpt, exportProfileOpt, hostOpt, portOpt, rxOpt, deviceOpt, nrOpt,
                        setOpt, gainOpt, bufferOpt, deviceRateOpt, rateOpt, noMuteOpt, captureOpt, recordOpt, durationOpt,
                        settingsOpt, connectOpt, screenshotOpt, pageOpt, sizeOpt});
@@ -403,6 +495,14 @@ int main(int argc, char** argv)
 
     if (parser.isSet(listDevicesOpt)) {
         printDevices();
+        return 0;
+    }
+    if (parser.isSet(listInputsOpt)) {
+        printInputs();
+        return 0;
+    }
+    if (parser.isSet(listSerialOpt)) {
+        printSerialPorts();
         return 0;
     }
     if (parser.isSet(listParamsOpt)) {
@@ -461,6 +561,51 @@ int main(int argc, char** argv)
         config.profileName = profile->name;
     }
 
+    if (parser.isSet(radioOpt)) {
+        const QString kind = parser.value(radioOpt);
+        if (kind != QLatin1String("tci") && kind != QLatin1String("usb")) {
+            qCritical("--radio must be tci or usb");
+            return 2;
+        }
+        config.radioKind = kind;
+    }
+    if (parser.isSet(usbModelOpt)) {
+        const QString id = parser.value(usbModelOpt);
+        if (usb::model(id).id != id) {
+            qCritical("Unknown USB radio \"%s\". USB radios: %s", qPrintable(id), qPrintable(usbModelList()));
+            return 2;
+        }
+        config.usbModel = id;
+    }
+    if (parser.isSet(inputOpt)) {
+        QString error;
+        config.usbInput = resolveInput(parser.value(inputOpt), &error);
+        if (!error.isEmpty()) {
+            qCritical("%s", qPrintable(error));
+            return 2;
+        }
+    }
+    if (parser.isSet(trimOpt)) {
+        bool ok = false;
+        const double db = parser.value(trimOpt).toDouble(&ok);
+        if (!ok || !std::isfinite(db)) {
+            qCritical("--trim takes a number of dB, such as -3");
+            return 2;
+        }
+        config.usbTrimDb = std::clamp(db, kMinUsbTrimDb, kMaxUsbTrimDb);
+    }
+    if (parser.isSet(catPortOpt)) {
+        const QString port = parser.value(catPortOpt);
+        config.usbCatPort = port == QLatin1String("none") ? QString() : port;
+    }
+    if (parser.isSet(catBaudOpt)) {
+        const int baud = parser.value(catBaudOpt).toInt();
+        if (!kCatBauds.contains(baud)) {
+            qCritical("--cat-baud must be one of 4800, 9600, 19200, 38400, 57600, 115200");
+            return 2;
+        }
+        config.usbCatBaud = baud;
+    }
     if (parser.isSet(hostOpt)) config.host = parser.value(hostOpt);
     if (parser.isSet(portOpt)) {
         config.port = parser.value(portOpt).toInt();
@@ -480,7 +625,10 @@ int main(int argc, char** argv)
     }
     if (parser.isSet(bufferOpt)) config.bufferMs = parser.value(bufferOpt).toInt();
     if (parser.isSet(deviceRateOpt)) config.deviceRate = parser.value(deviceRateOpt).toInt();
-    if (parser.isSet(noMuteOpt)) config.muteExpert = false;
+    if (parser.isSet(noMuteOpt)) {
+        config.muteExpert = false;
+        config.usbAfMute = false;
+    }
     if (parser.isSet(rateOpt)) {
         const int rate = parser.value(rateOpt).toInt();
         if (rate != 24000 && rate != 48000) {

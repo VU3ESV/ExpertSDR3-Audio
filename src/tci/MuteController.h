@@ -41,10 +41,14 @@ public:
     struct Ownership {
         bool owned{false};       // we set the mute and still owe a restore
         bool priorMuted{false};  // what the server reported before we touched it
+        int priorLevel{-1};      // a level control's level before we turned it down
     };
 
     struct Actions {
         std::function<void(bool muted)> sendMute;
+        // Instead of sendMute, for a speaker that is a level (the TS-990S's AF): 0 to silence it,
+        // and the level it had to give it back. A level never read is never sent.
+        std::function<void(int level)> sendLevel;
         std::function<void(const Ownership&)> persist;
     };
 
@@ -61,10 +65,17 @@ public:
     // Every MUTE state report from the server: init burst, echoes and changes
     // made by the operator or another client.
     void onServerMute(bool muted, qint64 nowMs);
+    // A level control's every reading: 0 counts as muted. The first on a connection is what
+    // makes the speaker known, so nothing is ever sent before one.
+    void onServerLevel(int level, qint64 nowMs);
+    // A level control's operator override lasts until this: the operator choosing the feature
+    // again, or a new session. A quiet spell that stops this app's audio is no such choice.
+    void rearm(qint64 nowMs);
     // Drives retries; call a few times a second.
     void tick(qint64 nowMs);
 
     Phase phase() const { return m_phase; }
+    const Ownership& ownership() const { return m_ownership; }
     bool wanted() const { return m_wanted; }
     // Nothing outstanding: safe to close the connection without losing a restore.
     bool settled() const;
@@ -74,7 +85,7 @@ private:
     void beginEngage(qint64 nowMs);
     void beginRelease(qint64 nowMs);
     void send(bool muted, qint64 nowMs);
-    void setOwnership(bool owned, bool priorMuted);
+    void setOwnership(bool owned, bool priorMuted, int priorLevel = -1);
 
     Actions m_actions;
     Ownership m_ownership;
@@ -83,6 +94,7 @@ private:
     bool m_connected{false};
     bool m_serverKnown{false};
     bool m_serverMuted{false};
+    int m_serverLevel{-1};
     qint64 m_lastSendMs{0};
     int m_attempts{0};
 };

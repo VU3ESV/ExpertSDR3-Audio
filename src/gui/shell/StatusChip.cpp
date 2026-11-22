@@ -40,24 +40,58 @@ QString colored(const QString& token, const QString& text)
 
 namespace statusText {
 
-QString radio(const EngineStatus& s)
+namespace {
+
+// A radio heard through its own USB codec: there is no server, and silence is the radio off.
+QString usbRadio(const EngineStatus& s)
 {
     QString radio;
     switch (s.connection) {
-    case TciClient::State::Disconnected:
+    case RadioBackend::Link::Disconnected:
+        return colored(kLabel, QStringLiteral("Not connected"));
+    case RadioBackend::Link::Connecting:
+    case RadioBackend::Link::Initializing:
+        radio = colored(kWarning, QStringLiteral("Waiting for the %1's audio...").arg(s.device));
+        if (!s.connectionError.isEmpty()) radio += QStringLiteral(" ") + colored(kLabel, QStringLiteral("(%1)").arg(s.connectionError));
+        return radio;
+    case RadioBackend::Link::Ready:
+        break;
+    }
+    QString line = QStringLiteral("%1 %2").arg(s.serverName, s.device).trimmed();
+    if (!s.receiverName.isEmpty()) line += QStringLiteral(" %1").arg(s.receiverName);
+    if (s.frequencyHz > 0) line += QStringLiteral("  ·  %1 %2").arg(formatFrequency(s.frequencyHz), s.modulation);
+    if (!s.inputDevice.isEmpty()) line += QStringLiteral("  ·  %1").arg(s.inputDevice);
+    radio = colored(kSuccess, line);
+    if (s.disconnecting) {
+        radio += QStringLiteral("<br>") + colored(kWarning, QStringLiteral("Disconnecting..."));
+    } else if (!s.audioFlowing) {
+        radio += QStringLiteral("<br>")
+                 + colored(kWarning, QStringLiteral("No sound from the radio. Is it switched on, with its USB audio output turned up?"));
+    }
+    return radio;
+}
+
+} // namespace
+
+QString radio(const EngineStatus& s)
+{
+    if (s.radioKind == QLatin1String("usb")) return usbRadio(s);
+    QString radio;
+    switch (s.connection) {
+    case RadioBackend::Link::Disconnected:
         radio = colored(kLabel, QStringLiteral("Not connected"));
         break;
-    case TciClient::State::Connecting: {
+    case RadioBackend::Link::Connecting: {
         radio = colored(kWarning, QStringLiteral("Looking for ExpertSDR3 on port %1...").arg(s.connectedPort));
         if (!s.connectionError.isEmpty()) {
             radio += QStringLiteral(" ") + colored(kLabel, QStringLiteral("(is TCI enabled in its options?)"));
         }
         break;
     }
-    case TciClient::State::Initializing:
+    case RadioBackend::Link::Initializing:
         radio = colored(kWarning, QStringLiteral("Connected, reading radio state..."));
         break;
-    case TciClient::State::Ready: {
+    case RadioBackend::Link::Ready: {
         QString line = QStringLiteral("%1 %2  ·  %3").arg(s.serverName, s.serverVersion, s.device);
         if (s.frequencyHz > 0) {
             line += QStringLiteral("  ·  %1 %2").arg(formatFrequency(s.frequencyHz), s.modulation);
@@ -81,6 +115,26 @@ QString radio(const EngineStatus& s)
 QString mute(const EngineStatus& s)
 {
     // Say what is true now, and whether anything needs doing.
+    if (s.radioKind == QLatin1String("usb")) {
+        // A USB radio's speaker is its AF level.
+        const QString radio = s.device.isEmpty() ? QStringLiteral("radio") : s.device;
+        const QString was = s.mutePriorLevel > 0 ? QStringLiteral(" (it was %1)").arg(s.mutePriorLevel) : QString();
+        switch (s.mutePhase) {
+        case MuteController::Phase::Holding:
+            return colored(kSuccess, QStringLiteral("%1 AF turned down%2").arg(radio, was));
+        case MuteController::Phase::Engaging:
+            return colored(kWarning, QStringLiteral("Turning the %1's AF down...").arg(radio));
+        case MuteController::Phase::Restoring:
+            return colored(kWarning, QStringLiteral("Giving the %1's AF back...").arg(radio));
+        case MuteController::Phase::OperatorOverride:
+            return colored(kWarning, QStringLiteral("You turned the %1's AF up; leaving it alone").arg(radio));
+        case MuteController::Phase::Failed:
+            return colored(kDanger, QStringLiteral("The %1 did not take its AF level%2").arg(radio, was));
+        case MuteController::Phase::Idle:
+            break;
+        }
+        return QString();
+    }
     switch (s.mutePhase) {
     case MuteController::Phase::Holding:
         return colored(kSuccess, QStringLiteral("ExpertSDR3 muted"));
@@ -155,7 +209,9 @@ StatusChip::Summary StatusChip::summarize(const EngineStatus& s, bool recordingF
         return {QStringLiteral("Output: %1").arg(s.outputError), QStringLiteral("danger"), QStringLiteral("output")};
     }
     if (s.mutePhase == MuteController::Phase::Failed) {
-        return {QStringLiteral("ExpertSDR3 mute failed"), QStringLiteral("danger"), radioPage};
+        const QString text = s.radioKind == QLatin1String("usb") ? QStringLiteral("%1 AF level failed").arg(s.device)
+                                                                 : QStringLiteral("ExpertSDR3 mute failed");
+        return {text, QStringLiteral("danger"), radioPage};
     }
     if (s.dspLoad > 0.85) return {QStringLiteral("Can't keep up: try NR2"), QStringLiteral("danger"), nrPage};
     if (s.nrFailed) return {QStringLiteral("NR failed: running dry"), QStringLiteral("danger"), nrPage};
@@ -170,12 +226,12 @@ StatusChip::Summary StatusChip::summarize(const EngineStatus& s, bool recordingF
     // this session's any more: the radio is going, not silent.
     if (s.disconnecting) return {QStringLiteral("Disconnecting…"), QStringLiteral("warning"), radioPage};
     switch (s.connection) {
-    case TciClient::State::Disconnected:
+    case RadioBackend::Link::Disconnected:
         return {QStringLiteral("Not connected"), QStringLiteral("idle"), radioPage};
-    case TciClient::State::Connecting:
-    case TciClient::State::Initializing:
+    case RadioBackend::Link::Connecting:
+    case RadioBackend::Link::Initializing:
         return {QStringLiteral("Connecting…"), QStringLiteral("warning"), radioPage};
-    case TciClient::State::Ready:
+    case RadioBackend::Link::Ready:
         break;
     }
     if (!s.audioFlowing) return {QStringLiteral("No audio from radio"), QStringLiteral("warning"), radioPage};
@@ -189,12 +245,13 @@ StatusChip::Summary StatusChip::summarize(const EngineStatus& s, bool recordingF
     }
 
     QStringList parts;
+    if (s.radioKind == QLatin1String("usb") && s.frequencyHz <= 0 && s.modulation.isEmpty()) parts << s.device;
     if (s.frequencyHz > 0) {
         parts << QStringLiteral("%1 %2").arg(formatFrequency(s.frequencyHz), s.modulation).trimmed();
     } else if (!s.modulation.isEmpty()) {
         parts << s.modulation;
     }
-    parts << QStringLiteral("RX%1").arg(s.receiver + 1);
+    parts << (s.receiverName.isEmpty() ? QStringLiteral("RX%1").arg(s.receiver + 1) : s.receiverName);
     if (s.transmitting) parts << QStringLiteral("TX");
     return {QStringLiteral("● ") + parts.join(QStringLiteral(" · ")), QStringLiteral("success"), radioPage};
 }

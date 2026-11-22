@@ -1,8 +1,7 @@
 #include "audio/PortAudioSink.h"
 
 #include "app/TestSandbox.h"
-
-#include <portaudio.h>
+#include "audio/PortAudioCommon.h"
 
 #include <QLoggingCategory>
 
@@ -15,30 +14,7 @@ namespace esa {
 
 namespace {
 
-// PortAudio's library state is process-wide and reference counted, and it snapshots
-// the device list when first initialised, so a rescan needs every holder to let go.
-class PaLibrary {
-public:
-    PaLibrary() : m_error(Pa_Initialize()) {}
-    ~PaLibrary()
-    {
-        if (m_error == paNoError) Pa_Terminate();
-    }
-    PaLibrary(const PaLibrary&) = delete;
-    PaLibrary& operator=(const PaLibrary&) = delete;
-    bool ok() const { return m_error == paNoError; }
-    QString errorText() const { return QString::fromUtf8(Pa_GetErrorText(m_error)); }
-
-private:
-    PaError m_error;
-};
-
-QString deviceKeyFor(const PaDeviceInfo* info)
-{
-    const PaHostApiInfo* host = Pa_GetHostApiInfo(info->hostApi);
-    return QStringLiteral("%1|%2").arg(host ? QString::fromUtf8(host->name) : QString(),
-                                       QString::fromUtf8(info->name));
-}
+using audio::pa::deviceKeyFor;
 
 PaDeviceIndex findDevice(const QString& key)
 {
@@ -66,7 +42,7 @@ namespace audio {
 QList<AudioDeviceInfo> listOutputDevices()
 {
     QList<AudioDeviceInfo> devices;
-    PaLibrary library;
+    audio::pa::Library library;
     if (!library.ok()) {
         qCWarning(lcSink) << "PortAudio init failed:" << library.errorText();
         return devices;
@@ -82,6 +58,7 @@ QList<AudioDeviceInfo> listOutputDevices()
         device.name = QString::fromUtf8(info->name);
         device.hostApi = host ? QString::fromUtf8(host->name) : QString();
         device.maxOutputChannels = info->maxOutputChannels;
+        device.maxInputChannels = info->maxInputChannels;
         device.defaultSampleRate = info->defaultSampleRate;
         device.isDefault = i == defaultDevice;
         devices.append(device);
@@ -98,8 +75,8 @@ QString realOutputRefusal()
 
 } // namespace audio
 
-std::unique_ptr<PortAudioSink> PortAudioSink::open(const QString& deviceKey, int chainRate,
-                                                   int targetLatencyMs, int forcedDeviceRate, QString* error)
+std::unique_ptr<PortAudioSink> PortAudioSink::open(const QString& deviceKey, int chainRate, int targetLatencyMs,
+                                                   int forcedDeviceRate, QString* error, const QString& radioCodec)
 {
     const auto fail = [error](const QString& message) -> std::unique_ptr<PortAudioSink> {
         if (error) *error = message;
@@ -121,6 +98,13 @@ std::unique_ptr<PortAudioSink> PortAudioSink::open(const QString& deviceKey, int
     if (!info) {
         Pa_Terminate();
         return fail(QStringLiteral("No audio output device is available"));
+    }
+    if (audio::samePhysicalDevice(deviceKeyFor(info), radioCodec)) {
+        const QString name = QString::fromUtf8(info->name);
+        Pa_Terminate();
+        qCWarning(lcSink) << "Refused to play into the radio's own codec:" << name;
+        return fail(QStringLiteral("%1 is the radio's own audio. Sound sent there can make the radio "
+                                   "transmit, so choose another output.").arg(name));
     }
 
     PaStreamParameters params{};
