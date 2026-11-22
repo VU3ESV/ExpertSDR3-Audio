@@ -19,7 +19,7 @@ option(ENABLE_NNR  "NNR (WDSP neural NR)." ON)
 option(BUILD_TESTS "Build the test suite." ON)
 option(ESA_STATIC_PORTAUDIO "Build PortAudio from source and link it statically, ignoring any system copy." OFF)
 
-find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Widgets Network WebSockets)
+find_package(Qt6 6.4 REQUIRED COMPONENTS Core Gui Widgets Network WebSockets SerialPort)
 qt_standard_project_setup()
 
 set(AETHER_DIR ${CMAKE_SOURCE_DIR}/vendor/aethersdr)
@@ -284,13 +284,14 @@ qt_add_resources(aether_gui "canon_ticks"
 add_library(esa_core STATIC
     src/tci/TciProtocol.cpp src/tci/TciClient.cpp src/tci/TciDiscovery.cpp src/tci/MuteController.cpp
     src/radio/RadioBackend.h src/radio/TciBackend.cpp src/radio/UsbBackend.cpp src/radio/UsbModels.cpp
+    src/radio/CatTransport.h src/radio/SerialCatTransport.cpp src/radio/Ts990Cat.cpp
     src/dsp/RxChain.cpp src/dsp/NrRegistry.cpp
     src/audio/PlaybackBuffer.cpp src/audio/PortAudioSink.cpp src/audio/PortAudioSource.cpp
     src/audio/MicrophonePermission.cpp
     src/app/Engine.cpp src/app/Profiles.cpp src/app/Settings.cpp)
 target_include_directories(esa_core PUBLIC src)
 target_link_libraries(esa_core PUBLIC
-    Qt6::Core Qt6::Network Qt6::WebSockets aether_dsp esa_portaudio)
+    Qt6::Core Qt6::Network Qt6::WebSockets Qt6::SerialPort aether_dsp esa_portaudio)
 
 # ── Recording core: WAV files, the disk thread, PLAY's reader ─────────────────
 # Its own block so it re-applies onto a restructured build: wherever the core library
@@ -433,7 +434,7 @@ if(UNIX AND NOT APPLE)
     # runs the result on each release listed in build.yml, which is what keeps this honest.
     # qt6-qpa-plugins is what lets the window open at all.
     set(CPACK_DEBIAN_PACKAGE_DEPENDS
-        "libc6 (>= 2.36), libstdc++6, libasound2 | libasound2t64, libfftw3-double3, libfftw3-single3, libqt6core6 | libqt6core6t64, libqt6gui6 | libqt6gui6t64, libqt6widgets6 | libqt6widgets6t64, libqt6network6 | libqt6network6t64, libqt6websockets6 | libqt6websockets6t64, qt6-qpa-plugins")
+        "libc6 (>= 2.36), libstdc++6, libasound2 | libasound2t64, libfftw3-double3, libfftw3-single3, libqt6core6 | libqt6core6t64, libqt6gui6 | libqt6gui6t64, libqt6widgets6 | libqt6widgets6t64, libqt6network6 | libqt6network6t64, libqt6websockets6 | libqt6websockets6t64, libqt6serialport6 | libqt6serialport6t64, qt6-qpa-plugins")
     include(CPack)
 endif()
 
@@ -463,6 +464,10 @@ if(BUILD_TESTS)
     # A USB radio's audio, from a fake codec through the engine: channels, rates, a codec that
     # goes away, and the rule that the radio's own codec is never an output.
     esa_test(test_capture)
+    # The TS-990S's CAT against a mock radio: the allowlist, identifying it, following it,
+    # losing it, its AF level, and the Radio page's Test. No real serial port opens.
+    esa_test(test_ts990)
+    target_compile_definitions(test_ts990 PRIVATE ESA_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
     # Recording: the core, which re-runs itself as a child for the disk-full and crash cases, and
     # the app run headless with --record and --capture against an in-process MockExpert.
     esa_test(test_recorder tests/MockExpert.cpp)

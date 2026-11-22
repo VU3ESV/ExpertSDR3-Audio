@@ -1705,6 +1705,61 @@ private slots:
         QVERIFY(!input->isVisibleTo(page));
     }
 
+    // The TS-990S's CAT section: shown for it alone, with this computer's serial ports listed and
+    // none chosen for the operator, since one may be an amplifier's or a GPS's. Listing opens
+    // nothing. The Test is answered on the page; under the sandbox it is refused at once.
+    void theTs990sCatIsChosenOnTheRadioPage()
+    {
+        esa::AppConfig config;
+        config.radioKind = QStringLiteral("usb");
+        config.usbModel = QStringLiteral("ts990s");
+        make(config, silentSinks());
+        QObject::disconnect(m_core.get(), &esa::Engine::inputDevicesChanged, nullptr, nullptr);
+        QObject::disconnect(m_core.get(), &esa::Engine::devicesChanged, nullptr, nullptr);
+        m_window->showPage(QStringLiteral("radio"));
+        auto* page = m_window->findChild<esa::RadioPage*>();
+        QVERIFY(page);
+        page->showInputDevices({});
+        auto* kind = page->findChild<QComboBox*>(QStringLiteral("radioKind"));
+        auto* port = page->findChild<QComboBox*>(QStringLiteral("catPort"));
+        auto* baud = page->findChild<QComboBox*>(QStringLiteral("catBaud"));
+        auto* test = page->findChild<QPushButton*>(QStringLiteral("catTest"));
+        QVERIFY(kind && port && baud && test);
+        QVERIFY(port->isVisibleTo(page) && baud->isVisibleTo(page) && test->isVisibleTo(page));
+        QCOMPARE(port->itemText(0), QStringLiteral("None (audio only)"));
+        QCOMPARE(port->itemData(0).toString(), QString());
+        QCOMPARE(port->currentIndex(), 0);
+        QCOMPARE(m_window->config().usbCatPort, QString());
+        QCOMPARE(baud->currentData().toInt(), 115200);
+        baud->setCurrentIndex(baud->findData(38400));
+        QCOMPARE(m_window->config().usbCatBaud, 38400);
+
+        // A radio without CAT has no such section, and is never sent anything.
+        kind->setCurrentIndex(kind->findData(QStringLiteral("usb:generic")));
+        QVERIFY(!port->isVisibleTo(page));
+        QCOMPARE(m_window->config().usbCatPort, QString());
+        kind->setCurrentIndex(kind->findData(QStringLiteral("tci")));
+        QVERIFY(!port->isVisibleTo(page));
+
+        // A port chosen before and not here now is kept by name, and the Test asks it.
+        config.usbCatPort = QStringLiteral("/dev/esa-test-no-such-port");
+        make(config, silentSinks());
+        QObject::disconnect(m_core.get(), &esa::Engine::inputDevicesChanged, nullptr, nullptr);
+        QObject::disconnect(m_core.get(), &esa::Engine::devicesChanged, nullptr, nullptr);
+        m_window->showPage(QStringLiteral("radio"));
+        page = m_window->findChild<esa::RadioPage*>();
+        port = page->findChild<QComboBox*>(QStringLiteral("catPort"));
+        test = page->findChild<QPushButton*>(QStringLiteral("catTest"));
+        auto* label = page->findChild<QLabel*>(QStringLiteral("catStatus"));
+        QVERIFY(port && test && label);
+        QCOMPARE(port->currentText(), QStringLiteral("/dev/esa-test-no-such-port (not found)"));
+        QCOMPARE(m_window->config().usbCatPort, QStringLiteral("/dev/esa-test-no-such-port"));
+        QTest::ignoreMessage(QtWarningMsg, QRegularExpression(QStringLiteral("Test sandbox: refused to open a serial port")));
+        test->click();
+        QTRY_VERIFY(label->text().contains(QStringLiteral("ESA_TEST_SANDBOX")));
+        QVERIFY(test->isEnabled());
+    }
+
     // Two inputs that look like the radio's codec: neither is chosen for the operator.
     void aLookAlikeCodecIsNeverChosenForTheOperator()
     {

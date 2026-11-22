@@ -282,6 +282,7 @@ MainWindow::MainWindow(Engine* engine, std::shared_ptr<LiveTaps> taps, Settings*
     connect(m_engine, &Engine::devicesChanged, m_output, &OutputPage::showDevices, Qt::QueuedConnection);
     connect(m_engine, &Engine::connectedPortChanged, m_radio, &RadioPage::showConnectedPort, Qt::QueuedConnection);
     connect(m_engine, &Engine::inputDevicesChanged, m_radio, &RadioPage::showInputDevices, Qt::QueuedConnection);
+    connect(m_engine, &Engine::catTested, m_radio, &RadioPage::showCatTest, Qt::QueuedConnection);
 
     onEngine([engine = m_engine, config = m_config] {
         engine->configure(config);

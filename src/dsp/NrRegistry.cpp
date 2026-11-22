@@ -408,7 +408,16 @@ bool modeBypassesNr(const QString& modulation)
         QStringLiteral("WSPR"), QStringLiteral("FT8"), QStringLiteral("FT4"), QStringLiteral("JT65"),
         QStringLiteral("JT9"),
     };
-    return kModes.contains(modulation, Qt::CaseInsensitive);
+    // As Kenwood names them over CAT: CW reversed, FSK and PSK, and every DATA mode (USB-D1...).
+    static const QStringList kKenwood = {
+        QStringLiteral("CW-R"), QStringLiteral("FSK"), QStringLiteral("FSK-R"),
+        QStringLiteral("PSK"), QStringLiteral("PSK-R"),
+    };
+    if (kModes.contains(modulation, Qt::CaseInsensitive) || kKenwood.contains(modulation, Qt::CaseInsensitive)) {
+        return true;
+    }
+    return modulation.endsWith(QLatin1String("-D1")) || modulation.endsWith(QLatin1String("-D2"))
+           || modulation.endsWith(QLatin1String("-D3"));
 }
 
 bool modeIsComplexStereo(const QString& modulation)

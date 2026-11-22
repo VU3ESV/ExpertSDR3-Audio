@@ -17,6 +17,8 @@ inline constexpr double kMaxOutputGainDb = 30.0;
 // A USB radio's input trim.
 inline constexpr double kMinUsbTrimDb = -20.0;
 inline constexpr double kMaxUsbTrimDb = 20.0;
+// The baud rates a Kenwood's virtual serial port offers (TS-990S menu 0-07-01).
+inline const QList<int> kCatBauds{4800, 9600, 19200, 38400, 57600, 115200};
 
 // Everything that describes how the app should run. The GUI edits this, `--flags`
 // override it, and the engine consumes it.
@@ -29,6 +31,10 @@ struct AppConfig {
     QString usbModel{QStringLiteral("ts990s")};
     QString usbInput;  // an input device key; empty: none chosen yet, so nothing is opened
     double usbTrimDb{0.0};
+    // The radio's CAT port (QSerialPortInfo::portName) and baud rate, where the model has CAT.
+    // Empty: audio only, and nothing is ever sent to the radio.
+    QString usbCatPort;
+    int usbCatBaud{115200};
     QString host{QStringLiteral("127.0.0.1")};
     int port{40001};
     // Tried if nothing answers on `port`: the ports ExpertSDR3 installs commonly use.

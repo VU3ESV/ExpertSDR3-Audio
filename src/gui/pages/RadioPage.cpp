@@ -1,6 +1,7 @@
 #include "gui/pages/RadioPage.h"
 
 #include "gui/shell/StatusChip.h"
+#include "radio/CatTransport.h"
 #include "radio/UsbModels.h"
 
 #include "CanonIndicators.h"
@@ -164,6 +165,29 @@ QWidget* RadioPage::buildUsb()
     m_usbConnect->setMinimumWidth(130);
     m_usbSetup = hintLabel();
     m_usbSetup->setWordWrap(true);
+
+    // CAT, for a model that has it: frequency and mode read from the radio. Ports are listed
+    // only; nothing is opened until Test or Connect, and then only the one chosen.
+    m_catPort = new QComboBox;
+    m_catPort->setObjectName(QStringLiteral("catPort"));
+    m_catPort->setAccessibleName(QStringLiteral("CAT port"));
+    m_catPort->setToolTip(QStringLiteral("The radio's USB serial port, for reading its frequency and mode. "
+                                         "None: audio only, and nothing is ever sent to the radio."));
+    m_catBaud = new QComboBox;
+    m_catBaud->setObjectName(QStringLiteral("catBaud"));
+    m_catBaud->setAccessibleName(QStringLiteral("CAT baud rate"));
+    for (const int baud : kCatBauds) m_catBaud->addItem(QString::number(baud), baud);
+    m_catBaud->setCurrentIndex(std::max(0, m_catBaud->findData(config().usbCatBaud)));
+    m_catBaud->setToolTip(QStringLiteral("As the radio's USB baud rate is set (TS-990S menu 0-07-01)."));
+    m_catTest = new QPushButton(QStringLiteral("Test"));
+    m_catTest->setObjectName(QStringLiteral("catTest"));
+    m_catTest->setToolTip(QStringLiteral("Asks the radio who it is (ID;), and nothing else."));
+    m_catLabel = hintLabel();
+    m_catLabel->setObjectName(QStringLiteral("catStatus"));
+    m_catLabel->setWordWrap(true);
+    auto* catLabel = new QLabel(QStringLiteral("CAT"));
+    auto* baudLabel = new QLabel(QStringLiteral("Baud"));
+    m_catWidgets = {catLabel, m_catPort, baudLabel, m_catBaud, m_catTest, m_catLabel};
     m_usbLabel = hintLabel(colored(QStringLiteral("color.text.label"), QStringLiteral("Not connected")));
 
     grid->addWidget(new QLabel(QStringLiteral("Input")), 1, 0);
@@ -173,17 +197,39 @@ QWidget* RadioPage::buildUsb()
     grid->addWidget(m_usbReceiver, 2, 1);
     grid->addWidget(new QLabel(QStringLiteral("Trim")), 2, 2);
     grid->addWidget(m_usbTrim, 2, 3);
-    grid->addWidget(m_usbSetup, 3, 0, 1, 4);
+    grid->addWidget(catLabel, 3, 0);
+    grid->addWidget(m_catPort, 3, 1, 1, 2);
+    grid->addWidget(m_catTest, 3, 3);
+    grid->addWidget(baudLabel, 4, 0);
+    grid->addWidget(m_catBaud, 4, 1);
+    grid->addWidget(m_catLabel, 5, 0, 1, 4);
+    grid->addWidget(m_usbSetup, 6, 0, 1, 4);
     auto* buttons = new QHBoxLayout;
     buttons->addStretch(1);
     buttons->addWidget(m_usbConnect);
-    grid->addLayout(buttons, 4, 0, 1, 4);
-    grid->addWidget(m_usbLabel, 5, 0, 1, 4);
+    grid->addLayout(buttons, 7, 0, 1, 4);
+    grid->addWidget(m_usbLabel, 8, 0, 1, 4);
     grid->setColumnStretch(1, 1);
 
     connect(m_usbConnect, &QPushButton::toggled, this, &RadioPage::onConnectToggled);
-    connect(m_usbRefresh, &QPushButton::clicked, this,
-            [this] { context().post([](Engine* engine) { engine->refreshDevices(); }); });
+    connect(m_usbRefresh, &QPushButton::clicked, this, [this] {
+        fillCatPorts();
+        context().post([](Engine* engine) { engine->refreshDevices(); });
+    });
+    connect(m_catPort, &QComboBox::currentIndexChanged, this, [this](int index) {
+        config().usbCatPort = m_catPort->itemData(index).toString();
+        m_catLabel->clear();
+    });
+    connect(m_catBaud, &QComboBox::currentIndexChanged, this,
+            [this](int index) { config().usbCatBaud = m_catBaud->itemData(index).toInt(); });
+    connect(m_catTest, &QPushButton::clicked, this, [this] {
+        const QString port = config().usbCatPort;
+        const int baud = config().usbCatBaud;
+        if (port.isEmpty()) return;
+        m_catTest->setEnabled(false);
+        m_catLabel->setText(colored(QStringLiteral("color.text.label"), QStringLiteral("Asking the radio...")));
+        context().post([port, baud](Engine* engine) { engine->testCat(port, baud); });
+    });
     connect(m_usbInput, &QComboBox::currentIndexChanged, this, [this](int index) {
         config().usbInput = m_usbInput->itemData(index).toString();
         context().post([](Engine* engine) { engine->refreshDevices(); });  // the output list follows
@@ -214,10 +260,14 @@ void RadioPage::showKind()
     m_muteBox->setVisible(!usb);
     m_inputMeter->setToolTip(usb ? QStringLiteral("The level of the radio's USB audio, before any processing.")
                                  : QStringLiteral("The level of the audio arriving from ExpertSDR3, before any processing."));
+    const bool cat = usb && usb::model(config().usbModel).hasCat();
+    for (QWidget* widget : std::as_const(m_catWidgets)) widget->setVisible(cat);
+    if (!cat) config().usbCatPort.clear();  // a model with no CAT is never sent anything
     if (usb) {
         m_usbSetup->setText(colored(QStringLiteral("color.text.label"), usb::model(config().usbModel).setup));
         fillUsbReceivers();
         fillUsbInputs();
+        if (cat) fillCatPorts();
     }
 }
 
@@ -229,6 +279,43 @@ void RadioPage::fillUsbReceivers()
     for (int i = 0; i < model.receivers.size(); ++i) m_usbReceiver->addItem(model.receivers.at(i), i);
     m_usbReceiver->setCurrentIndex(std::max(0, m_usbReceiver->findData(config().receiver)));
     if (m_usbReceiver->currentIndex() >= 0) config().receiver = m_usbReceiver->currentData().toInt();
+}
+
+void RadioPage::fillCatPorts()
+{
+    const UsbModel& model = usb::model(config().usbModel);
+    const QString selected = config().usbCatPort;
+    const QSignalBlocker block(m_catPort);
+    m_catPort->clear();
+    m_catPort->addItem(QStringLiteral("None (audio only)"), QString());
+    const auto ports = listSerialPorts();
+    for (const QSerialPortInfo& port : ports) {
+        QString label = port.portName();
+        if (!port.description().isEmpty()) label += QStringLiteral("  ·  %1").arg(port.description());
+        if (port.hasVendorIdentifier() && port.hasProductIdentifier()) {
+            const QString id = QStringLiteral("%1:%2")
+                                   .arg(port.vendorIdentifier(), 4, 16, QLatin1Char('0'))
+                                   .arg(port.productIdentifier(), 4, 16, QLatin1Char('0'))
+                                   .toUpper();
+            label += QStringLiteral(" (%1)").arg(id);
+            // A hint only: never chosen for the operator, since another device may share the bridge.
+            if (!model.bridgeHint.isEmpty() && id == model.bridgeHint) label += QStringLiteral("  ◂ %1?").arg(model.name);
+        }
+        m_catPort->addItem(label, port.portName());
+    }
+    const int index = m_catPort->findData(selected);
+    if (index >= 0) {
+        m_catPort->setCurrentIndex(index);
+    } else {
+        m_catPort->addItem(QStringLiteral("%1 (not found)").arg(selected), selected);
+        m_catPort->setCurrentIndex(m_catPort->count() - 1);
+    }
+}
+
+void RadioPage::showCatTest(bool ok, const QString& text)
+{
+    m_catTest->setEnabled(!m_usbConnect->isChecked());
+    m_catLabel->setText(colored(ok ? QStringLiteral("color.accent.success") : QStringLiteral("color.accent.danger"), text));
 }
 
 void RadioPage::showInputDevices(const QList<AudioDeviceInfo>& devices)
@@ -402,6 +489,9 @@ void RadioPage::onConnectToggled(bool on)
     }
     m_kind->setEnabled(!on);
     m_usbInput->setEnabled(!on);
+    m_catPort->setEnabled(!on);
+    m_catBaud->setEnabled(!on);
+    m_catTest->setEnabled(!on);  // the session has the port
     if (on) {
         if (!usbRadio()) {
             config().host = m_host->text().trimmed();
@@ -452,6 +542,13 @@ void RadioPage::showStatus(const EngineStatus& s)
     const QString radio = statusText::radio(s);
     QLabel* label = s.radioKind == QLatin1String("usb") ? m_usbLabel : m_radioLabel;
     if (radio != label->text()) label->setText(radio);
+    if (s.radioKind == QLatin1String("usb") && s.catUsed && s.connection != RadioBackend::Link::Disconnected) {
+        const QString cat = s.catReady
+                                ? colored(QStringLiteral("color.accent.success"), QStringLiteral("CAT: reading the radio on %1").arg(s.catPort))
+                                : colored(QStringLiteral("color.accent.warning"),
+                                          QStringLiteral("CAT: %1").arg(s.catError.isEmpty() ? QStringLiteral("connecting...") : s.catError));
+        if (cat != m_catLabel->text()) m_catLabel->setText(cat);
+    }
 
     // The server knows how many receivers there are. Match it.
     if (s.radioKind == QLatin1String("tci") && s.trxCount > 0 && s.trxCount != m_receiver->count()) {

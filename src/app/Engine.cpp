@@ -4,6 +4,7 @@
 #include "audio/PortAudioSink.h"
 #include "dsp/NrProcessor.h"
 #include "radio/TciBackend.h"
+#include "radio/Ts990Cat.h"
 #include "radio/UsbBackend.h"
 #include "audio/PortAudioSource.h"
 
@@ -197,6 +198,8 @@ void Engine::useBackendFor(const QString& kind)
     connect(m_radio, &RadioBackend::malformedBlock, this, [this] { ++m_malformedBlocks; });
     connect(m_radio, &RadioBackend::blocksLost, this, [this](quint64 count) { m_droppedBlocks += count; });
     connect(m_radio, &RadioBackend::portResolved, this, &Engine::connectedPortChanged);
+    // What a backend reports can change while it runs: a USB radio's CAT answering, or not.
+    connect(m_radio, &RadioBackend::radioChanged, this, [this] { m_caps = m_radio->capabilities(); });
 }
 
 void Engine::prepareMuteFor(const QString& host)
@@ -851,6 +854,41 @@ void Engine::setReceiver(int receiver)
     if (m_sessionActive) requestAudio();
 }
 
+void Engine::testCat(const QString& port, int baud)
+{
+    if (m_catProbe) return;  // one Test at a time; its answer is coming
+    if (const RadioBackend::Cat session = m_radio->cat(); session.used) {
+        emit catTested(false, QStringLiteral("The connected radio is using %1: disconnect to test").arg(session.port));
+        return;
+    }
+    if (port.isEmpty()) {
+        emit catTested(false, QStringLiteral("No CAT port chosen"));
+        return;
+    }
+    auto* probe = new Ts990Cat(m_catTransport, this);
+    m_catProbe = probe;
+    auto answered = std::make_shared<bool>(false);
+    const auto finish = [this, probe, answered](bool ok, const QString& text) {
+        if (*answered) return;
+        *answered = true;
+        m_catProbe.clear();
+        emit catTested(ok, text);
+        probe->close();
+        probe->deleteLater();
+    };
+    connect(probe, &Ts990Cat::stateChanged, this, [probe, finish, port](Ts990Cat::State state) {
+        if (state == Ts990Cat::State::Ready) finish(true, QStringLiteral("Kenwood TS-990S answered on %1").arg(port));
+        if (state == Ts990Cat::State::Refused) finish(false, probe->lastError());
+    });
+    // Three unanswered IDs take 1.5 s; a port that will not open fails at once.
+    QTimer::singleShot(2500, probe, [probe, finish] {
+        finish(false, probe->lastError().isEmpty() ? QStringLiteral("No answer") : probe->lastError());
+    });
+    probe->open(port, baud, true);
+    // A port that will not open (not there, taken, or the test sandbox) fails at once.
+    if (probe->state() == Ts990Cat::State::Closed) finish(false, probe->lastError());
+}
+
 void Engine::setUsbTrimDb(double db)
 {
     m_config.usbTrimDb = db;
@@ -1211,6 +1249,11 @@ void Engine::emitStatus()
     s.inputDevice = input.device;
     s.inputRate = input.sampleRate;
     s.inputOverflows = input.overflows;
+    const RadioBackend::Cat cat = m_radio->cat();
+    s.catUsed = cat.used;
+    s.catReady = cat.ready;
+    s.catPort = cat.port;
+    s.catError = cat.error;
     s.blocksPerSecond = m_blocksPerSecond;
     s.blocks = m_blocks;
     s.droppedBlocks = m_droppedBlocks;

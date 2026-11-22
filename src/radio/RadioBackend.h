@@ -91,6 +91,15 @@ public:
     // A gain on the incoming audio, in dB, for a radio whose level is fixed at its end.
     virtual void setInputTrimDb(double db) { Q_UNUSED(db); }
 
+    // CAT beside the audio, for a USB radio: what the window says about it.
+    struct Cat {
+        bool used{false};  // a CAT port is chosen
+        bool ready{false}; // the radio answered as the model it should be
+        QString port;
+        QString error;     // why it is not ready
+    };
+    virtual Cat cat() const { return {}; }
+
 signals:
     void stateChanged(esa::RadioBackend::Link state);
     void radioChanged();

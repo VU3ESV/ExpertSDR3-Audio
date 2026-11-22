@@ -6,12 +6,14 @@
 #include "app/Settings.h"
 #include "audio/AudioSink.h"
 #include "dsp/RxChain.h"
+#include "radio/CatTransport.h"
 #include "radio/RadioBackend.h"
 #include "tci/MuteController.h"
 
 #include <QElapsedTimer>
 #include <QHash>
 #include <QObject>
+#include <QPointer>
 #include <QSet>
 #include <QStringList>
 #include <QThreadPool>
@@ -55,6 +57,11 @@ struct EngineStatus {
     QString inputDevice;
     int inputRate{0};
     quint64 inputOverflows{0};
+    // CAT beside a USB radio's audio.
+    bool catUsed{false};
+    bool catReady{false};
+    QString catPort;
+    QString catError;
 
     QString outputDevice;
     QString outputError;
@@ -133,6 +140,9 @@ public:
 
     // A seam for tests: how backends are made. Set before the first connectRadio().
     void setBackendFactory(BackendFactory factory);
+    // A seam for tests: the port the Radio page's CAT Test opens. Empty opens real serial ports.
+    using CatTransportFactory = std::function<std::unique_ptr<CatTransport>(QObject* parent)>;
+    void setCatTransportFactory(CatTransportFactory factory) { m_catTransport = std::move(factory); }
 
     // For tests only: a stage parameter as the chain the audio runs through holds it. False
     // before the first configure(), or for a key that is not a stage's. It reads the chain
@@ -149,6 +159,9 @@ public slots:
     void setReceiver(int receiver);
     // A USB radio's input trim, applied at once.
     void setUsbTrimDb(double db);
+    // The Radio page's CAT Test: asks the radio on `port` who it is (ID;) and nothing else,
+    // then closes the port. Answered by catTested. Only while no session holds the port.
+    void testCat(const QString& port, int baud);
     void setOutputDevice(const QString& deviceKey);
     void setBufferMs(int ms);
     void setOutputGainDb(double db);
@@ -204,6 +217,8 @@ signals:
     void recordingFailed(const QString& reason);
     // PLAY was refused (nothing recorded, another sample rate, no output) or stopped early.
     void playbackFailed(const QString& reason);
+    // What testCat found.
+    void catTested(bool ok, const QString& text);
 
 private slots:
     void onAudioBlock(int receiver, const float* stereo, int frames, int sampleRate);
@@ -263,6 +278,8 @@ private:
 
     SinkFactory m_sinkFactory;
     BackendFactory m_backendFactory;
+    CatTransportFactory m_catTransport;
+    QPointer<QObject> m_catProbe;  // the CAT Test running, if one is
     std::unique_ptr<Settings> m_settings;
     AppConfig m_config;
 

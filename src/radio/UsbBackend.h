@@ -2,6 +2,7 @@
 
 #include "audio/AudioSource.h"
 #include "radio/RadioBackend.h"
+#include "radio/Ts990Cat.h"
 #include "radio/UsbModels.h"
 
 #include <QByteArray>
@@ -20,8 +21,8 @@ namespace esa {
 
 // A radio whose receive audio comes from its own USB codec, such as a Kenwood TS-990S. The
 // codec streams whether or not the radio is on, so audio arriving proves nothing about the
-// radio; and without CAT the app cannot silence the radio's speaker, which the operator turns
-// down by hand. Lives on the engine thread.
+// radio. Where the model has CAT and a port is chosen, its frequency and mode are read beside
+// the audio; the audio never waits on CAT, and works with none. Lives on the engine thread.
 class UsbBackend : public RadioBackend {
     Q_OBJECT
 
@@ -29,8 +30,9 @@ public:
     using SourceFactory =
         std::function<std::unique_ptr<AudioSource>(const QString& deviceKey, int preferredRate, QString* error)>;
 
-    // `sourceFactory` is a seam for tests; empty opens real devices through PortAudio.
-    explicit UsbBackend(SourceFactory sourceFactory = {}, QObject* parent = nullptr);
+    // `sourceFactory` and `catTransport` are seams for tests; empty opens real devices.
+    explicit UsbBackend(SourceFactory sourceFactory = {}, QObject* parent = nullptr,
+                        Ts990Cat::TransportFactory catTransport = {});
     ~UsbBackend() override;
 
     QString kind() const override { return QStringLiteral("usb"); }
@@ -47,6 +49,9 @@ public:
 
     Input input() const override;
     void setInputTrimDb(double db) override;
+    Cat cat() const override;
+    // The CAT link, while a port is chosen; null for audio only.
+    Ts990Cat* catLink() const { return m_cat; }
     void releaseAudioDevices() override;
     void reacquireAudioDevices() override;
 
@@ -59,8 +64,11 @@ private:
     void lose(const QString& why);
     void drain();
     void deliver(const float* mono, size_t frames);
+    void onCatBand(int receiver);
 
     SourceFactory m_sourceFactory;
+    Ts990Cat::TransportFactory m_catTransport;
+    Ts990Cat* m_cat{nullptr};
     std::unique_ptr<AudioSource> m_source;
     QTimer m_retry;
     QTimer m_drain;

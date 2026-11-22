@@ -52,9 +52,10 @@ std::unique_ptr<AudioSource> openRealSource(const QString& key, int preferredRat
 
 } // namespace
 
-UsbBackend::UsbBackend(SourceFactory sourceFactory, QObject* parent)
+UsbBackend::UsbBackend(SourceFactory sourceFactory, QObject* parent, Ts990Cat::TransportFactory catTransport)
     : RadioBackend(parent),
       m_sourceFactory(sourceFactory ? std::move(sourceFactory) : SourceFactory(openRealSource)),
+      m_catTransport(std::move(catTransport)),
       m_retry(this),
       m_drain(this)
 {
@@ -73,6 +74,9 @@ RadioBackend::Capabilities UsbBackend::capabilities() const
     Capabilities c;
     c.speaker = SpeakerControl::None;
     c.audioProvesRadio = false;
+    const bool catReady = m_cat && m_cat->state() == Ts990Cat::State::Ready;
+    c.reportsMode = catReady;
+    c.reportsFrequency = catReady;
     return c;
 }
 
@@ -98,10 +102,46 @@ void UsbBackend::open(const AppConfig& config)
     m_lastError.clear();
     setState(Link::Connecting);
     tryOpen();
+
+    // CAT, where the model has it and a port is chosen. Only the TS-990S's for now.
+    if (m_model.hasCat() && !config.usbCatPort.isEmpty()) {
+        if (!m_cat) {
+            m_cat = new Ts990Cat(m_catTransport, this);
+            connect(m_cat, &Ts990Cat::bandChanged, this, &UsbBackend::onCatBand);
+            connect(m_cat, &Ts990Cat::stateChanged, this, &RadioBackend::radioChanged);
+        }
+        m_cat->open(config.usbCatPort, config.usbCatBaud);
+    } else if (m_cat) {
+        m_cat->close();
+    }
+}
+
+RadioBackend::Cat UsbBackend::cat() const
+{
+    Cat c;
+    if (!m_cat || !m_cat->active()) return c;
+    c.used = true;
+    c.ready = m_cat->state() == Ts990Cat::State::Ready;
+    c.port = m_cat->port();
+    c.error = c.ready ? QString() : m_cat->lastError();
+    return c;
+}
+
+void UsbBackend::onCatBand(int receiver)
+{
+    if (!m_radio.receivers.contains(receiver)) return;
+    const Ts990Cat::Band& band = m_cat->band(receiver);
+    RadioState::Receiver& rx = m_radio.receivers[receiver];
+    rx.frequencyHz = band.frequencyHz;
+    const bool modeChanged = rx.modulation != band.mode;
+    rx.modulation = band.mode;
+    emit radioChanged();
+    if (modeChanged) emit modulationChanged(receiver, band.mode);
 }
 
 void UsbBackend::close()
 {
+    if (m_cat) m_cat->close();
     m_wantOpen = false;
     m_retry.stop();
     m_drain.stop();

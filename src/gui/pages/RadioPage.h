@@ -39,6 +39,8 @@ public:
     int port() const;
     // This computer's input devices, where a USB radio's codec is chosen.
     void showInputDevices(const QList<AudioDeviceInfo>& devices);
+    // What the CAT Test found.
+    void showCatTest(bool ok, const QString& text);
 
 protected:
     void showEvent(QShowEvent* event) override;
@@ -55,6 +57,7 @@ private:
     void showKind();
     void fillUsbReceivers();
     void fillUsbInputs();
+    void fillCatPorts();
     bool usbRadio() const;
 
     QComboBox* m_kind{nullptr};
@@ -68,6 +71,11 @@ private:
     QPushButton* m_usbConnect{nullptr};
     QLabel* m_usbLabel{nullptr};
     QLabel* m_usbSetup{nullptr};
+    QList<QWidget*> m_catWidgets;  // shown only for a model with CAT
+    QComboBox* m_catPort{nullptr};
+    QComboBox* m_catBaud{nullptr};
+    QPushButton* m_catTest{nullptr};
+    QLabel* m_catLabel{nullptr};
     QList<AudioDeviceInfo> m_inputs;
 
     QLineEdit* m_host{nullptr};
