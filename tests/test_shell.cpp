@@ -1217,6 +1217,65 @@ private slots:
         QCOMPARE(m_quits, 0);
     }
 
+    // Where a Mac's title bar is, beside its buttons, the window's own ground lies: the system
+    // passes those presses to the content, so the ground there moves the window, as does the
+    // margin beside the header, and a double-click there zooms. Below the header's foot the
+    // ground is the pages' and moves nothing. The drags go to the window, which picks the
+    // widget under them as it does a real click.
+    void theMacCustomFrameMovesByTheStripUnderItsButtons()
+    {
+        const MacCustom asOnAMac;
+        Settings::WindowState window;
+        window.frame = QStringLiteral("Custom");
+        make(window);
+        atReferenceSize();
+        QWidget* ground = m_window->centralWidget();
+        auto* header = m_window->findChild<HeaderBar*>();
+        QVERIFY(ground && header);
+        // A Mac's title bar insets the content by its height; with no title bar to measure
+        // (offscreen), as much as macOS's.
+        if (ground->contentsMargins().top() == 0) ground->setContentsMargins(0, 28, 0, 0);
+        ground->layout()->activate();
+        const int headerTop = header->mapTo(ground, QPoint()).y();
+        const int foot = headerTop + header->height();
+        QVERIFY2(headerTop >= 28, qPrintable(QString::number(headerTop)));
+
+        QWindow* native = m_window->windowHandle();
+        QVERIFY(native);
+        // A left-button drag from `from` on the ground, by `by`.
+        const auto drag = [&](QPoint from, QPoint by) {
+            const QPoint at = ground->mapTo(m_window.get(), from);
+            // The pointer stays where it went while the window follows it, so the release is
+            // there on the screen, not at the same place in the window.
+            const QPoint pointer = native->mapToGlobal(at + by);
+            QTest::mousePress(native, Qt::LeftButton, Qt::NoModifier, at);
+            QTest::mouseMove(native, at + by);
+            QTest::mouseRelease(native, Qt::LeftButton, Qt::NoModifier, native->mapFromGlobal(pointer));
+        };
+        const QPoint strip(ground->width() / 2, 12);           // under the title bar
+        const QPoint beside(5, (headerTop + foot) / 2);        // the margin left of the title
+        const QPoint below(ground->width() / 2, ground->height() - 7);  // the bottom margin
+        for (const QPoint& bare : {strip, beside, below}) QCOMPARE(ground->childAt(bare), nullptr);
+
+        m_window->move(40, 30);
+        QTRY_COMPARE(m_window->pos(), QPoint(40, 30));
+        drag(strip, QPoint(25, 15));
+        QTRY_COMPARE(m_window->pos(), QPoint(65, 45));
+        QCOMPARE(QWidget::mouseGrabber(), nullptr);
+        drag(beside, QPoint(-10, 20));
+        QTRY_COMPARE(m_window->pos(), QPoint(55, 65));
+        drag(below, QPoint(30, 30));
+        QTest::qWait(100);  // a window system answers a move it was asked for in its own time
+        QCOMPARE(m_window->pos(), QPoint(55, 65));
+        QCOMPARE(QWidget::mouseGrabber(), nullptr);
+
+        QTest::mouseDClick(ground, Qt::LeftButton, Qt::NoModifier, strip);
+        QTRY_VERIFY(m_window->isMaximized());
+        QTest::mouseDClick(ground, Qt::LeftButton, Qt::NoModifier, strip);
+        QTRY_VERIFY(!m_window->isMaximized());
+        QCOMPARE(m_quits, 0);
+    }
+
     // The frameless Custom of Windows and Linux, on any machine: minimise and close chips at
     // the end of the header, as tall as its row and off the keyboard's path, the close chip
     // going out through closeEvent like every other way; and the header's empty part moving

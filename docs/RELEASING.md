@@ -230,8 +230,11 @@ macOS (Custom needs Qt 6.9 or later; release builds use 6.10):
 
 - The traffic lights sit over the ground at the top left, with no title text and no title bar
   background behind them, and the header starts below them, clear of them.
-- Dragging the strip the traffic lights are in moves the window, and double-clicking it zooms
-  or minimises as System Settings says. Every edge resizes.
+- Dragging the strip the traffic lights are in moves the window, and so does dragging the
+  header's empty part (the title, or the space before the status chip). Double-clicking either
+  zooms, and again restores; System Settings' "Double-click a window's title bar to" choice is
+  not followed yet. Every edge resizes. Tests send their clicks past macOS, so only a real
+  pointer shows that the strip's clicks reach the app at all.
 - Full screen (the green button, or Control-Command-F): the strip goes and the header moves up,
   then comes back down on leaving. On a MacBook with a notch, nothing sits under the notch.
   Switching the frame while full screen leaves the window full screen.

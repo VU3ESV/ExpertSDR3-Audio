@@ -13,6 +13,7 @@
 class QAction;
 class QMainWindow;
 class QMenu;
+class QMouseEvent;
 class QWindow;
 
 namespace esa {
@@ -23,12 +24,16 @@ class HeaderBar;
 // everywhere) or AetherRX's (Custom). What Custom is depends on the platform:
 //  - macOS, with Qt 6.9 or later: the system's frame kept, with its title bar drawn over
 //    the window's own ground, so the traffic lights sit on it and the content starts below
-//    them. Moving, resizing, full screen and the main-window status all stay the system's.
-//    An older Qt cannot ask for that, so there Custom is the system frame.
-//  - Windows, Linux and the Raspberry Pi: no system frame at all. The header's empty part
-//    moves the window and double-clicking it maximises; a 6 px band round the edges resizes
-//    it; the header carries minimise and close chips. The window stays opaque, so nothing
-//    needs a compositor, and Windows 11 rounds its corners.
+//    them. Resizing, full screen and the main-window status stay the system's; moving does
+//    not, because the content under the title bar takes its clicks. So the window moves
+//    itself, as a frameless one does. An older Qt cannot ask for any of this, so there
+//    Custom is the system frame.
+//  - Windows, Linux and the Raspberry Pi: no system frame at all. A 6 px band round the
+//    edges resizes the window; the header carries minimise and close chips. The window
+//    stays opaque, so nothing needs a compositor, and Windows 11 rounds its corners.
+// Either way, with Custom the header's empty part moves the window, and so does the ground
+// round it as far down as the header's foot: on a Mac, the strip under the system's
+// buttons. Double-clicking either maximises. Full screen, neither moves anything.
 class WindowChrome : public QObject {
     Q_OBJECT
 
@@ -90,6 +95,8 @@ private:
     void updateNative();
     void updateInsets();
     void updateMenu();
+    // Whether a press on `handle`, the header or the ground, moves the window.
+    bool movesWindow(const QWidget* handle, const QMouseEvent* event) const;
 
     QMainWindow* m_window;
     HeaderBar* m_header;
@@ -98,6 +105,7 @@ private:
     QMenu* m_menu{nullptr};
     QAction* m_systemAction{nullptr};
     QAction* m_customAction{nullptr};
+    QPointer<QWidget> m_body;      // the window's central widget, the ground round the header
     QPointer<QWindow> m_followed;  // the native window whose safe area the content follows
     bool m_resizer{false};         // the edge resizer, once installed, stays for good
     Placer m_placer;
