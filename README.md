@@ -164,7 +164,9 @@ everywhere, is the frame and title bar your computer gives every window. **Custo
 AetherRX's own look:
 
 - On a Mac the window's dark ground runs right to the top, under the usual close, minimise and
-  zoom buttons. This needs a build with Qt 6.9 or later, which the released app has.
+  zoom buttons. Drag the strip those buttons are in, or the header's empty part, to move the
+  window, and double-click either to zoom. This needs a build with Qt 6.9 or later, which the
+  released app has.
 - On Windows and Linux the system's frame goes. Minimise and close are at the right of the
   header. Drag the header to move the window, double-click it to maximise, and drag an edge
   to resize.

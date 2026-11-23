@@ -156,6 +156,10 @@ WindowChrome::WindowChrome(QMainWindow* window, HeaderBar* header, Frame frame)
 
     window->installEventFilter(this);
     header->installEventFilter(this);
+    // The ground round the header, which on a Mac includes the strip under the system's
+    // buttons; it holds the header, so it exists already.
+    m_body = window->centralWidget();
+    if (m_body) m_body->installEventFilter(this);
     setFrame(frame);
 }
 
@@ -256,27 +260,43 @@ bool WindowChrome::eventFilter(QObject* watched, QEvent* event)
         return false;
     }
     // Custom frames only. On a Mac the content reaches under the system's title bar, which
-    // then no longer moves the window itself, so the header has to, as a frameless one does.
-    if (watched != m_header || m_mode == Mode::System) return false;
+    // then no longer moves the window itself, so the window has to, as a frameless one does.
+    if (m_mode == Mode::System || (watched != m_header && (!m_body || watched != m_body))) return false;
+    auto* handle = static_cast<QWidget*>(watched);
 
-    // Only presses no control took reach the header itself: on its empty part, the title
-    // and the rule. FramelessMoveHelper uses the platform's own move where that works,
-    // which on Windows keeps snapping to the screen's edges, and moves by hand elsewhere.
+    // Only presses no control took reach the header or the ground: on the header's empty
+    // part, its title and its rule, and on the ground round it as far down as its foot,
+    // where a Mac's title bar is. FramelessMoveHelper uses the platform's own move where
+    // that works, which on Windows keeps snapping to the screen's edges, and moves by hand
+    // elsewhere. Full screen, nothing moves.
     using namespace AetherSDR;
     switch (event->type()) {
-    case QEvent::MouseButtonPress:
-        return FramelessMoveHelper::start(m_header, static_cast<QMouseEvent*>(event));
+    case QEvent::MouseButtonPress: {
+        auto* mouse = static_cast<QMouseEvent*>(event);
+        return movesWindow(handle, mouse) && FramelessMoveHelper::start(handle, mouse);
+    }
     case QEvent::MouseMove:
-        return FramelessMoveHelper::move(m_header, static_cast<QMouseEvent*>(event));
+        return FramelessMoveHelper::move(handle, static_cast<QMouseEvent*>(event));
     case QEvent::MouseButtonRelease:
-        return FramelessMoveHelper::finish(m_header, static_cast<QMouseEvent*>(event));
-    case QEvent::MouseButtonDblClick:
-        if (static_cast<QMouseEvent*>(event)->button() != Qt::LeftButton) return false;
-        FramelessMoveHelper::toggleMaximized(m_header);
+        return FramelessMoveHelper::finish(handle, static_cast<QMouseEvent*>(event));
+    case QEvent::MouseButtonDblClick: {
+        auto* mouse = static_cast<QMouseEvent*>(event);
+        if (mouse->button() != Qt::LeftButton || !movesWindow(handle, mouse)) return false;
+        FramelessMoveHelper::toggleMaximized(handle);
         return true;
+    }
     default:
         return false;
     }
+}
+
+bool WindowChrome::movesWindow(const QWidget* handle, const QMouseEvent* event) const
+{
+    if (m_window->isFullScreen()) return false;
+    if (handle == m_header) return true;
+    // The ground, only above the header's foot: below it are the pages' own gaps.
+    const int foot = m_header->mapTo(handle, QPoint(0, m_header->height())).y();
+    return event->position().y() < foot;
 }
 
 } // namespace esa
