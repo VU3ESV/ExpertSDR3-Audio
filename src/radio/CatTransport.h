@@ -5,6 +5,7 @@
 #include <QObject>
 #include <QSerialPortInfo>
 #include <QString>
+#include <QStringList>
 
 #include <memory>
 
@@ -33,12 +34,18 @@ signals:
 // a test never reaches a radio, an amplifier or anything else on this computer's ports.
 QString realSerialRefusal();
 
+// The other programs that have this device open (its path, such as /dev/cu.usbserial-X),
+// by name. A serial port cannot be shared: what one program reads, the other never sees,
+// and a baud rate or a line one sets changes under the other. On macOS the cu. and tty. nodes
+// of one port count as one. macOS and Linux; empty elsewhere, where a port opens only once.
+QStringList otherProgramsUsing(const QString& devicePath);
+
 // The serial ports a radio's CAT may be on: listed, never opened. On macOS each port appears
 // twice, and only the cu. one is offered: opening its tty. twin waits for a carrier.
 QList<QSerialPortInfo> listSerialPorts();
 
-// A real serial port, 8N1 with no flow control. DTR and RTS are dropped at once on opening,
-// because a radio can map either to transmit.
+// A real serial port, 8N1 with no flow control. On opening, DTR is dropped at once, and RTS
+// raised: Kenwood's CAT needs RTS high to answer.
 std::unique_ptr<CatTransport> makeSerialTransport(QObject* parent = nullptr);
 
 } // namespace esa

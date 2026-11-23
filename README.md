@@ -264,19 +264,22 @@ is not involved.
   the sub receiver on the right. The app expects that.
 - The USB baud rate (menu 0-07-01) must match the app's **Baud**, which is 115200 unless you
   change it.
-- The first time you use CAT, turn **TX Inhibit** on (menu 0-06-03). Then check that none of
-  the radio's USB port settings let DTR or RTS key it. The app drops both lines as it opens the
-  port, but the computer may raise them for a moment first.
+- The first time you use CAT, turn **TX Inhibit** on (menu 0-06-03). As it opens the port, the
+  app keeps DTR low and raises RTS, because Kenwood's CAT handshakes with RTS and CTS and the
+  radio answers nothing without it. The TS-990S has no setting that keys it from USB DTR or RTS.
 
 **In the app:**
 
 1. On the **Radio** page, choose **Kenwood TS-990S (USB)**. The first time on a Mac, allow
    microphone access when asked: macOS asks for any audio input, and this one is the radio's.
 2. **Input**: "USB Audio CODEC". **Receiver**: Main or Sub.
-3. **CAT**: the radio's port. It is a CP2102 (10C4:EA60), shown on a Mac as
-   `cu.usbserial-<serial>` or `cu.SLAB_USBtoUART`. No port is chosen for you, because other
-   ports may belong to an amplifier, a GPS or a panel. **Test** asks the radio who it is and
-   sends nothing else.
+3. **CAT**: choose the radio's port. It is a CP2102 (10C4:EA60), marked ◂ in the list and shown
+   on a Mac as `cu.usbserial-<serial>` or `cu.SLAB_USBtoUART`. No port is chosen for you,
+   because other ports may belong to an amplifier, a GPS or a panel. Until one is chosen there
+   is no CAT, and no AF setting either. **Test** asks the radio who it is and sends nothing else.
+   A serial port cannot be shared. If another program, such as a logger, has the port open, the
+   app names it and waits without touching the port. Quit that program or turn its CAT off,
+   and the app connects by itself.
 4. **Connect**. With CAT, the frequency and mode follow the radio, and recordings are named by
    them. CW and data modes skip NR, as they do with ExpertSDR3. Without CAT you get the audio
    only.
@@ -412,8 +415,8 @@ RN2 any cheaper, because RNNoise always runs at 48 kHz internally. On a small sc
 the 7-inch display, the window opens maximised.
 
 **USB radios.** The Kenwood TS-990S's USB audio has been heard live on a Mac, through the
-chain. Its CAT and the AF setting have so far been tested only against a simulated radio, and
-nothing USB has been tried on Windows or Linux.
+chain, and its CAT read live there: its ID, frequency and mode. The AF setting has so far been
+tested only against a simulated radio, and nothing USB has been tried on Windows or Linux.
 
 **Transceivers.** Testing so far is on a receive-only radio. While transmitting, the chain
 is bypassed and restarts cleanly afterwards, but that has only been tested against a

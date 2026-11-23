@@ -219,7 +219,7 @@ QWidget* RadioPage::buildUsb()
     });
     connect(m_catPort, &QComboBox::currentIndexChanged, this, [this](int index) {
         config().usbCatPort = m_catPort->itemData(index).toString();
-        m_catLabel->clear();
+        showCatChoice();
         showAfNote();
     });
     connect(m_catBaud, &QComboBox::currentIndexChanged, this,
@@ -289,6 +289,17 @@ void RadioPage::fillUsbReceivers()
     if (m_usbReceiver->currentIndex() >= 0) config().receiver = m_usbReceiver->currentData().toInt();
 }
 
+void RadioPage::showCatChoice()
+{
+    // Test asks the chosen port only, so with none chosen there is nothing to test.
+    const bool chosen = !config().usbCatPort.isEmpty();
+    m_catTest->setEnabled(chosen && !m_usbConnect->isChecked());
+    m_catLabel->setText(chosen ? QString()
+                               : colored(QStringLiteral("color.text.label"),
+                                         QStringLiteral("Choose the radio's CAT port to read its frequency and mode. "
+                                                        "The likely one is marked ◂; nothing is chosen for you.")));
+}
+
 void RadioPage::fillCatPorts()
 {
     const UsbModel& model = usb::model(config().usbModel);
@@ -309,6 +320,10 @@ void RadioPage::fillCatPorts()
             // A hint only: never chosen for the operator, since another device may share the bridge.
             if (!model.bridgeHint.isEmpty() && id == model.bridgeHint) label += QStringLiteral("  ◂ %1?").arg(model.name);
         }
+        // A port cannot be shared, so one a logger holds is marked before anyone chooses it.
+        if (const QStringList users = otherProgramsUsing(port.systemLocation()); !users.isEmpty()) {
+            label += QStringLiteral("  (in use by %1)").arg(users.join(QStringLiteral(", ")));
+        }
         m_catPort->addItem(label, port.portName());
     }
     const int index = m_catPort->findData(selected);
@@ -318,11 +333,12 @@ void RadioPage::fillCatPorts()
         m_catPort->addItem(QStringLiteral("%1 (not found)").arg(selected), selected);
         m_catPort->setCurrentIndex(m_catPort->count() - 1);
     }
+    showCatChoice();
 }
 
 void RadioPage::showCatTest(bool ok, const QString& text)
 {
-    m_catTest->setEnabled(!m_usbConnect->isChecked());
+    m_catTest->setEnabled(!config().usbCatPort.isEmpty() && !m_usbConnect->isChecked());
     m_catLabel->setText(colored(ok ? QStringLiteral("color.accent.success") : QStringLiteral("color.accent.danger"), text));
 }
 
@@ -543,7 +559,7 @@ void RadioPage::onConnectToggled(bool on)
     m_usbInput->setEnabled(!on);
     m_catPort->setEnabled(!on);
     m_catBaud->setEnabled(!on);
-    m_catTest->setEnabled(!on);  // the session has the port
+    m_catTest->setEnabled(!on && !config().usbCatPort.isEmpty());  // the session has the port
     if (on) {
         if (!usbRadio()) {
             config().host = m_host->text().trimmed();

@@ -1731,6 +1731,10 @@ private slots:
         QCOMPARE(port->currentIndex(), 0);
         QCOMPARE(m_window->config().usbCatPort, QString());
         QCOMPARE(baud->currentData().toInt(), 115200);
+        // With no port there is nothing to test, and the page says what to do.
+        QVERIFY(!test->isEnabled());
+        auto* catStatus = page->findChild<QLabel*>(QStringLiteral("catStatus"));
+        QVERIFY(catStatus && catStatus->text().contains(QLatin1String("Choose the radio's CAT port")));
         baud->setCurrentIndex(baud->findData(38400));
         QCOMPARE(m_window->config().usbCatBaud, 38400);
 
@@ -1771,6 +1775,8 @@ private slots:
         QVERIFY(port && test && label);
         QCOMPARE(port->currentText(), QStringLiteral("/dev/esa-test-no-such-port (not found)"));
         QCOMPARE(m_window->config().usbCatPort, QStringLiteral("/dev/esa-test-no-such-port"));
+        QVERIFY(test->isEnabled());
+        QVERIFY(!label->text().contains(QLatin1String("Choose the radio's CAT port")));
         QTest::ignoreMessage(QtWarningMsg, QRegularExpression(QStringLiteral("Test sandbox: refused to open a serial port")));
         test->click();
         QTRY_VERIFY(label->text().contains(QStringLiteral("ESA_TEST_SANDBOX")));

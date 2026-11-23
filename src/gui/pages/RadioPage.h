@@ -60,6 +60,7 @@ private:
     void fillUsbReceivers();
     void fillUsbInputs();
     void fillCatPorts();
+    void showCatChoice();
     bool usbRadio() const;
 
     QComboBox* m_kind{nullptr};

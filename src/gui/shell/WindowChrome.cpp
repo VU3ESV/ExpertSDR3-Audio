@@ -255,7 +255,9 @@ bool WindowChrome::eventFilter(QObject* watched, QEvent* event)
         }
         return false;
     }
-    if (watched != m_header || m_mode != Mode::Frameless) return false;
+    // Custom frames only. On a Mac the content reaches under the system's title bar, which
+    // then no longer moves the window itself, so the header has to, as a frameless one does.
+    if (watched != m_header || m_mode == Mode::System) return false;
 
     // Only presses no control took reach the header itself: on its empty part, the title
     // and the rule. FramelessMoveHelper uses the platform's own move where that works,

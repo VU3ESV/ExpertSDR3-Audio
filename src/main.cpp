@@ -104,6 +104,9 @@ void printSerialPorts()
                                  .toUpper();
         }
         if (!port.serialNumber().isEmpty()) out() << "  serial " << port.serialNumber();
+        if (const QStringList users = otherProgramsUsing(port.systemLocation()); !users.isEmpty()) {
+            out() << "  (in use by " << users.join(QStringLiteral(", ")) << ")";
+        }
         out() << "\n      --cat-port \"" << port.portName() << "\"\n";
     }
 }
