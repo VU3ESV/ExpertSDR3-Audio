@@ -13,6 +13,7 @@
 
 #include <QFile>
 #include <QPointer>
+#include <QProcess>
 #include <QRegularExpression>
 #include <QTemporaryDir>
 #include <QtTest>
@@ -602,6 +603,32 @@ private slots:
         QCOMPARE(cat.state(), Ts990Cat::State::Closed);
         QVERIFY(cat.lastError().contains(QStringLiteral("ESA_TEST_SANDBOX")));
         cat.close();
+    }
+
+    // Another program with the port open is named, so the port is never shared with it. A file
+    // stands in for the port here, held open by a shell and its sleep; this program's own
+    // holding does not count.
+    void aPortAnotherProgramHoldsIsNamed()
+    {
+#if !defined(Q_OS_MACOS) && !defined(Q_OS_LINUX)
+        QSKIP("Windows opens a port only once: a second program is refused by the system itself");
+#else
+        QTemporaryDir dir;
+        const QString path = dir.filePath(QStringLiteral("port"));
+        QFile mine(path);
+        QVERIFY(mine.open(QIODevice::WriteOnly));
+        QVERIFY(otherProgramsUsing(path).isEmpty());
+
+        QProcess holder;
+        holder.start(QStringLiteral("/bin/sh"),
+                     {QStringLiteral("-c"), QStringLiteral("exec 3<\"$1\"; exec sleep 30"), QStringLiteral("sh"), path});
+        QVERIFY(holder.waitForStarted());
+        QTRY_VERIFY_WITH_TIMEOUT(otherProgramsUsing(path).contains(QStringLiteral("sleep")), kTimeout);
+        QVERIFY(otherProgramsUsing(dir.filePath(QStringLiteral("elsewhere"))).isEmpty());
+        holder.kill();
+        QVERIFY(holder.waitForFinished());
+        QTRY_VERIFY_WITH_TIMEOUT(otherProgramsUsing(path).isEmpty(), kTimeout);
+#endif
     }
 
     // ── Through the backend and the engine ───────────────────────────────────

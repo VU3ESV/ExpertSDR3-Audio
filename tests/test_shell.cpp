@@ -202,6 +202,14 @@ struct FramelessCustom {
     FramelessCustom& operator=(const FramelessCustom&) = delete;
 };
 
+// The same for the Mac's Custom: the content reaches under the system's title bar.
+struct MacCustom {
+    MacCustom() { WindowChrome::overrideCustomMode(WindowChrome::Mode::ExpandedClientArea); }
+    ~MacCustom() { WindowChrome::overrideCustomMode(std::nullopt); }
+    MacCustom(const MacCustom&) = delete;
+    MacCustom& operator=(const MacCustom&) = delete;
+};
+
 // While it lives, the window places its title bar as a system that `places` it would: Windows
 // leaves a title bar where the window is put, and a Mac and GNOME move the window down
 // themselves. nullopt leaves this system's way. A test makes and uses its window within its
@@ -1172,6 +1180,41 @@ private slots:
         // Linux this platform's own Custom is.
         const bool resizes = WindowChrome::customMode() == WindowChrome::Mode::Frameless;
         QCOMPARE(m_window->findChildren<AetherSDR::FramelessResizer*>().size(), resizes ? 1 : 0);
+    }
+
+    // The Mac's Custom, on any machine. With the content under the system's title bar, the
+    // title bar moves nothing, so the header's empty part moves the window and a double-click
+    // zooms it, as a Mac title bar does. The system keeps its own buttons, and a control keeps
+    // its own clicks.
+    void theMacCustomFrameMovesByItsHeader()
+    {
+        const MacCustom asOnAMac;
+        Settings::WindowState window;
+        window.frame = QStringLiteral("Custom");
+        make(window);
+        atReferenceSize();
+        QVERIFY(!(m_window->windowFlags() & Qt::FramelessWindowHint));
+        auto* title = m_window->findChild<QLabel*>(QStringLiteral("canonHeaderTitle"));
+        auto* status = m_window->findChild<StatusChip*>();
+        QVERIFY(title && status);
+        if (auto* close = m_window->findChild<QToolButton*>(QStringLiteral("headerClose"))) QVERIFY(!close->isVisible());
+        QCOMPARE(m_window->findChildren<AetherSDR::FramelessResizer*>().size(), 0);
+
+        m_window->move(40, 30);
+        QTRY_COMPARE(m_window->pos(), QPoint(40, 30));
+        QTest::mousePress(title, Qt::LeftButton, Qt::NoModifier, QPoint(4, 4));
+        QTest::mouseMove(title, QPoint(29, 19));
+        QTest::mouseRelease(title, Qt::LeftButton, Qt::NoModifier, QPoint(29, 19));
+        QTRY_COMPARE(m_window->pos(), QPoint(65, 45));
+        QCOMPARE(QWidget::mouseGrabber(), nullptr);
+        QTest::mouseClick(status, Qt::LeftButton);
+        QCOMPARE(m_window->pos(), QPoint(65, 45));
+
+        QTest::mouseDClick(title, Qt::LeftButton, Qt::NoModifier, QPoint(4, 4));
+        QTRY_VERIFY(m_window->isMaximized());
+        QTest::mouseDClick(title, Qt::LeftButton, Qt::NoModifier, QPoint(4, 4));
+        QTRY_VERIFY(!m_window->isMaximized());
+        QCOMPARE(m_quits, 0);
     }
 
     // The frameless Custom of Windows and Linux, on any machine: minimise and close chips at

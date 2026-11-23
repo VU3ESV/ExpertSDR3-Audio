@@ -1355,7 +1355,14 @@ from the plan above:
   - One write: `AG0000;` to `AG0255;`.
 
   Nothing writes at open, so the Hamlib conditions in section 4.3 do not arise. Qt SerialPort
-  opens the port, with DTR and RTS dropped at once. The Radio page's Test sends `ID;` alone.
+  opens the port with DTR low and RTS high. Dropping RTS too, as v0.1.3 did, kept the radio
+  from answering: Kenwood's CAT handshakes with RTS and CTS, per the command reference. The
+  TS-990S has no menu setting that keys it from USB DTR or RTS.
+- **A port another program holds is never opened.** On the bench, v0.1.3 opened the port
+  alongside RUMlogNG. The logger read the radio's answers, and the app's baud and RTS settings
+  changed under it. `otherProgramsUsing()` now names any holder (libproc on macOS, `/proc` on
+  Linux; Windows refuses a second open itself), and the driver waits for the port to be free.
+  Sharing stays phase 6. The Radio page's Test sends `ID;` alone.
   Hamlib stays the plan for further models: a second built-in driver is written only for a
   model that is on the bench.
 - **No transmit read.** The TS-990S's `IF;` always reports P8 as 0, and pushes would need an
